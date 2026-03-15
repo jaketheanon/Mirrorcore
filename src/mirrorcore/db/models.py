@@ -163,24 +163,6 @@ def initialize_database(conn: sqlite3.Connection):
         )
     """)
     
-    # 8) investigation_strategies table - Stores investigation strategy tracking
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS investigation_strategies (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            strategy_name TEXT NOT NULL,
-            hypothesis_category TEXT NOT NULL,
-            status TEXT DEFAULT 'active',
-            timestamp_started TIMESTAMP,
-            timestamp_completed TIMESTAMP,
-            steps_completed INTEGER DEFAULT 0,
-            evidence_events_count INTEGER DEFAULT 0,
-            hypothesis_changes_count INTEGER DEFAULT 0,
-            last_progress_timestamp TIMESTAMP,
-            FOREIGN KEY (session_id) REFERENCES analysis_sessions (id)
-        )
-    """)
-    
     # 4) decision_history table - Stores analyzed decisions and outcomes
     conn.execute("""
         CREATE TABLE IF NOT EXISTS decision_history (
