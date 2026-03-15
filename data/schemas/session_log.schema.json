@@ -1,0 +1,405 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Session Log",
+  "description": "Schema for interaction session logs in Mirrorcore",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique identifier for the session"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the session started"
+    },
+    "ended_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the session ended"
+    },
+    "duration_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Session duration in seconds"
+    },
+    "session_type": {
+      "type": "string",
+      "enum": ["interactive", "single_command", "batch", "background"],
+      "description": "Type of session"
+    },
+    "user_context": {
+      "type": "object",
+      "properties": {
+        "working_directory": {
+          "type": "string",
+          "description": "Current working directory"
+        },
+        "environment": {
+          "type": "object",
+          "properties": {
+            "shell": {
+              "type": "string",
+              "description": "Shell environment"
+            },
+            "os": {
+              "type": "string",
+              "description": "Operating system"
+            },
+            "python_version": {
+              "type": "string",
+              "description": "Python version"
+            },
+            "git_branch": {
+              "type": "string",
+              "description": "Current git branch if in git repository"
+            }
+          },
+          "description": "Environment information"
+        },
+        "intent": {
+          "type": "string",
+          "enum": ["troubleshooting", "decision_making", "learning", "general_assistance", "configuration"],
+          "description": "Primary user intent for the session"
+        },
+        "success_criteria": {
+          "type": "string",
+          "description": "What would constitute success for this session"
+        }
+      },
+      "required": ["intent"],
+      "additionalProperties": false
+    },
+    "interactions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Unique identifier for the interaction"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the interaction occurred"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["user_input", "system_response", "error", "confirmation", "feedback"],
+            "description": "Type of interaction"
+          },
+          "content": {
+            "type": "string",
+            "description": "Interaction content"
+          },
+          "metadata": {
+            "type": "object",
+            "properties": {
+              "agent_responsible": {
+                "type": "string",
+                "enum": ["intake", "memory", "persona", "terminal", "decision", "llm", "system"],
+                "description": "Which agent handled this interaction"
+              },
+              "processing_time_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Processing time in milliseconds"
+              },
+              "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Confidence in the response"
+              },
+              "data_sources_used": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Data sources used for generating the response"
+              }
+            },
+            "description": "Interaction metadata"
+          },
+          "related_memories": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Memory entries referenced in this interaction"
+          }
+        },
+        "required": ["id", "timestamp", "type", "content"],
+        "additionalProperties": false
+      },
+      "description": "Sequence of interactions in the session"
+    },
+    "outcomes": {
+      "type": "object",
+      "properties": {
+        "primary_goal_achieved": {
+          "type": "boolean",
+          "description": "Whether the primary session goal was achieved"
+        },
+        "success_rating": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5,
+          "description": "Overall success rating (1-5)"
+        },
+        "user_satisfaction": {
+          "type": "string",
+          "enum": ["very_dissatisfied", "dissatisfied", "neutral", "satisfied", "very_satisfied"],
+          "description": "User satisfaction level"
+        },
+        "key_insights": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Key insights gained during the session"
+        },
+        "problems_solved": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Problems that were solved"
+        },
+        "new_patterns_identified": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "New patterns identified during the session"
+        }
+      },
+      "required": ["primary_goal_achieved"],
+      "additionalProperties": false
+    },
+    "system_performance": {
+      "type": "object",
+      "properties": {
+        "total_processing_time_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total processing time for the session"
+        },
+        "average_response_time_ms": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Average response time in milliseconds"
+        },
+        "memory_operations": {
+          "type": "object",
+          "properties": {
+            "retrievals": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of memory retrievals"
+            },
+            "stores": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of memory stores"
+            },
+            "updates": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of memory updates"
+            }
+          },
+          "description": "Memory operation statistics"
+        },
+        "agent_usage": {
+          "type": "object",
+          "properties": {
+            "intake_agent_calls": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of intake agent calls"
+            },
+            "memory_agent_calls": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of memory agent calls"
+            },
+            "persona_agent_calls": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of persona agent calls"
+            },
+            "terminal_agent_calls": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of terminal agent calls"
+            },
+            "decision_agent_calls": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of decision agent calls"
+            },
+            "llm_agent_calls": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of LLM agent calls"
+            }
+          },
+          "description": "Agent usage statistics"
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "timestamp": {
+                "type": "string",
+                "format": "date-time",
+                "description": "When the error occurred"
+              },
+              "error_type": {
+                "type": "string",
+                "enum": ["system_error", "agent_error", "llm_error", "network_error", "user_error"],
+                "description": "Type of error"
+              },
+              "error_message": {
+                "type": "string",
+                "description": "Error message"
+              },
+              "severity": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "critical"],
+                "description": "Error severity"
+              },
+              "resolved": {
+                "type": "boolean",
+                "description": "Whether the error was resolved"
+              }
+            },
+            "required": ["timestamp", "error_type", "error_message", "severity"],
+            "additionalProperties": false
+          },
+          "description": "Errors that occurred during the session"
+        }
+      },
+      "required": ["total_processing_time_ms", "average_response_time_ms"],
+      "additionalProperties": false
+    },
+    "learning_updates": {
+      "type": "object",
+      "properties": {
+        "persona_updates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "aspect": {
+                "type": "string",
+                "description": "Aspect of persona that was updated"
+              },
+              "change_type": {
+                "type": "string",
+                "enum": ["refinement", "correction", "expansion"],
+                "description": "Type of change made"
+              },
+              "confidence_delta": {
+                "type": "number",
+                "minimum": -1,
+                "maximum": 1,
+                "description": "Change in confidence score"
+              }
+            },
+            "required": ["aspect", "change_type"],
+            "additionalProperties": false
+          },
+          "description": "Persona model updates made during the session"
+        },
+        "new_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "description": "New patterns created during the session"
+        },
+        "pattern_updates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "pattern_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "ID of the updated pattern"
+              },
+              "update_type": {
+                "type": "string",
+                "enum": ["success_rate_update", "confidence_update", "usage_increment", "relationship_change"],
+                "description": "Type of pattern update"
+              },
+              "old_value": {
+                "description": "Previous value"
+              },
+              "new_value": {
+                "description": "New value"
+              }
+            },
+            "required": ["pattern_id", "update_type"],
+            "additionalProperties": false
+          },
+          "description": "Updates to existing patterns"
+        }
+      },
+      "additionalProperties": false
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "string",
+          "description": "Mirrorcore version used"
+        },
+        "configuration_hash": {
+          "type": "string",
+          "description": "Hash of configuration used"
+        },
+        "data_retention_policy": {
+          "type": "string",
+          "description": "Data retention policy applied"
+        },
+        "privacy_level": {
+          "type": "string",
+          "enum": ["minimal", "standard", "detailed"],
+          "description": "Privacy level for this session"
+        },
+        "exportable": {
+          "type": "boolean",
+          "description": "Whether this session can be exported"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Tags for session categorization"
+        }
+      },
+      "required": ["version", "privacy_level"],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "id",
+    "started_at",
+    "session_type",
+    "user_context",
+    "interactions",
+    "outcomes",
+    "metadata"
+  ],
+  "additionalProperties": false
+}

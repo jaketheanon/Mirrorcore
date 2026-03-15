@@ -1,0 +1,215 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Persona Profile",
+  "description": "Schema for user persona profile data",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique identifier for the persona profile"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the profile was created"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the profile was last updated"
+    },
+    "version": {
+      "type": "integer",
+      "description": "Profile schema version"
+    },
+    "communication_style": {
+      "type": "object",
+      "properties": {
+        "formality": {
+          "type": "string",
+          "enum": ["casual", "moderate", "formal"],
+          "description": "Preferred communication formality level"
+        },
+        "directness": {
+          "type": "string",
+          "enum": ["indirect", "moderate", "direct"],
+          "description": "Communication directness preference"
+        },
+        "technical_detail": {
+          "type": "string",
+          "enum": ["minimal", "moderate", "comprehensive"],
+          "description": "Preferred level of technical detail"
+        },
+        "tone": {
+          "type": "string",
+          "enum": ["encouraging", "analytical", "instructional", "neutral"],
+          "description": "Preferred communication tone"
+        }
+      },
+      "required": ["formality", "directness", "technical_detail", "tone"]
+    },
+    "decision_style": {
+      "type": "object",
+      "properties": {
+        "risk_tolerance": {
+          "type": "string",
+          "enum": ["conservative", "moderate", "aggressive"],
+          "description": "Risk tolerance level"
+        },
+        "analysis_approach": {
+          "type": "string",
+          "enum": ["data_driven", "intuitive", "hybrid"],
+          "description": "Primary decision analysis approach"
+        },
+        "time_horizon": {
+          "type": "string",
+          "enum": ["short_term", "medium_term", "long_term"],
+          "description": "Preferred decision time horizon"
+        },
+        "stakeholder_focus": {
+          "type": "string",
+          "enum": ["individual", "team", "system", "mixed"],
+          "description": "Primary stakeholder consideration"
+        }
+      },
+      "required": ["risk_tolerance", "analysis_approach", "time_horizon", "stakeholder_focus"]
+    },
+    "problem_solving": {
+      "type": "object",
+      "properties": {
+        "methodology": {
+          "type": "string",
+          "enum": ["systematic", "experimental", "hybrid"],
+          "description": "Problem-solving methodology preference"
+        },
+        "resource_preference": {
+          "type": "string",
+          "enum": ["self_reliant", "research_focused", "collaborative"],
+          "description": "Resource usage preference"
+        },
+        "learning_style": {
+          "type": "string",
+          "enum": ["hands_on", "theoretical", "observational"],
+          "description": "Learning style preference"
+        },
+        "documentation_preference": {
+          "type": "string",
+          "enum": ["minimal", "moderate", "comprehensive"],
+          "description": "Documentation preference level"
+        }
+      },
+      "required": ["methodology", "resource_preference", "learning_style", "documentation_preference"]
+    },
+    "technical_profile": {
+      "type": "object",
+      "properties": {
+        "expertise_level": {
+          "type": "string",
+          "enum": ["beginner", "intermediate", "advanced", "expert"],
+          "description": "Overall technical expertise level"
+        },
+        "primary_domains": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["development", "devops", "data_science", "networking", "security", "general_it"]
+          },
+          "description": "Primary technical domains"
+        },
+        "work_context": {
+          "type": "string",
+          "enum": ["individual_contributor", "team_lead", "manager", "consultant", "student"],
+          "description": "Work context"
+        },
+        "tools_preference": {
+          "type": "object",
+          "properties": {
+            "cli_preference": {
+              "type": "string",
+              "enum": ["gui", "cli", "mixed"],
+              "description": "CLI vs GUI preference"
+            },
+            "automation_level": {
+              "type": "string",
+              "enum": ["manual", "semi_automated", "fully_automated"],
+              "description": "Automation preference"
+            }
+          },
+          "required": ["cli_preference", "automation_level"]
+        }
+      },
+      "required": ["expertise_level", "primary_domains", "work_context", "tools_preference"]
+    },
+    "confidence_scores": {
+      "type": "object",
+      "properties": {
+        "communication_style": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Confidence in communication style assessment"
+        },
+        "decision_style": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Confidence in decision style assessment"
+        },
+        "problem_solving": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Confidence in problem-solving assessment"
+        },
+        "technical_profile": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Confidence in technical profile assessment"
+        }
+      },
+      "required": ["communication_style", "decision_style", "problem_solving", "technical_profile"]
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "assessment_method": {
+          "type": "string",
+          "enum": ["questionnaire", "observation", "hybrid"],
+          "description": "How the profile was assessed"
+        },
+        "data_sources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Data sources used for profile generation"
+        },
+        "validation_status": {
+          "type": "string",
+          "enum": ["pending", "validated", "needs_review"],
+          "description": "Profile validation status"
+        },
+        "last_validation": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last validation timestamp"
+        }
+      },
+      "required": ["assessment_method", "data_sources", "validation_status"]
+    }
+  },
+  "required": [
+    "id",
+    "created_at",
+    "updated_at",
+    "version",
+    "communication_style",
+    "decision_style",
+    "problem_solving",
+    "technical_profile",
+    "confidence_scores",
+    "metadata"
+  ]
+}

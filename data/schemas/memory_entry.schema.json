@@ -1,0 +1,276 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Memory Entry",
+  "description": "Schema for episodic memory entries in Mirrorcore",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique identifier for the memory entry"
+    },
+    "type": {
+      "type": "string",
+      "enum": ["episode", "pattern", "knowledge", "insight"],
+      "description": "Type of memory entry"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the memory was created"
+    },
+    "session_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Session identifier for grouping related memories"
+    },
+    "context": {
+      "type": "object",
+      "properties": {
+        "domain": {
+          "type": "string",
+          "enum": ["terminal", "decision", "learning", "general"],
+          "description": "Domain context of the memory"
+        },
+        "environment": {
+          "type": "string",
+          "enum": ["development", "production", "testing", "staging"],
+          "description": "Environment context"
+        },
+        "complexity": {
+          "type": "string",
+          "enum": ["simple", "moderate", "complex"],
+          "description": "Complexity level"
+        },
+        "urgency": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "critical"],
+          "description": "Urgency level"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Context tags for categorization"
+        }
+      },
+      "required": ["domain", "environment", "complexity"],
+      "additionalProperties": false
+    },
+    "content": {
+      "type": "object",
+      "properties": {
+        "input": {
+          "type": "string",
+          "description": "User input or problem description"
+        },
+        "process": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "step": {
+                "type": "integer",
+                "description": "Step number in the process"
+              },
+              "action": {
+                "type": "string",
+                "description": "Action taken"
+              },
+              "reasoning": {
+                "type": "string",
+                "description": "Reasoning behind the action"
+              },
+              "timestamp": {
+                "type": "string",
+                "format": "date-time",
+                "description": "When the step occurred"
+              }
+            },
+            "required": ["step", "action", "timestamp"]
+          },
+          "description": "Reasoning steps taken"
+        },
+        "output": {
+          "type": "string",
+          "description": "Solution or response provided"
+        },
+        "outcome": {
+          "type": "string",
+          "enum": ["success", "failure", "partial", "unknown"],
+          "description": "Outcome of the interaction"
+        },
+        "feedback": {
+          "type": "object",
+          "properties": {
+            "user_rating": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5,
+              "description": "User satisfaction rating (1-5)"
+            },
+            "user_comment": {
+              "type": "string",
+              "description": "User feedback comments"
+            },
+            "effectiveness": {
+              "type": "string",
+              "enum": ["very_ineffective", "ineffective", "neutral", "effective", "very_effective"],
+              "description": "Perceived effectiveness"
+            }
+          },
+          "description": "User feedback on the interaction"
+        }
+      },
+      "required": ["input", "output", "outcome"],
+      "additionalProperties": false
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Confidence score for the memory content"
+        },
+        "relevance": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Current relevance score"
+        },
+        "access_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of times this memory was accessed"
+        },
+        "last_accessed": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When this memory was last accessed"
+        },
+        "success_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Success rate when this memory is applied"
+        },
+        "source": {
+          "type": "string",
+          "enum": ["user_input", "system_generated", "llm_assisted", "imported"],
+          "description": "How this memory was created"
+        },
+        "processing_time": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Time taken to process in milliseconds"
+        }
+      },
+      "required": ["confidence", "relevance", "access_count", "source"],
+      "additionalProperties": false
+    },
+    "relationships": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["similar_to", "caused_by", "led_to", "contains", "refines", "contradicts"],
+            "description": "Type of relationship"
+          },
+          "target_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Target memory ID"
+          },
+          "strength": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Relationship strength"
+          },
+          "bidirectional": {
+            "type": "boolean",
+            "description": "Whether the relationship is bidirectional"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the relationship was created"
+          }
+        },
+        "required": ["type", "target_id", "strength", "bidirectional"],
+        "additionalProperties": false
+      },
+      "description": "Relationships to other memory entries"
+    },
+    "embeddings": {
+      "type": "object",
+      "properties": {
+        "content_vector": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "Vector embedding of content for similarity search"
+        },
+        "context_vector": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "Vector embedding of context"
+        },
+        "model_version": {
+          "type": "string",
+          "description": "Embedding model version used"
+        },
+        "embedding_timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When embeddings were generated"
+        }
+      },
+      "required": ["model_version", "embedding_timestamp"],
+      "additionalProperties": false
+    },
+    "archival": {
+      "type": "object",
+      "properties": {
+        "archived": {
+          "type": "boolean",
+          "description": "Whether this memory is archived"
+        },
+        "archived_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the memory was archived"
+        },
+        "archive_reason": {
+          "type": "string",
+          "enum": ["age", "low_relevance", "user_request", "system_cleanup"],
+          "description": "Reason for archiving"
+        },
+        "retention_until": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When this memory should be deleted"
+        }
+      },
+      "required": ["archived"],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "id",
+    "type",
+    "timestamp",
+    "context",
+    "content",
+    "metadata"
+  ],
+  "additionalProperties": false
+}
