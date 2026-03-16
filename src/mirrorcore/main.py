@@ -1281,8 +1281,6 @@ def handle_analyze_followup(args):
         print("All suggested diagnostic commands have been executed.")
         print("Consider reviewing all evidence or escalating investigation.")
 
-    db_store.update_analysis_session_status(session['id'], 'updated')
-
     print("\n✅ Follow-up analysis complete.")
     print(f"Session {session['id']} updated with new evidence.")
 

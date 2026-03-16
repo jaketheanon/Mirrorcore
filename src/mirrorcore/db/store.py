@@ -846,14 +846,14 @@ class DatabaseStore:
         if subsystem:
             query = """
             SELECT * FROM analysis_sessions 
-            WHERE detected_subsystem = ? AND session_status = 'active'
+            WHERE detected_subsystem = ? AND session_status IN ('active','updated',stalled')
             ORDER BY timestamp DESC LIMIT 1
             """
             result = conn.execute(query, (subsystem,)).fetchone()
         else:
             query = """
             SELECT * FROM analysis_sessions 
-            WHERE session_status = 'active'
+            WHERE session_status IN ('active','updated','stalled')
             ORDER BY timestamp DESC LIMIT 1
             """
             result = conn.execute(query).fetchone()
