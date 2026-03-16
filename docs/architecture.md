@@ -1,138 +1,62 @@
-# Mirrorcore Architecture Documentation
+# Mirrorcore Architecture
 
-## System Overview
+Mirrorcore is a local-first modular Python CLI system designed to act as a persistent reasoning assistant. All data remains local using SQLite storage and no external services are required for core functionality.
 
-Mirrorcore follows a modular agent-based architecture designed for local-first operation with optional cloud enhancements. The system is organized around specialized agents that handle different aspects of reasoning assistance.
+## Core Agents
 
-## Architecture Principles
+### Intake Agent
+Handles onboarding, questionnaires, and profiling to establish baseline reasoning patterns.
 
-### 1. Agent-Based Design
-Each agent has a specific responsibility and well-defined interface:
-- **Intake Agent**: User assessment and profiling
-- **Memory Agent**: Episodic memory management
-- **Persona Agent**: User modeling and style adaptation
-- **Terminal Agent**: Command-line troubleshooting
-- **Decision Agent**: Reasoning and tradeoff analysis
-- **LLM Agent**: Language model abstraction
+### Memory Agent
+Stores and retrieves episodic memories including troubleshooting sessions, decisions, and outcomes.
 
-### 2. Local-First Approach
-- Core functionality works entirely offline
-- SQLite for local persistence
-- Optional cloud LLM calls with explicit consent
-- Graceful degradation when external services unavailable
+### Persona Agent
+Maintains structured representation of user communication preferences, values, and decision style.
 
-### 3. Modular Interfaces
-- Clear separation between agents
-- Standardized communication protocols
-- Plugin-like extensibility
-- Independent testing and deployment
+### Terminal Agent
+Analyzes command outputs, logs, and error messages to guide troubleshooting workflows.
 
-## Data Flow Architecture
+### Decision Agent
+Structures trade-offs and decision-making scenarios aligned with user preferences.
 
-```
-User Input → Intake Agent → Memory Agent → Persona Agent → Response Generation
-                ↓              ↑              ↓
-Terminal Agent ← Memory Agent → Decision Agent → LLM Agent (optional)
-```
+### LLM Agent
+Provides an abstraction layer for optional language model usage while enforcing privacy rules.
 
-## Component Architecture
+## Shared Infrastructure
 
-### Database Layer (`db/`)
-- **Models.py**: SQLite data models and ORM definitions
-- **Store.py**: Database operations and query abstraction
-- Supports schema migrations and data integrity
+### Database
+SQLite database used for all persistent storage including sessions, investigations, and memory episodes.
 
-### Agent Layer
-Each agent follows consistent patterns:
-- `__init__.py`: Public interfaces and agent initialization
-- Core modules: Specific functionality implementation
-- Integration points: Standardized communication with other agents
+### Configuration
+Central configuration system controlling model choices, privacy settings, and agent behavior.
 
-### Configuration Layer (`config.py`)
-- System settings and preferences
-- Environment-specific overrides
-- LLM provider configurations
-- Privacy and security settings
+## Key Design Principles
 
-## Memory Architecture
+- Local-first architecture
+- Offline-capable functionality
+- Explicit user consent for external calls
+- Modular agents with clear responsibilities
+- Deterministic reasoning where possible
 
-### Episodic Memory System
-- Session-based interaction logging
-- Pattern extraction from historical data
-- Contextual retrieval based on current scenarios
-- Incremental learning from user feedback
+## Agent Interaction Flows
 
-### Memory Retrieval Patterns
-- Similarity-based matching
-- Temporal context consideration
-- Success rate weighting
-- User preference adaptation
+Terminal → Memory  
+Troubleshooting sessions become episodic memory records.
 
-## Persona Modeling Architecture
+Decision → Persona  
+Decision outcomes refine value and preference models.
 
-### Model Components
-- **Voice**: Communication style and tone preferences
-- **Values**: Decision criteria and ethical considerations
-- **Decision Style**: Risk tolerance and analytical approach
+Memory → All Agents  
+Past experiences inform future reasoning.
 
-### Learning Mechanisms
-- Pattern recognition from interactions
-- Explicit feedback integration
-- Behavioral analysis over time
-- Model validation and correction
+Persona → All Agents  
+Communication and reasoning style is adjusted based on stored persona preferences.
 
-## Security Architecture
+## Development Philosophy
 
-### Privacy Controls
-- Local-only data storage by default
-- Explicit consent for cloud operations
-- Data retention policies
-- Secure credential handling
+Mirrorcore prioritizes:
 
-### Data Protection
-- Input validation and sanitization
-- Safe file operations
-- Access controls for local data
-- Audit logging for sensitive operations
-
-## Performance Architecture
-
-### Optimization Strategies
-- Efficient SQLite queries
-- Memory caching for frequent patterns
-- Lazy loading of agent components
-- Asynchronous LLM operations
-
-### Scalability Considerations
-- Database indexing strategies
-- Pattern compression techniques
-- Incremental model updates
-- Resource usage monitoring
-
-## Integration Architecture
-
-### LLM Integration
-- Abstract interface for multiple providers
-- Local model support (Ollama, etc.)
-- Cloud API integration (OpenAI, Anthropic, etc.)
-- Fallback mechanisms and error handling
-
-### CLI Integration
-- Command parsing and routing
-- Interactive session management
-- Progress reporting and feedback
-- Configuration management commands
-
-## Deployment Architecture
-
-### Development Environment
-- Modular testing framework
-- Mock agents for isolated testing
-- Development database seeding
-- Configuration validation
-
-### Production Deployment
-- Single-file executable option
-- Environment-specific configurations
-- Update mechanisms and migrations
-- Health monitoring and diagnostics
+- deterministic reasoning
+- privacy-first architecture
+- modular design
+- reproducible debugging workflows
