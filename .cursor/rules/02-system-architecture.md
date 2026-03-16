@@ -1,22 +1,29 @@
-# Architecture Principles
+# Mirrorcore System Architecture
 
-## Agent-Based Design
-- Modular agents with clear responsibilities
-- Self-contained components with defined interfaces
-- Shared utilities for common functionality
+Mirrorcore is a modular Python CLI application with clear subsystem boundaries.
 
-## Local-First Approach
-- All core functionality works offline
-- SQLite for local persistence
-- Optional cloud LLM integrations only with explicit consent
-- Graceful degradation when external services unavailable
+Core modules:
+- intake/: assessments, questionnaires, first-contact profiling
+- memory/: episodic storage and retrieval
+- persona/: user preferences, values, communication style
+- terminal/: terminal/log/error parsing and troubleshooting workflows
+- decision/: structured choice and trade-off analysis
+- llm/: abstraction layer for local models and optional explicit remote use
+- db/: SQLite persistence, schema, storage, and retrieval
+- config.py: configuration, feature flags, privacy settings
 
-## Database Layer
-- Abstract persistence details from business logic
-- Structured models for persona, memory, and session data
-- Migration support for schema evolution
+Architecture rules:
+- preserve module boundaries
+- do not move logic into unrelated modules without strong justification
+- prefer extending the correct module over adding parallel subsystems
+- use shared DB/storage abstractions rather than scattering raw SQL across unrelated files
+- preserve CLI-first behavior
+- preserve SQLite as the default persistence layer
+- keep cross-module interaction explicit and understandable
+- avoid unnecessary indirection or abstraction layers
 
-## Configuration Management
-- Externalized settings with version control
-- Environment-specific overrides
-- Sensitive data handled separately
+When adding a feature:
+1. identify the owning subsystem
+2. extend the smallest safe surface area
+3. preserve current behavior outside the feature scope
+4. keep the design explainable

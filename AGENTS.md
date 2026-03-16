@@ -1,5 +1,11 @@
 # Mirrorcore Agent System
 
+This repository uses Cursor project rules located in .cursor/rules.
+
+All code modifications must follow these rules.
+Implement new phases by extending the existing project in place with minimal safe changes.
+Do not redesign working architecture or regress previously verified CLI and investigation behavior unless explicitly required.
+
 ## Project Purpose
 
 Mirrorcore is a local-first Python CLI application that serves as a private persistent reasoning assistant. It models the user's thinking patterns, decision logic, troubleshooting habits, and communication style to provide personalized assistance.

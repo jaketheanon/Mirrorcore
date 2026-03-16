@@ -1,25 +1,17 @@
-# Safety and Privacy Rules
+# Mirrorcore Safety and Privacy Rules
 
-## Privacy Requirements
-- User data never leaves local system without explicit consent
-- All processing happens locally by default
-- Optional cloud LLM calls only with user approval
-- Data retention under user control
+Mirrorcore is privacy-constrained and local-first.
 
-## Data Protection
-- Sanitize user input where applicable
-- Never expose secrets or credentials
-- Prefer safe behavior for file and system operations
-- Avoid destructive operations without safeguards
+Rules:
+- do not add silent cloud calls
+- do not transmit user logs, memory data, persona data, or decisions externally without explicit opt-in
+- keep core functionality usable without network access
+- remote model usage, if present, must remain optional and explicit
+- preserve graceful fallback behavior when LLMs are unavailable
+- do not add identity simulation or deceptive anthropomorphic behavior
+- do not blur the boundary between reasoning assistance and autonomous action
 
-## Security Constraints
-- Validate all external inputs
-- Use secure defaults for configuration
-- Implement proper access controls for local data
-- Regular security reviews for LLM integrations
-
-## Ethical Boundaries
-- No identity claims or consciousness simulation
-- Clear boundaries between assistance and automation
-- User consent for all learning and data collection
-- Transparent about system capabilities and limitations
+Storage/privacy rules:
+- local SQLite storage is the default
+- retention and external-use behavior must remain under user control
+- privacy-sensitive behavior should be explicit in code and configuration

@@ -1,25 +1,26 @@
-# Coding Standards
+# Mirrorcore Coding Standards
 
-## Python Guidelines
-- Follow PEP 8 style guidelines
-- Use type hints for all function signatures
-- Document all public functions and classes
-- Keep functions small and focused
+Mirrorcore favors clarity, determinism, and minimal safe changes over cleverness.
 
-## Code Organization
-- Each agent in separate module with clear interfaces
-- Shared utilities in common modules
-- Database models abstract persistence details
-- Configuration externalized
+Rules:
+- prefer small, targeted edits over broad refactors
+- do not rewrite working code without a concrete reason
+- preserve public command behavior unless the current task explicitly changes it
+- prefer explicit data structures and readable control flow
+- avoid introducing heavy dependencies
+- keep logic local-first and lightweight
+- make schema/storage changes minimal and backwards-compatible
+- preserve compatibility with existing session/history data whenever possible
 
-## Error Handling
-- Use explicit exception handling with clear error messages
-- Validate inputs and handle edge cases
-- Provide graceful degradation for optional features
-- Log errors appropriately for debugging
+Code style expectations:
+- use descriptive names
+- keep functions focused on one job
+- avoid hidden side effects
+- prefer straightforward branching over overly abstract patterns
+- keep CLI output consistent and readable
+- document behavior changes in README when relevant
 
-## Testing Requirements
-- Unit tests for all agent components
-- Integration tests for agent interactions
-- End-to-end tests for user workflows
-- Performance tests for memory operations
+Testing expectations:
+- verify the modified command or workflow directly
+- do not assume passing syntax means behavior is correct
+- protect earlier verified phases from regression
