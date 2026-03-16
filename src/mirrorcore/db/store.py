@@ -874,6 +874,41 @@ class DatabaseStore:
         
         return None
     
+    def get_resolved_analysis_sessions(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get recently resolved analysis sessions for similarity retrieval."""
+        import json
+        
+        conn = self.get_db_connection()
+        query = """
+        SELECT id, timestamp, detected_subsystem, signal_families,
+               top_hypothesis_category, analysis_summary,
+               investigation_state, current_strategy_family, strategies_attempted
+        FROM analysis_sessions
+        WHERE session_status IN ('completed','resolved')
+        ORDER BY timestamp DESC
+        LIMIT ?
+        """
+        
+        rows = conn.execute(query, (limit,)).fetchall()
+        
+        sessions: List[Dict[str, Any]] = []
+        for row in rows:
+            sessions.append(
+                {
+                    "id": row["id"],
+                    "timestamp": row["timestamp"],
+                    "detected_subsystem": row["detected_subsystem"],
+                    "signal_families": json.loads(row["signal_families"] or "[]"),
+                    "top_hypothesis_category": row["top_hypothesis_category"],
+                    "analysis_summary": row["analysis_summary"],
+                    "investigation_state": row["investigation_state"],
+                    "current_strategy_family": row["current_strategy_family"],
+                    "strategies_attempted": json.loads(row["strategies_attempted"] or "[]"),
+                }
+            )
+        
+        return sessions
+    
     def store_investigation_steps(self, session_id: str, diagnostic_commands: Dict[str, Any]) -> List[str]:
         """Store investigation steps for a session."""
         from uuid import uuid4

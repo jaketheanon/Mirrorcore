@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import json
 from ..persona.drift import DriftEvaluation
-from ..reasoning.response_engine import ConfidenceEvaluation
+from ..reasoning.response_engine import ConfidenceEvaluation, RootCauseHypothesis
 
 
 @dataclass
@@ -28,6 +28,18 @@ class RetrievedMemory:
     memory: Dict[str, Any]
     relevance_score: float
     retrieval_reason: str
+
+
+@dataclass
+class InvestigationMemoryMatch:
+    """Represents a retrieved past investigation session."""
+    session_id: str
+    timestamp: str
+    subsystem: Optional[str]
+    root_cause_category: Optional[str]
+    strategy_family: Optional[str]
+    resolution_summary: Optional[str]
+    similarity_score: float
 
 
 class MemoryRetrieval:
@@ -601,6 +613,92 @@ class MemoryRetrieval:
                 ))
         
         return self._rank_results(memories, query)
+    
+    def retrieve_similar_investigations(
+        self,
+        parsed_log: Any,
+        ranked_hypotheses: List[RootCauseHypothesis],
+        memory_store: Any,
+        limit: int = 3,
+    ) -> List[InvestigationMemoryMatch]:
+        """Retrieve similar past investigation sessions using deterministic scoring."""
+        # Derive current investigation context
+        current_subsystem = getattr(parsed_log, "detected_subsystem", None)
+        current_signal_families = getattr(parsed_log, "signal_families", None) or []
+        
+        top_hypothesis_category: Optional[str] = None
+        if ranked_hypotheses:
+            top_hypothesis_category = ranked_hypotheses[0].category
+        
+        # Derive current strategy family deterministically from top hypothesis category
+        if top_hypothesis_category and "network" in top_hypothesis_category:
+            current_strategy_family = "connectivity"
+        else:
+            current_strategy_family = "configuration"
+        
+        # Fetch resolved sessions from the underlying store
+        if not hasattr(memory_store, "get_resolved_analysis_sessions"):
+            return []
+        
+        try:
+            past_sessions = memory_store.get_resolved_analysis_sessions(limit=100)
+        except Exception:
+            return []
+        
+        matches: List[InvestigationMemoryMatch] = []
+        
+        for session in past_sessions:
+            past_subsystem = session.get("detected_subsystem")
+            past_families = session.get("signal_families") or []
+            past_category = session.get("top_hypothesis_category")
+            past_strategy_family = session.get("current_strategy_family")
+            past_strategies_attempted = session.get("strategies_attempted") or []
+            
+            if not past_strategy_family and past_strategies_attempted:
+                past_strategy_family = past_strategies_attempted[0]
+            
+            score = 0.0
+            
+            # Subsystem match (binary)
+            if current_subsystem and past_subsystem and current_subsystem == past_subsystem:
+                score += 0.4
+            
+            # Signal family overlap (Jaccard)
+            current_set = set(current_signal_families)
+            past_set = set(past_families)
+            if current_set and past_set:
+                intersection = len(current_set & past_set)
+                union = len(current_set | past_set) or 1
+                signal_score = 0.3 * (intersection / union)
+                score += signal_score
+            
+            # Root-cause hypothesis category match
+            if top_hypothesis_category and past_category and top_hypothesis_category == past_category:
+                score += 0.2
+            
+            # Strategy family match
+            if current_strategy_family and past_strategy_family and current_strategy_family == past_strategy_family:
+                score += 0.1
+            
+            if score <= 0.0:
+                continue
+            
+            matches.append(
+                InvestigationMemoryMatch(
+                    session_id=session["id"],
+                    timestamp=session["timestamp"],
+                    subsystem=past_subsystem,
+                    root_cause_category=past_category,
+                    strategy_family=past_strategy_family,
+                    resolution_summary=session.get("analysis_summary"),
+                    similarity_score=round(score, 3),
+                )
+            )
+        
+        # Deterministic ranking: score desc, then timestamp asc, then session_id asc
+        matches.sort(key=lambda m: (-m.similarity_score, m.timestamp or "", m.session_id))
+        
+        return matches[:limit]
 
     def _rank_results(self, results: List[RetrievedMemory], query: RetrievalQuery) -> List[RetrievedMemory]:
         """Rank results by relevance score."""

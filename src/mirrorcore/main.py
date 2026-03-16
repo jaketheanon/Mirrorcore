@@ -646,6 +646,7 @@ def handle_analyze_log(args):
     from .intake.log_parser import LogParser
     from .terminal.signatures import IncidentSignatureDetector
     from .reasoning.response_engine import ReasoningResponseEngine
+    from .memory.retrieval import MemoryRetrieval
     
     db_path = Path("data") / "mirrorcore.db"
     db_store = DatabaseStore(db_path)
@@ -926,6 +927,29 @@ def handle_analyze_log(args):
                 for i, hypothesis in enumerate(ranked_hypotheses[1:], 2):
                     print(f"{i}. {hypothesis.text}")
                     print(f"   Reason: {hypothesis.reason}")
+            
+            # Phase 23: Investigation Memory Retrieval
+            retrieval = MemoryRetrieval()
+            similar_investigations = retrieval.retrieve_similar_investigations(
+                parsed_log, ranked_hypotheses, db_store, limit=3
+            )
+            
+            print(f"\nSIMILAR PAST INVESTIGATIONS")
+            print("-" * 40)
+            if similar_investigations:
+                for match in similar_investigations:
+                    subsystem_label = match.subsystem or "unknown"
+                    root_cause_label = match.root_cause_category or "unknown"
+                    strategy_label = match.strategy_family or "unknown"
+                    
+                    print(f"{match.timestamp}  [Subsystem: {subsystem_label}]")
+                    print(f"  Root cause category: {root_cause_label}")
+                    print(f"  Strategy used: {strategy_label}")
+                    if match.resolution_summary:
+                        print(f"  Resolution summary: {match.resolution_summary}")
+                    print()
+            else:
+                print("No similar resolved investigations found.\n")
             
             # Generate and display diagnostic command suggestions
             if ranked_hypotheses:
