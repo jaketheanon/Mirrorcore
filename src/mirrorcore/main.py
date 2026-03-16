@@ -1028,15 +1028,14 @@ def handle_analyze_followup(args):
     from .intake.log_parser import LogParser
     from .reasoning.response_engine import ReasoningResponseEngine, RootCauseHypothesis
     from .db.store import DatabaseStore
-    
+
     print("🔄 EVIDENCE-BASED REANALYSIS")
     print("=" * 50)
     print("Paste follow-up command output or additional logs")
     print("End input with Ctrl+D (Unix) or Ctrl+Z then Enter (Windows)")
     print("Or type 'exit' to cancel")
     print("=" * 50)
-    
-    # Read follow-up evidence
+
     evidence_lines = []
     try:
         while True:
@@ -1045,159 +1044,158 @@ def handle_analyze_followup(args):
                 if line.strip().lower() == 'exit':
                     print("Follow-up analysis cancelled.")
                     return
-                
                 evidence_lines.append(line)
             except EOFError:
                 break
     except KeyboardInterrupt:
         print("\nFollow-up analysis cancelled.")
         return
-    
+
     if not evidence_lines:
         print("No evidence provided for follow-up analysis.")
         return
-    
+
     evidence_text = '\n'.join(evidence_lines)
-    
-    # Initialize components
+
     db_path = Path("data") / "mirrorcore.db"
     db_store = DatabaseStore(db_path)
     log_parser = LogParser()
     reasoning_engine = ReasoningResponseEngine()
-    
-    # Get latest analysis session
+
     session = db_store.get_latest_analysis_session()
-    
     if not session:
         print("No recent analysis session found for follow-up.")
         print("Run 'mirrorcore analyze-log' first to create an analysis session.")
         return
-    
+
     print(f"\n📋 Using analysis session from: {session['timestamp']}")
     print(f"Original subsystem: {session['detected_subsystem']}")
     print(f"Original top hypothesis: {session['top_hypothesis_category']}")
-    
-    # Parse evidence
+
     evidence_signals = log_parser.parse_evidence(evidence_text)
-    
     if not evidence_signals:
         print("\n⚠️ No specific evidence signals detected in follow-up.")
         print("Evidence text will be stored but hypotheses cannot be updated.")
         return
-    
+
     print(f"\n🔍 Detected evidence signals: {', '.join(evidence_signals)}")
-    
-    # Generate evidence summary
+
     evidence_summary = reasoning_engine.generate_evidence_summary(evidence_signals)
-    
-    # Show evidence update
-    print(f"\n🔄 EVIDENCE UPDATE")
+    print("\n🔄 EVIDENCE UPDATE")
     print("-" * 40)
-    
     if evidence_summary['supports']:
         print("New evidence supports:")
         for support in evidence_summary['supports']:
             print(f"- {support}")
-    
     if evidence_summary['weakens']:
         print("\nNew evidence weakens:")
         for weaken in evidence_summary['weakens']:
             print(f"- {weaken}")
-    
-    # Reconstruct original hypotheses
+
     original_hypotheses = []
     for hyp_data in session['original_hypotheses']:
-        hypothesis = RootCauseHypothesis(
-            text=hyp_data['text'],
-            related_families=session['signal_families'],
-            related_subsystems=[session['detected_subsystem']] if session['detected_subsystem'] else [],
-            category=hyp_data['category'],
-            score=hyp_data['score'],
-            reason=hyp_data['reason']
+        original_hypotheses.append(
+            RootCauseHypothesis(
+                text=hyp_data['text'],
+                related_families=session['signal_families'],
+                related_subsystems=[session['detected_subsystem']] if session['detected_subsystem'] else [],
+                category=hyp_data['category'],
+                score=hyp_data['score'],
+                reason=hyp_data['reason'],
+            )
         )
-        original_hypotheses.append(hypothesis)
-    
-    # Update hypotheses with evidence
+
     updated_hypotheses = reasoning_engine.update_hypotheses_with_evidence(
         original_hypotheses, evidence_signals, session
     )
 
-    tracking_data = db_store.get_investigation_tracking(session['id'])
-    
-    # Update evidence and hypothesis history
-    current_evidence = evidence_signals
-    current_hypotheses = [{'category': h.category, 'score': h.score, 'eliminated': h.eliminated} for h in updated_hypotheses]
-    
-    evidence_history = tracking_data['evidence_history'] + [current_evidence]
-    hypothesis_history = tracking_data['hypothesis_history'] + [current_hypotheses]
-    
-    # Detect investigation stall
-    stall_detection = reasoning_engine.detect_investigation_stall(
-        investigation_status,
-        tracking_data['current_strategy_family'],
-        tracking_data['strategies_attempted'],
-        evidence_history,
-        hypothesis_history
-    )
-    
-    # Update investigation tracking
-    if stall_detection.is_stalled and stall_detection.alternative_family:
-        new_strategies = tracking_data['strategies_attempted'] + [stall_detection.alternative_family]
-        new_progress = stall_detection.progress_metrics
-        
-        db_store.update_investigation_tracking(
-            session['id'],
-            stall_detection.alternative_family,
-            new_strategies,
-            new_progress,
-            'stalled',
-            evidence_history,
-            hypothesis_history
-        )
-    else:
-        # Update with current evidence and progress
-        current_progress = {
-            'completion_rate': investigation_status['completed_count'] / investigation_status['total_steps'] if investigation_status['total_steps'] > 0 else 0.0,
-            'strategies_attempted': len(tracking_data['strategies_attempted']),
-            'evidence_diversity': len(set(tuple(e) for e in evidence_history))
-        }
-        
-        db_store.update_investigation_tracking(
-            session['id'],
-            tracking_data['current_strategy_family'],
-            tracking_data['strategies_attempted'],
-            current_progress,
-            tracking_data['investigation_state'],
-            evidence_history,
-            hypothesis_history
-        )
-    
-    # Find and complete matching investigation step
     matching_step_id = db_store.find_matching_step(session['id'], evidence_text)
     if matching_step_id:
         db_store.complete_investigation_step(matching_step_id, evidence_signals)
-    
-    # Generate investigation status
+
     investigation_status = reasoning_engine.generate_investigation_status(
         session['id'], evidence_signals, db_store
     )
-    
-    # Generate deduplicated diagnostic commands
+    if not investigation_status:
+        investigation_status = {
+            'completed_steps': [],
+            'pending_steps': [],
+            'next_step': None,
+            'total_steps': 0,
+            'completed_count': 0,
+            'pending_count': 0,
+        }
+
     command_context = {'subsystem': session['detected_subsystem']} if session['detected_subsystem'] else None
-    top_hypothesis = updated_hypotheses[0] if updated_hypotheses else None
-    
+    top_hypothesis = next((h for h in updated_hypotheses if not h.eliminated), None)
     if top_hypothesis:
         diagnostic_commands = reasoning_engine.generate_deduplicated_diagnostic_commands(
             session['id'], top_hypothesis, command_context, db_store
         )
     else:
         diagnostic_commands = {'primary': [], 'additional': []}
-    
-    # Show investigation status
-    print(f"\n📋 INVESTIGATION STATUS")
+
+    tracking_data = db_store.get_investigation_tracking(session['id'])
+    current_strategy_family = tracking_data['current_strategy_family']
+    if not current_strategy_family:
+        current_strategy_family = 'connectivity' if 'network' in (session.get('top_hypothesis_category') or '') else 'configuration'
+
+    strategies_attempted = tracking_data['strategies_attempted'] or [current_strategy_family]
+    current_evidence = sorted(set(evidence_signals))
+    current_hypotheses = [
+        {
+            'category': h.category,
+            'score': h.score,
+            'eliminated': h.eliminated,
+        }
+        for h in updated_hypotheses
+    ]
+    evidence_history = (tracking_data['evidence_history'] or []) + [current_evidence]
+    hypothesis_history = (tracking_data['hypothesis_history'] or []) + [current_hypotheses]
+
+    stall_detection = reasoning_engine.detect_investigation_stall(
+        investigation_status,
+        current_strategy_family,
+        strategies_attempted,
+        evidence_history,
+        hypothesis_history,
+    )
+
+    if stall_detection.is_stalled and stall_detection.alternative_family:
+        new_strategies = list(strategies_attempted)
+        if stall_detection.alternative_family not in new_strategies:
+            new_strategies.append(stall_detection.alternative_family)
+        db_store.update_investigation_tracking(
+            session['id'],
+            stall_detection.alternative_family,
+            new_strategies,
+            stall_detection.progress_metrics,
+            'stalled',
+            evidence_history,
+            hypothesis_history,
+        )
+    else:
+        current_progress = {
+            'completion_rate': (
+                investigation_status['completed_count'] / investigation_status['total_steps']
+                if investigation_status['total_steps'] > 0 else 0.0
+            ),
+            'strategies_attempted': len(strategies_attempted),
+            'evidence_diversity': len({tuple(e) for e in evidence_history}) if evidence_history else 0,
+        }
+        db_store.update_investigation_tracking(
+            session['id'],
+            current_strategy_family,
+            strategies_attempted,
+            current_progress,
+            tracking_data['investigation_state'] or 'active',
+            evidence_history,
+            hypothesis_history,
+        )
+
+    print("\n📋 INVESTIGATION STATUS")
     print("-" * 40)
-    
-    # Show eliminated hypotheses
+
     eliminated_hypotheses = [h for h in updated_hypotheses if h.eliminated]
     if eliminated_hypotheses:
         print("Eliminated hypotheses:")
@@ -1205,24 +1203,21 @@ def handle_analyze_followup(args):
             print(f"✗ {hypothesis.category}")
             print(f"  Reason: {hypothesis.elimination_reason}")
         print()
-    
-    # Show completed steps
+
     if investigation_status['completed_steps']:
         print("Completed steps:")
         for step in investigation_status['completed_steps']:
             print(f"✓ {step['description']}")
             print(f"  Command: {step['command']}")
         print()
-    
-    # Show pending steps
+
     if investigation_status['pending_steps']:
         print("Pending steps:")
         for step in investigation_status['pending_steps']:
             print(f"- {step['description']}")
             print(f"  Command: {step['command']}")
         print()
-    
-    # Show next recommended step
+
     if investigation_status['next_step']:
         print("Next recommended step:")
         next_step = investigation_status['next_step']
@@ -1230,80 +1225,66 @@ def handle_analyze_followup(args):
         print(f"  Command: {next_step['command']}")
         print()
 
-    # Show stall detection if stalled
     if stall_detection.is_stalled:
-        print(f"\n🚨 INVESTIGATION STALL DETECTED")
+        print("\n🚨 INVESTIGATION STALL DETECTED")
         print("-" * 40)
         print(f"Stall reason: {stall_detection.stall_reason}")
         print(f"Failed strategy families: {', '.join(stall_detection.failed_families)}")
         print(f"Progress metrics: {stall_detection.progress_metrics['completion_rate']:.1%} completion rate")
-        
-    if stall_detection.alternative_family:
-        print(f"\n🔄 SWITCHING TO {stall_detection.alternative_family.upper()} STRATEGY")
-        print("-" * 40)
-            
-        # Generate alternative strategy commands
-        command_context = {'subsystem': session['detected_subsystem']} if session['detected_subsystem'] else None
-        alt_commands = reasoning_engine.generate_alternative_strategy_commands(
-            stall_detection.alternative_family, command_context
-        )
-            
-        if alt_commands['primary']:
-            print("\n🔎 ALTERNATIVE DIAGNOSTIC STEPS")
+
+        if stall_detection.alternative_family:
+            print(f"\n🔄 SWITCHING TO {stall_detection.alternative_family.upper()} STRATEGY")
             print("-" * 40)
-            print("Recommended checks for alternative strategy:")
-                
-            for i, cmd in enumerate(alt_commands['primary'], 1):
-                print(f"{i}. {cmd['description']}")
-                print(f"   Command: {cmd['command']}")
-    
-    # Show updated hypotheses
-    print(f"\n🧩 UPDATED ROOT-CAUSE HYPOTHESES")
+            alt_commands = reasoning_engine.generate_alternative_strategy_commands(
+                stall_detection.alternative_family, command_context
+            )
+            if alt_commands['primary']:
+                print("\n🔎 ALTERNATIVE DIAGNOSTIC STEPS")
+                print("-" * 40)
+                print("Recommended checks for alternative strategy:")
+                for i, cmd in enumerate(alt_commands['primary'], 1):
+                    print(f"{i}. {cmd['description']}")
+                    print(f"   Command: {cmd['command']}")
+
+    print("\n🧩 UPDATED ROOT-CAUSE HYPOTHESES")
     print("-" * 40)
-    
-    if updated_hypotheses:
-        top_hypothesis = updated_hypotheses[0]
+    active_hypotheses = [h for h in updated_hypotheses if not h.eliminated]
+    if active_hypotheses:
+        top_hypothesis = active_hypotheses[0]
         print("Most likely hypothesis:")
         print(f"1. {top_hypothesis.text}")
         print(f"   Reason: {top_hypothesis.reason}")
-        
-        if len(updated_hypotheses) > 1:
-            # Filter out eliminated hypotheses from display
-            active_hypotheses = [h for h in updated_hypotheses if not h.eliminated]
-            if active_hypotheses:
-                print("\nOther plausible hypotheses:")
-                for i, hypothesis in enumerate(active_hypotheses[1:], 2):
-                    print(f"{i}. {hypothesis.text}")
-                    print(f"   Reason: {hypothesis.reason}")
-        
-        # Show updated diagnostic steps (deduplicated)
-        if diagnostic_commands["primary"]:
-            print(f"\n🔎 UPDATED NEXT DIAGNOSTIC STEPS")
-            print("-" * 40)
-            print("Recommended checks for updated hypothesis:")
-            
-            for i, cmd in enumerate(diagnostic_commands["primary"], 1):
-                print(f"{i}. {cmd['description']}")
-                print(f"   Command: {cmd['command']}")
-            
-            if diagnostic_commands["additional"]:
-                print("\nOther useful checks:")
-                for cmd in diagnostic_commands["additional"]:
-                    print(f"- {cmd['description']}")
-                    print(f"  Command: {cmd['command']}")
-        elif investigation_status['completed_count'] > 0:
-            print(f"\n🔎 INVESTIGATION PROGRESS")
-            print("-" * 40)
-            print(f"Completed {investigation_status['completed_count']}/{investigation_status['total_steps']} investigation steps.")
-            print("All suggested diagnostic commands have been executed.")
-            print("Consider reviewing all evidence or escalating investigation.")
-    
-    # Update session status
-    db_store.update_analysis_session_status(session['id'], 'updated')
-    
-    print(f"\n✅ Follow-up analysis complete.")
-    print(f"Session {session['id']} updated with new evidence.")
+        if len(active_hypotheses) > 1:
+            print("\nOther plausible hypotheses:")
+            for i, hypothesis in enumerate(active_hypotheses[1:], 2):
+                print(f"{i}. {hypothesis.text}")
+                print(f"   Reason: {hypothesis.reason}")
+    else:
+        print("No active hypotheses remain after applying follow-up evidence.")
 
+    if diagnostic_commands['primary']:
+        print("\n🔎 UPDATED NEXT DIAGNOSTIC STEPS")
+        print("-" * 40)
+        print("Recommended checks for updated hypothesis:")
+        for i, cmd in enumerate(diagnostic_commands['primary'], 1):
+            print(f"{i}. {cmd['description']}")
+            print(f"   Command: {cmd['command']}")
+        if diagnostic_commands['additional']:
+            print("\nOther useful checks:")
+            for cmd in diagnostic_commands['additional']:
+                print(f"- {cmd['description']}")
+                print(f"  Command: {cmd['command']}")
+    elif investigation_status['completed_count'] > 0:
+        print("\n🔎 INVESTIGATION PROGRESS")
+        print("-" * 40)
+        print(f"Completed {investigation_status['completed_count']}/{investigation_status['total_steps']} investigation steps.")
+        print("All suggested diagnostic commands have been executed.")
+        print("Consider reviewing all evidence or escalating investigation.")
+
+    db_store.update_analysis_session_status(session['id'], 'updated')
+
+    print("\n✅ Follow-up analysis complete.")
+    print(f"Session {session['id']} updated with new evidence.")
 
 def handle_debug_history(args):
     """Handle debug history command to view ranked fix history."""

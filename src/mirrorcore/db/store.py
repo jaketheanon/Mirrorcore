@@ -40,7 +40,33 @@ class DatabaseStore:
         """Initialize the database with all required tables."""
         conn = self.get_db_connection()
         initialize_database(conn)
+        self.ensure_step21_columns()
         return True
+
+    def ensure_step21_columns(self):
+        """Ensure Step 21 investigation tracking columns exist on existing databases."""
+        conn = self.get_db_connection()
+        existing_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(analysis_sessions)").fetchall()
+        }
+
+        required_columns = {
+            "investigation_state": "TEXT DEFAULT 'active'",
+            "current_strategy_family": "TEXT",
+            "strategies_attempted": "TEXT",
+            "progress_metrics": "TEXT",
+            "evidence_history": "TEXT",
+            "hypothesis_history": "TEXT",
+        }
+
+        for column, definition in required_columns.items():
+            if column not in existing_columns:
+                conn.execute(
+                    f"ALTER TABLE analysis_sessions ADD COLUMN {column} {definition}"
+                )
+
+        conn.commit()
     
     def close(self):
         """Close database connection."""
