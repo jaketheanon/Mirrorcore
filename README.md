@@ -1464,6 +1464,8 @@ All evidence interpretation follows strict deterministic rules:
 
 Mirrorcore tracks investigation progress to avoid repeating diagnostic steps and eliminates hypotheses when strongly contradicted by evidence.
 
+
+
 ### Investigation Step Lifecycle
 
 Each diagnostic suggestion becomes a tracked investigation step:
@@ -1636,6 +1638,62 @@ Completed 3/3 investigation steps.
 All suggested diagnostic commands have been executed.
 Consider reviewing all evidence or escalating investigation.
 ```
+
+## Investigation Strategy and Dead-End Detection
+ 
+Mirrorcore detects investigation stalls and automatically switches to alternative diagnostic strategies to avoid dead ends.
+ 
+### Stall Detection Rules
+ 
+Mirrorcore uses deterministic rules to detect when investigation is stalled:
+ 
+1. **Low Completion Rate**: < 30% completion with 2+ strategy attempts
+2. **Repeated Evidence**: Same evidence patterns for 3+ consecutive updates
+3. **No Hypothesis Changes**: Top hypothesis remains unchanged for 3+ updates
+ 
+### Strategy Families
+ 
+```python
+strategy_families = {
+    'connectivity': ['direct_connection_test', 'port_connectivity_check', 'network_path_validation'],
+    'configuration': ['config_file_validation', 'environment_variable_check', 'dependency_verification'],
+    'service': ['service_status_check', 'service_log_review', 'service_dependency_check'],
+    'permissions': ['file_permission_check', 'user_access_verification', 'resource_accessibility_test']
+}
+Stall Detection Output
+bash
+🚨 INVESTIGATION STALL DETECTED
+----------------------------------------
+Stall reason: Repeated evidence patterns with no new information
+Failed strategy families: connectivity, configuration
+Progress metrics: 25.0% completion rate
+ 
+🔄 SWITCHING TO SERVICE STRATEGY
+----------------------------------------
+ 
+🔎 ALTERNATIVE DIAGNOSTIC STEPS
+----------------------------------------
+Recommended checks for alternative strategy:
+1. Check system service status
+   Command: systemctl list-units --type=service --state=running
+2. Review recent system logs
+   Command: journalctl --since "10 minutes ago" --no-pager
+Investigation Tracking Storage
+Strategy tracking stored in existing analysis_sessions table:
+
+sql
+investigation_state TEXT DEFAULT 'active',     -- active | stalled
+current_strategy_family TEXT,                  -- current strategy family
+strategies_attempted TEXT,                     -- JSON list of attempted families
+progress_metrics TEXT,                         -- JSON dict of progress metrics
+evidence_history TEXT,                         -- JSON list of evidence updates
+hypothesis_history TEXT                        -- JSON list of hypothesis rankings
+Benefits
+Dead-End Avoidance: Automatically detects when current approach is stuck
+Strategy Diversity: Systematically tries different diagnostic families
+Progressive Learning: Tracks evidence patterns and hypothesis changes
+Deterministic Switching: Clear rules for when to switch strategies
+Lightweight Storage: Uses existing session structure with minimal fields
 
 ### Benefits
 

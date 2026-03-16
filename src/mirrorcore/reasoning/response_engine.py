@@ -66,6 +66,14 @@ class ConfidenceEvaluation:
     no_incident_match: bool
     escalation_triggered: bool
 
+@dataclass
+class InvestigationStallDetection:
+    """Investigation stall detection result."""
+    is_stalled: bool
+    stall_reason: str
+    failed_families: List[str]
+    alternative_family: str
+    progress_metrics: Dict[str, float]
 
 class ReasoningResponseEngine:
     """Lightweight deterministic reasoning response generator."""
@@ -78,6 +86,14 @@ class ReasoningResponseEngine:
             "missing", "not found", "permission", "access", "install"
         ]
         
+        # Investigation strategy families
+        self.strategy_families = {
+            'connectivity': ['direct_connection_test', 'port_connectivity_check', 'network_path_validation'],
+            'configuration': ['config_file_validation', 'environment_variable_check', 'dependency_verification'],
+            'service': ['service_status_check', 'service_log_review', 'service_dependency_check'],
+            'permissions': ['file_permission_check', 'user_access_verification', 'resource_accessibility_test']
+        }
+
         self.troubleshooting_patterns = [
             r".*error.*", r".*failed.*", r".*exception.*", r".*crash.*",
             r".*not.*work.*", r".*can't.*", r".*cannot.*", r".*unable.*"
@@ -880,6 +896,91 @@ class ReasoningResponseEngine:
             'additional': filtered_additional
         }
     
+    def detect_investigation_stall(self, investigation_status: Dict[str, Any], 
+                             current_strategy_family: str, strategies_attempted: List[str],
+                             evidence_history: List[List[str]], hypothesis_history: List[Dict[str, Any]]) -> InvestigationStallDetection:
+        """Detect investigation stall using deterministic rules."""
+        
+        # Calculate progress metrics
+        completion_rate = investigation_status['completed_count'] / investigation_status['total_steps'] if investigation_status['total_steps'] > 0 else 0.0
+        
+        # Stall detection rules
+        is_stalled = False
+        stall_reason = ""
+        
+        # Rule 1: Low completion rate with multiple attempts
+        if completion_rate < 0.3 and len(strategies_attempted) >= 2:
+            is_stalled = True
+            stall_reason = "Low completion rate with multiple strategy attempts"
+        
+        # Rule 2: Repeated evidence patterns (no new evidence)
+        elif len(evidence_history) >= 3 and len(set(tuple(e) for e in evidence_history[-3:])) <= 1:
+            is_stalled = True
+            stall_reason = "Repeated evidence patterns with no new information"
+        
+        # Rule 3: No hypothesis ranking changes
+        elif len(hypothesis_history) >= 3:
+            top_categories = [h[0]['category'] if h and h[0] else None for h in hypothesis_history[-3:]]
+            if len(set(top_categories)) <= 1 and top_categories[0] is not None:
+                is_stalled = True
+                stall_reason = "No hypothesis ranking changes detected"
+        
+        # Find alternative strategy family
+        available_families = [f for f in self.strategy_families.keys() if f not in strategies_attempted]
+        alternative_family = available_families[0] if available_families else None
+        
+        progress_metrics = {
+            'completion_rate': completion_rate,
+            'strategies_attempted': len(strategies_attempted),
+            'evidence_diversity': len(set(tuple(e) for e in evidence_history)) if evidence_history else 0
+        }
+        
+        return InvestigationStallDetection(
+            is_stalled=is_stalled,
+            stall_reason=stall_reason,
+            failed_families=strategies_attempted,
+            alternative_family=alternative_family,
+            progress_metrics=progress_metrics
+        )
+    
+    def generate_alternative_strategy_commands(self, alternative_family: str, command_context: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate lightweight generic diagnostic commands for alternative strategy family."""
+        
+        if alternative_family == 'connectivity':
+            return {
+                'primary': [
+                    {'description': 'Test basic network connectivity', 'command': 'ping -c 3 localhost'},
+                    {'description': 'Check if target port is accessible', 'command': 'nc -zv localhost 8080'}
+                ],
+                'additional': []
+            }
+        elif alternative_family == 'configuration':
+            return {
+                'primary': [
+                    {'description': 'Check configuration file syntax', 'command': 'python -c "import json; json.load(open(\'config.json\'))"'},
+                    {'description': 'List environment variables', 'command': 'env | head -20'}
+                ],
+                'additional': []
+            }
+        elif alternative_family == 'service':
+            return {
+                'primary': [
+                    {'description': 'Check system service status', 'command': 'systemctl list-units --type=service --state=running'},
+                    {'description': 'Review recent system logs', 'command': 'journalctl --since "10 minutes ago" --no-pager'}
+                ],
+                'additional': []
+            }
+        elif alternative_family == 'permissions':
+            return {
+                'primary': [
+                    {'description': 'Check current user permissions', 'command': 'id'},
+                    {'description': 'Verify file access permissions', 'command': 'ls -la /tmp'}
+                ],
+                'additional': []
+            }
+        
+        return {'primary': [], 'additional': []}
+
     def generate_evidence_summary(self, evidence_signals: List[str]) -> Dict[str, List[str]]:
         """Generate summary of evidence effects on hypotheses."""
         supports = []

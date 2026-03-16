@@ -144,7 +144,13 @@ def initialize_database(conn: sqlite3.Connection):
             top_hypothesis_category TEXT,
             suggested_commands TEXT,
             analysis_summary TEXT,
-            session_status TEXT DEFAULT 'active'
+            session_status TEXT DEFAULT 'active',
+            investigation_state TEXT DEFAULT 'active',
+            current_strategy_family TEXT,
+            strategies_attempted TEXT,
+            progress_metrics TEXT,
+            evidence_history TEXT,
+            hypothesis_history TEXT
         )
     """)
     

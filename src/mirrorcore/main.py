@@ -987,7 +987,19 @@ def handle_analyze_log(args):
                 # Store investigation steps if diagnostic commands were generated
                 if 'diagnostic_commands' in locals() and diagnostic_commands:
                     db_store.store_investigation_steps(session_id, diagnostic_commands)
-                
+                # Initialize investigation tracking
+                initial_strategy = 'connectivity' if 'network' in session_data['top_hypothesis_category'] else 'configuration'
+                progress_metrics = {'completion_rate': 0.0, 'strategies_attempted': 1}
+                                
+                db_store.update_investigation_tracking(
+                    session_id,
+                    initial_strategy,
+                    [initial_strategy],
+                    progress_metrics,
+                    'active',
+                    [],
+                    []
+                )
                 print(f"\n💾 Analysis session stored with ID: {session_id}")
                 print("   Use 'mirrorcore analyze-followup' to update with new evidence.")
             except Exception:
@@ -1109,6 +1121,56 @@ def handle_analyze_followup(args):
     updated_hypotheses = reasoning_engine.update_hypotheses_with_evidence(
         original_hypotheses, evidence_signals, session
     )
+
+    tracking_data = db_store.get_investigation_tracking(session['id'])
+    
+    # Update evidence and hypothesis history
+    current_evidence = evidence_signals
+    current_hypotheses = [{'category': h.category, 'score': h.score, 'eliminated': h.eliminated} for h in updated_hypotheses]
+    
+    evidence_history = tracking_data['evidence_history'] + [current_evidence]
+    hypothesis_history = tracking_data['hypothesis_history'] + [current_hypotheses]
+    
+    # Detect investigation stall
+    stall_detection = reasoning_engine.detect_investigation_stall(
+        investigation_status,
+        tracking_data['current_strategy_family'],
+        tracking_data['strategies_attempted'],
+        evidence_history,
+        hypothesis_history
+    )
+    
+    # Update investigation tracking
+    if stall_detection.is_stalled and stall_detection.alternative_family:
+        new_strategies = tracking_data['strategies_attempted'] + [stall_detection.alternative_family]
+        new_progress = stall_detection.progress_metrics
+        
+        db_store.update_investigation_tracking(
+            session['id'],
+            stall_detection.alternative_family,
+            new_strategies,
+            new_progress,
+            'stalled',
+            evidence_history,
+            hypothesis_history
+        )
+    else:
+        # Update with current evidence and progress
+        current_progress = {
+            'completion_rate': investigation_status['completed_count'] / investigation_status['total_steps'] if investigation_status['total_steps'] > 0 else 0.0,
+            'strategies_attempted': len(tracking_data['strategies_attempted']),
+            'evidence_diversity': len(set(tuple(e) for e in evidence_history))
+        }
+        
+        db_store.update_investigation_tracking(
+            session['id'],
+            tracking_data['current_strategy_family'],
+            tracking_data['strategies_attempted'],
+            current_progress,
+            tracking_data['investigation_state'],
+            evidence_history,
+            hypothesis_history
+        )
     
     # Find and complete matching investigation step
     matching_step_id = db_store.find_matching_step(session['id'], evidence_text)
@@ -1167,6 +1229,33 @@ def handle_analyze_followup(args):
         print(f"- {next_step['description']}")
         print(f"  Command: {next_step['command']}")
         print()
+
+    # Show stall detection if stalled
+    if stall_detection.is_stalled:
+        print(f"\n🚨 INVESTIGATION STALL DETECTED")
+        print("-" * 40)
+        print(f"Stall reason: {stall_detection.stall_reason}")
+        print(f"Failed strategy families: {', '.join(stall_detection.failed_families)}")
+        print(f"Progress metrics: {stall_detection.progress_metrics['completion_rate']:.1%} completion rate")
+        
+    if stall_detection.alternative_family:
+        print(f"\n🔄 SWITCHING TO {stall_detection.alternative_family.upper()} STRATEGY")
+        print("-" * 40)
+            
+        # Generate alternative strategy commands
+        command_context = {'subsystem': session['detected_subsystem']} if session['detected_subsystem'] else None
+        alt_commands = reasoning_engine.generate_alternative_strategy_commands(
+            stall_detection.alternative_family, command_context
+        )
+            
+        if alt_commands['primary']:
+            print("\n🔎 ALTERNATIVE DIAGNOSTIC STEPS")
+            print("-" * 40)
+            print("Recommended checks for alternative strategy:")
+                
+            for i, cmd in enumerate(alt_commands['primary'], 1):
+                print(f"{i}. {cmd['description']}")
+                print(f"   Command: {cmd['command']}")
     
     # Show updated hypotheses
     print(f"\n🧩 UPDATED ROOT-CAUSE HYPOTHESES")

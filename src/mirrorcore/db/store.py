@@ -986,6 +986,66 @@ class DatabaseStore:
         query = "UPDATE analysis_sessions SET session_status = ? WHERE id = ?"
         conn.execute(query, (status, session_id))
         conn.commit()
+
+    def update_investigation_tracking(self, session_id: str, current_strategy_family: str, 
+                                strategies_attempted: List[str], progress_metrics: Dict[str, Any],
+                                investigation_state: str = 'active', evidence_history: List[List[str]] = None,
+                                hypothesis_history: List[List[Dict[str, Any]]] = None):
+        """Update investigation tracking fields."""
+        import json
+        
+        conn = self.get_db_connection()
+        query = """
+        UPDATE analysis_sessions 
+        SET investigation_state = ?, current_strategy_family = ?, 
+            strategies_attempted = ?, progress_metrics = ?, 
+            evidence_history = ?, hypothesis_history = ?
+        WHERE id = ?
+        """
+        
+        conn.execute(query, (
+            investigation_state,
+            current_strategy_family,
+            json.dumps(strategies_attempted),
+            json.dumps(progress_metrics),
+            json.dumps(evidence_history or []),
+            json.dumps(hypothesis_history or []),
+            session_id
+        ))
+        conn.commit()
+    
+    def get_investigation_tracking(self, session_id: str) -> Dict[str, Any]:
+        """Get investigation tracking fields."""
+        import json
+        
+        conn = self.get_db_connection()
+        query = """
+        SELECT investigation_state, current_strategy_family, strategies_attempted, 
+            progress_metrics, evidence_history, hypothesis_history
+        FROM analysis_sessions 
+        WHERE id = ?
+        """
+        
+        result = conn.execute(query, (session_id,)).fetchone()
+        
+        if result:
+            return {
+                'investigation_state': result['investigation_state'] or 'active',
+                'current_strategy_family': result['current_strategy_family'],
+                'strategies_attempted': json.loads(result['strategies_attempted'] or '[]'),
+                'progress_metrics': json.loads(result['progress_metrics'] or '{}'),
+                'evidence_history': json.loads(result['evidence_history'] or '[]'),
+                'hypothesis_history': json.loads(result['hypothesis_history'] or '[]')
+            }
+        
+        return {
+            'investigation_state': 'active',
+            'current_strategy_family': None,
+            'strategies_attempted': [],
+            'progress_metrics': {},
+            'evidence_history': [],
+            'hypothesis_history': []
+        }
     
     def get_session_count(self) -> int:
         """Get total number of sessions."""
