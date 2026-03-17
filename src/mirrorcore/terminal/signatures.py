@@ -40,6 +40,7 @@ class IncidentSignatureDetector:
             "git_auth_remote": "git_auth",
             "network_connectivity": "network_connectivity",
             "config_syntax_error": "config_syntax",
+            "runtime_validation_error": "runtime_validation",
             "command_not_found": "error",
         }
         return family_map.get(incident_type, "error")
@@ -230,18 +231,35 @@ class IncidentSignatureDetector:
                 ]
             },
             
-            # configuration/syntax errors
+            # configuration/syntax errors (parsing/format only; not runtime validation)
             "config_syntax_error": {
-                "keywords": ["config", "syntax", "error", "parse", "invalid", "malformed"],
-                "phrases": ["syntax error", "parse error", "invalid syntax", "malformed"],
+                "keywords": ["syntaxerror", "parse", "parsing", "malformed", "jsondecoder", "scannererror"],
+                "phrases": [
+                    "syntax error",
+                    "parse error",
+                    "invalid syntax",
+                    "syntaxerror",
+                    "jsondecodeerror",
+                    "malformed json",
+                    "malformed yaml",
+                    "malformed config",
+                    "unexpected token",
+                    "expected property name",
+                ],
                 "patterns": [
+                    r"SyntaxError\b",
+                    r"json\.decoder\.JSONDecodeError",
+                    r"yaml\.scanner\.ScannerError",
+                    r"yaml\.parser\.ParserError",
                     r"syntax\s+error",
                     r"parse\s+error",
                     r"invalid\s+syntax",
-                    r"malformed.*config"
+                    r"malformed\s+(json|yaml|config)",
+                    r"unexpected\s+token",
+                    r"expected\s+property\s+name",
                 ],
                 "confidence": 0.9,
-                "allowed_subsystems": [],  # Broad/cross-subsystem allowed
+                "allowed_subsystems": [],
                 "likely_causes": [
                     "Typo in configuration file",
                     "Wrong format or version",
@@ -257,6 +275,47 @@ class IncidentSignatureDetector:
                     "Backup current config and restore known-good version",
                     "Use configuration validation tools",
                     "Check documentation for correct format"
+                ]
+            },
+            # runtime validation errors (ValueError, invalid value, validation failed)
+            "runtime_validation_error": {
+                "keywords": ["valueerror", "typeerror", "validation", "invalid", "config", "value"],
+                "phrases": [
+                    "valueerror",
+                    "typeerror",
+                    "validation failed",
+                    "invalid configuration",
+                    "invalid value",
+                    "invalid config",
+                    "invalid configuration value",
+                    "configuration value",
+                ],
+                "patterns": [
+                    r"ValueError\b",
+                    r"TypeError\b",
+                    r"validation\s+failed",
+                    r"invalid\s+(configuration|config)\s+value",
+                    r"invalid\s+value",
+                    r"invalid\s+configuration",
+                    r"invalid\s+config\b",
+                ],
+                "confidence": 0.88,
+                "allowed_subsystems": [],
+                "likely_causes": [
+                    "Configuration value out of allowed range or type",
+                    "Missing or wrong type for a required setting",
+                    "Validation rule failed at runtime",
+                    "Environment or runtime constraint violation"
+                ],
+                "recommended_first_checks": [
+                    "Check the exact key/value mentioned in the traceback",
+                    "Validate allowed values and types in documentation",
+                    "Run with minimal config to isolate the failing option"
+                ],
+                "low_risk_initial_actions": [
+                    "Adjust the reported configuration value",
+                    "Add or fix the required setting",
+                    "Verify environment variables or overrides"
                 ]
             },
             
@@ -373,6 +432,17 @@ class IncidentSignatureDetector:
         # Sort candidates by final adjusted confidence
         candidate_incidents.sort(key=lambda x: x['confidence'], reverse=True)
         
+        # Multi-signal: prefer runtime_validation_error over config_syntax_error when both are close
+        if len(candidate_incidents) >= 2:
+            best = candidate_incidents[0]
+            second = candidate_incidents[1]
+            if (
+                best['incident_type'] == "config_syntax_error"
+                and second['incident_type'] == "runtime_validation_error"
+                and best['confidence'] - second['confidence'] <= 0.05
+            ):
+                candidate_incidents[0], candidate_incidents[1] = candidate_incidents[1], candidate_incidents[0]
+        
         # Check if best candidate meets threshold
         if candidate_incidents and candidate_incidents[0]['confidence'] >= min_threshold:
             best_candidate = candidate_incidents[0]
@@ -412,6 +482,7 @@ class IncidentSignatureDetector:
         """
         weights: Dict[str, float] = {
             "python_runtime": 0.0,
+            "runtime_validation": 0.0,
             "network_connectivity": 0.0,
             "permissions": 0.0,
             "systemd_service": 0.0,
@@ -426,6 +497,14 @@ class IncidentSignatureDetector:
             weights["python_runtime"] += 2.5
         if "exception" in user_input_lower or "valueerror" in user_input_lower or "typeerror" in user_input_lower:
             weights["python_runtime"] += 1.5
+
+        # Runtime validation (ValueError, validation failed, invalid config value)
+        if "valueerror" in user_input_lower or "typeerror" in user_input_lower:
+            weights["runtime_validation"] += 2.0
+        if "validation failed" in user_input_lower or "invalid configuration" in user_input_lower:
+            weights["runtime_validation"] += 2.0
+        if "invalid value" in user_input_lower or "invalid config" in user_input_lower:
+            weights["runtime_validation"] += 1.5
 
         # Strong network/service evidence
         if "connection refused" in user_input_lower:
@@ -478,6 +557,25 @@ class IncidentSignatureDetector:
             or "not listening" in user_input_lower
             or signal_weights.get("network_connectivity", 0.0) >= 2.0
         )
+        # Runtime validation: program ran and failed on value/validation (not parse/syntax).
+        has_runtime_validation = (
+            signal_weights.get("runtime_validation", 0.0) >= 1.5
+            or "valueerror" in user_input_lower
+            or "typeerror" in user_input_lower
+            or "validation failed" in user_input_lower
+            or "invalid configuration value" in user_input_lower
+        )
+        # Explicit syntax/parse evidence (for allowing config_syntax when Traceback present).
+        has_syntax_parse_evidence = (
+            "syntaxerror" in user_input_lower
+            or "jsondecoder" in user_input_lower
+            or "jsondecodeerror" in user_input_lower
+            or "scannererror" in user_input_lower
+            or "parse error" in user_input_lower
+            or "invalid syntax" in user_input_lower
+            or "malformed json" in user_input_lower
+            or "malformed yaml" in user_input_lower
+        )
 
         if incident_type == "pip_permission_denied":
             # Must have explicit pip evidence; generic "permission denied" isn't enough.
@@ -486,6 +584,15 @@ class IncidentSignatureDetector:
                 return False
             # If strong network or runtime evidence is present, this is almost certainly not pip permission.
             if has_traceback or has_network:
+                return False
+
+        # config_syntax_error: avoid when execution reached runtime (Traceback without syntax) or runtime validation.
+        if incident_type == "config_syntax_error":
+            # Traceback present but no explicit syntax/parse error → runtime failure, not syntax.
+            if has_traceback and not has_syntax_parse_evidence:
+                return False
+            # Runtime validation signals present → prefer runtime_validation_error.
+            if has_runtime_validation:
                 return False
 
         # Prefer network/service when strong connectivity signals appear.
@@ -518,12 +625,13 @@ class IncidentSignatureDetector:
         """Detect conflicting signal families in input."""
         signal_families = {
             'python_runtime': ['traceback', 'runtimeerror', 'typeerror', 'attributeerror', 'importerror'],
+            'runtime_validation': ['valueerror', 'typeerror', 'validation', 'invalid value', 'invalid config', 'invalid configuration'],
             'network_connectivity': ['connection', 'timeout', 'refused', 'dns', 'resolve', 'host', 'network'],
             'permissions': ['permission', 'denied', 'access', 'forbidden', 'unauthorized'],
             'docker_container': ['container', 'docker', 'restart', 'dies', 'stops', 'crash'],
             'git_auth': ['git', 'push', 'pull', 'clone', 'auth', 'authentication', 'remote'],
             'systemd_service': ['systemd', 'service', 'systemctl', 'journalctl', 'system'],
-            'config_syntax': ['config', 'syntax', 'parse', 'invalid', 'malformed']
+            'config_syntax': ['syntaxerror', 'parse', 'parsing', 'malformed', 'jsondecoder', 'scannererror', 'invalid syntax', 'parse error']
         }
         
         user_input_lower = user_input.lower()
