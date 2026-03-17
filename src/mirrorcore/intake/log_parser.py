@@ -305,6 +305,69 @@ class LogParser:
             ]
         }
     
+    def _resolve_mutually_exclusive_signals(self, signals: List[str]) -> List[str]:
+        """Resolve mutually exclusive signals before downstream scoring/output."""
+        if not signals:
+            return []
+        
+        signal_set = set(signals)
+        
+        # If both appear, keep the failure signal.
+        if 'service_active' in signal_set and 'service_inactive' in signal_set:
+            signal_set.discard('service_active')
+        
+        if 'port_listening' in signal_set and 'port_not_listening' in signal_set:
+            signal_set.discard('port_listening')
+        
+        # Preserve original ordering while applying removals.
+        resolved = []
+        for s in signals:
+            if s in signal_set and s not in resolved:
+                resolved.append(s)
+        return resolved
+    
+    def _reduce_signal_noise(self, signals: List[str]) -> List[str]:
+        """Prefer fewer high-confidence signals; suppress generic noise."""
+        if not signals:
+            return []
+        
+        signal_set = set(signals)
+        
+        # Strong/specific signals that make generic ones redundant.
+        strong_signals = {
+            'permission_denied',
+            'connection_refused',
+            'timeout',
+            'dns',
+            'command_not_found',
+            'module_not_found',
+            'import_error',
+            'syntax_error',
+            'segmentation_fault',
+            'traceback',
+            'exception',
+            'service_failed',
+            'exited_with_code',
+            'parse_error',
+        }
+        
+        generic_noise = {'error', 'failed'}
+        
+        # Drop generic noise if we already have stronger evidence.
+        if signal_set & strong_signals:
+            signal_set -= generic_noise
+        
+        # If we have traceback/exception, "error" adds little.
+        if ('traceback' in signal_set or 'exception' in signal_set) and 'error' in signal_set:
+            signal_set.discard('error')
+        
+        # Preserve original ordering while applying removals.
+        reduced = []
+        for s in signals:
+            if s in signal_set and s not in reduced:
+                reduced.append(s)
+        return reduced
+    
     def parse_log(self, raw_text: str) -> ParsedLog:
         """Parse raw log text to extract error signals and command context."""
         lines = raw_text.strip().split('\n')
@@ -335,6 +398,10 @@ class LogParser:
                 likely_keywords.extend(matched_keywords)
                 error_lines.append(line_stripped)
         
+        # Cleanup: resolve conflicts + reduce generic/noisy signals before categorization.
+        likely_keywords = self._resolve_mutually_exclusive_signals(likely_keywords)
+        likely_keywords = self._reduce_signal_noise(likely_keywords)
+        
         # Determine likely error category
         likely_error_category = self._determine_error_category(likely_keywords)
         
@@ -347,7 +414,7 @@ class LogParser:
         return ParsedLog(
             original_text=raw_text,
             extracted_lines=extracted_lines,
-            likely_keywords=list(set(likely_keywords)),  # Remove duplicates
+            likely_keywords=list(dict.fromkeys(likely_keywords)),  # De-dup preserving order
             likely_error_category=likely_error_category,
             compact_summary_text=compact_summary,
             context_lines=context_lines,
@@ -456,6 +523,8 @@ class LogParser:
                                 evidence_signals.append(category)
                             break
         
+        evidence_signals = self._resolve_mutually_exclusive_signals(evidence_signals)
+        evidence_signals = self._reduce_signal_noise(evidence_signals)
         return evidence_signals
     
     def _determine_error_category(self, keywords: List[str]) -> str:

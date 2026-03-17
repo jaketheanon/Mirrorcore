@@ -1089,9 +1089,10 @@ class ReasoningResponseEngine:
         if evaluation.escalation_triggered:
             escalation_guidance = self.generate_escalation_guidance(evaluation)
         
-        # Return result with outcome capture support and escalation info
+        # Return result with outcome capture support and escalation info.
+        # Escalation guidance is returned separately to ensure callers can print it once.
         return ResponseResult(
-            response=styled_response + escalation_guidance,
+            response=styled_response,
             should_prompt_outcome=True,  # Enable outcome capture for targeted responses
             incident_id=getattr(context, 'incident_id', None),
             suggested_fixes=suggested_fixes,
@@ -1350,9 +1351,10 @@ class ReasoningResponseEngine:
         if evaluation.escalation_triggered:
             escalation_guidance = self.generate_escalation_guidance(evaluation)
         
-        # Return result with outcome capture support and escalation info
+        # Return result with outcome capture support and escalation info.
+        # Escalation guidance is returned separately to ensure callers can print it once.
         return ResponseResult(
-            response=styled_response + escalation_guidance,
+            response=styled_response,
             should_prompt_outcome=True,  # Enable outcome capture for targeted responses
             incident_id=getattr(context, 'incident_id', None),
             suggested_fixes=suggested_fixes,

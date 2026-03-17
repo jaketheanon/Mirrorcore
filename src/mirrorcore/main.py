@@ -308,8 +308,8 @@ def handle_interactive(args):
                 
                 # Print the response
                 print_response(response_result.response)
-                
-                # Show escalation guidance if present
+
+                # Show escalation guidance if present (print once per turn)
                 if response_result.escalation_guidance:
                     print(response_result.escalation_guidance)
                 
