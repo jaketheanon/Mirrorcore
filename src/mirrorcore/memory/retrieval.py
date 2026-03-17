@@ -622,6 +622,9 @@ class MemoryRetrieval:
         limit: int = 3,
     ) -> List[InvestigationMemoryMatch]:
         """Retrieve similar past investigation sessions using deterministic scoring."""
+        # Minimum relevance threshold for inclusion
+        MIN_RELEVANCE = 0.35
+        
         # Derive current investigation context
         current_subsystem = getattr(parsed_log, "detected_subsystem", None)
         current_signal_families = getattr(parsed_log, "signal_families", None) or []
@@ -653,15 +656,24 @@ class MemoryRetrieval:
             past_category = session.get("top_hypothesis_category")
             past_strategy_family = session.get("current_strategy_family")
             past_strategies_attempted = session.get("strategies_attempted") or []
+            investigation_state = (session.get("investigation_state") or "").lower()
             
+            # Skip non-resolved investigations explicitly, even if session_status was marked resolved
+            if investigation_state in {"active", "stalled", "abandoned"}:
+                continue
+            
+            # Prefer a concrete winning strategy if available
             if not past_strategy_family and past_strategies_attempted:
                 past_strategy_family = past_strategies_attempted[0]
             
             score = 0.0
             
-            # Subsystem match (binary)
-            if current_subsystem and past_subsystem and current_subsystem == past_subsystem:
-                score += 0.4
+            # Subsystem match / mismatch
+            if current_subsystem and past_subsystem:
+                if current_subsystem == past_subsystem:
+                    score += 0.45
+                else:
+                    score -= 0.4
             
             # Signal family overlap (Jaccard)
             current_set = set(current_signal_families)
@@ -669,18 +681,52 @@ class MemoryRetrieval:
             if current_set and past_set:
                 intersection = len(current_set & past_set)
                 union = len(current_set | past_set) or 1
-                signal_score = 0.3 * (intersection / union)
+                jaccard = intersection / union
+                signal_score = 0.3 * jaccard
                 score += signal_score
+                
+                # Explicit penalty for no overlap when both sides have signals
+                if intersection == 0:
+                    score -= 0.25
+            elif current_set or past_set:
+                # One side has signals, the other doesn't – treat as weak signal
+                score -= 0.1
             
-            # Root-cause hypothesis category match
-            if top_hypothesis_category and past_category and top_hypothesis_category == past_category:
-                score += 0.2
+            # Root-cause / incident category match
+            if top_hypothesis_category and past_category:
+                if top_hypothesis_category == past_category:
+                    score += 0.25
+                else:
+                    # Soft match on shared keyword families (e.g., permission, network)
+                    def _keywords(cat: str) -> List[str]:
+                        base = cat.lower()
+                        keywords = []
+                        for kw in ["permission", "permissions", "auth", "network", "connect", "timeout", "dns", "config", "configuration", "pip", "package"]:
+                            if kw in base:
+                                keywords.append(kw)
+                        return keywords
+                    
+                    current_keywords = set(_keywords(top_hypothesis_category))
+                    past_keywords = set(_keywords(past_category))
+                    if current_keywords and past_keywords and current_keywords & past_keywords:
+                        score += 0.15
+                    else:
+                        score -= 0.3
             
             # Strategy family match
             if current_strategy_family and past_strategy_family and current_strategy_family == past_strategy_family:
+                score += 0.15
+            
+            # Reward clearly resolved investigation states
+            if investigation_state in {"resolved", "completed", "success", "fixed"}:
                 score += 0.1
             
-            if score <= 0.0:
+            # Penalize extremely generic sessions with almost no structure
+            if not any([past_subsystem, past_families, past_category, past_strategy_family]):
+                score -= 0.5
+            
+            # Enforce minimum relevance threshold
+            if score < MIN_RELEVANCE:
                 continue
             
             matches.append(
