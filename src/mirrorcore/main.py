@@ -1354,6 +1354,21 @@ def handle_debug_history(args):
             
             result = outcome.get('result_status', '').lower()
             if result == 'success':
+                open_session = db_store.get_open_session()
+                if open_session:
+                    db_store.record_investigation_resolution(
+                        session_id=open_session['id'],
+                        fix_summary=suggested_fix,
+
+            final_root_cause_category=confirmed_root_cause or "",
+            winning_strategy_family="",
+            successful_actions=[suggested_fix],
+            resolution_confidence=1.0,
+            resolution_notes=notes or "",
+                    )
+                    print(f" Investigation session {open_session['id']} marked as resolved.")
+                    print("  Future analyze-followup calls will not attach to this session.")
+                
                 incident_types[incident_type]['success'] += 1
             elif result == 'failed':
                 incident_types[incident_type]['failed'] += 1
@@ -1425,6 +1440,22 @@ def handle_debug_outcome(args):
         print(f"  Result: {result_status}")
         if confirmed_root_cause:
             print(f"  Root cause: {confirmed_root_cause}")
+        
+        # Phase 22: automatically close the latest open investigation session on success
+        if result_status.strip().lower() == "success":
+            try:
+                open_session = db_store.get_latest_analysis_session()
+            except Exception:
+                open_session = None
+            
+            if open_session and open_session.get("session_status") in ("active", "updated", "stalled"):
+                try:
+                    db_store.update_analysis_session_status(open_session["id"], "completed")
+                    print(f"\n Investigation session {open_session['id']} marked as resolved.")
+                    print("  Future analyze-followup calls will not attach to this session.")
+                except Exception:
+                    # Do not fail debug-outcome if session resolution update fails
+                    pass
         
     except (ValueError, KeyboardInterrupt):
         print("\nCancelled.")
