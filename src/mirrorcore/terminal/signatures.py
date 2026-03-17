@@ -51,11 +51,28 @@ class IncidentSignatureDetector:
             # pip permission issues
             "pip_permission_denied": {
                 "keywords": ["pip", "install", "permission", "denied", "error", "failed"],
-                "phrases": ["permission denied", "error: could not create", "unable to create", "can't create"],
+                "phrases": [
+                    "permission denied",
+                    "error: could not create",
+                    "unable to create",
+                    "can't create",
+                    "could not install packages",
+                    "--user option",
+                    "check the permissions",
+                    "dist-packages",
+                    "site-packages",
+                    "errno 13",
+                ],
                 "patterns": [
                     r"pip\s+install.*permission\s+denied",
                     r"pip\s+install.*error.*permission",
-                    r"permission\s+denied.*pip"
+                    r"permission\s+denied.*pip",
+                    r"dist-packages",
+                    r"site-packages",
+                    r"/usr/local/lib/python",
+                    r"/usr/lib/python",
+                    r"could not install packages",
+                    r"oserror.*errno\s*13",
                 ],
                 "confidence": 0.9,
                 "allowed_subsystems": ["pip", "python"],
@@ -362,7 +379,7 @@ class IncidentSignatureDetector:
         candidate_incidents = []
         
         for incident_type, signature_config in self.signatures.items():
-            if not self._passes_negative_filters(incident_type, user_input_lower, signal_weights):
+            if not self._passes_negative_filters(incident_type, user_input_lower, signal_weights, command_context):
                 continue
 
             # Check basic keyword/phrases/patterns matching
@@ -405,6 +422,13 @@ class IncidentSignatureDetector:
                 + (0.02 * len(phrase_matches))
                 + (0.005 * len(keyword_matches)),
             )
+
+            # Strong positive match: pip + permission denied + path hint → confident pip_permission_denied
+            if (
+                incident_type == "pip_permission_denied"
+                and self._is_strong_pip_permission_denied(user_input_lower, command_context)
+            ):
+                final_confidence = max(final_confidence, 0.9)
             
             # Store candidate with all scoring information
             candidate_incidents.append({
@@ -548,7 +572,13 @@ class IncidentSignatureDetector:
             return best_family
         return None
 
-    def _passes_negative_filters(self, incident_type: str, user_input_lower: str, signal_weights: Dict[str, float]) -> bool:
+    def _passes_negative_filters(
+        self,
+        incident_type: str,
+        user_input_lower: str,
+        signal_weights: Dict[str, float],
+        command_context: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Block clearly incorrect incident matches using deterministic negative rules."""
         # If runtime evidence exists, don't classify pip permission issues.
         has_traceback = "traceback" in user_input_lower or signal_weights.get("python_runtime", 0.0) >= 2.0
@@ -578,9 +608,10 @@ class IncidentSignatureDetector:
         )
 
         if incident_type == "pip_permission_denied":
-            # Must have explicit pip evidence; generic "permission denied" isn't enough.
+            # Must have pip evidence in text or from context (e.g. compact summary may omit "pip").
             has_pip_terms = ("pip" in user_input_lower) or ("pip install" in user_input_lower)
-            if not has_pip_terms:
+            subsystem_is_pip = command_context and command_context.get("subsystem") == "pip"
+            if not has_pip_terms and not subsystem_is_pip:
                 return False
             # If strong network or runtime evidence is present, this is almost certainly not pip permission.
             if has_traceback or has_network:
@@ -600,7 +631,21 @@ class IncidentSignatureDetector:
             return False
 
         return True
-    
+
+    def _is_strong_pip_permission_denied(
+        self, user_input_lower: str, command_context: Optional[Dict[str, Any]]
+    ) -> bool:
+        """True when subsystem is pip, text has permission denied, and path/supporting evidence is present."""
+        if not command_context or command_context.get("subsystem") != "pip":
+            return False
+        if "permission denied" not in user_input_lower:
+            return False
+        path_hints = ("dist-packages", "site-packages", "/usr/local/lib/python", "/usr/lib/python")
+        supporting = ("could not install packages", "--user option", "check the permissions", "errno 13")
+        has_path = any(hint in user_input_lower for hint in path_hints)
+        has_supporting = any(phrase in user_input_lower for phrase in supporting)
+        return has_path or has_supporting
+
     def _apply_subsystem_scoping(self, incident_type: str, signature_config: Dict[str, Any], command_context: Optional[Dict[str, Any]], base_confidence: float) -> float:
         """Apply subsystem scoping and conflict penalties to confidence."""
         if not command_context:
