@@ -26,11 +26,21 @@ class IncidentSignatureDetector:
     
     def __init__(self):
         self.signatures = self._create_incident_signatures()
+        # Minimum confidence required to return a concrete incident match.
+        # Below this threshold, callers should fall back to multi-signal diagnostic mode.
+        self.min_confidence_threshold = 0.75
 
     def _get_incident_signal_family(self, incident_type: str) -> str:
         """Map an incident type to the signal family it primarily explains."""
         family_map = {
-            "pip_permission_denied": "permission_denied", "docker_container_restart": "error", "systemd_service_failed": "error", "git_auth_remote": "error", "network_connectivity": "connection_refused", "config_syntax_error": "error", "command_not_found": "error",
+            # Must align with families produced by _detect_conflicting_signals().
+            "pip_permission_denied": "permissions",
+            "docker_container_restart": "docker_container",
+            "systemd_service_failed": "systemd_service",
+            "git_auth_remote": "git_auth",
+            "network_connectivity": "network_connectivity",
+            "config_syntax_error": "config_syntax",
+            "command_not_found": "error",
         }
         return family_map.get(incident_type, "error")
     
@@ -280,24 +290,22 @@ class IncidentSignatureDetector:
                 ]
             },
         }
-    def _get_incident_signal_family(self, incident_type: str) -> str:
-        """Map an incident type to the signal family it primarily explains."""
-        family_map = {
-            "pip_permission_denied": "permission_denied", "docker_container_restart": "error", "systemd_service_failed": "error", "git_auth_remote": "error", "network_connectivity": "connection_refused", "config_syntax_error": "error", "command_not_found": "error",
-        }
-        return family_map.get(incident_type, "error")
-        
     def detect_incident(self, user_input: str, command_context: Optional[Dict[str, Any]] = None) -> Optional[IncidentSignature]:
         """Detect incident signature from user input with optional command context."""
         user_input_lower = user_input.lower()
         
         # Detect signal families for conflict analysis
         signal_families = self._detect_conflicting_signals(user_input)
+        signal_weights = self._calculate_signal_family_weights(user_input_lower)
+        dominant_family = self._get_dominant_signal_family(signal_weights)
         
         # Calculate adjusted confidence for all incident signatures
         candidate_incidents = []
         
         for incident_type, signature_config in self.signatures.items():
+            if not self._passes_negative_filters(incident_type, user_input_lower, signal_weights):
+                continue
+
             # Check basic keyword/phrases/patterns matching
             keyword_matches = self._check_keywords(user_input_lower, signature_config.get('keywords', []))
             phrase_matches = self._check_phrases(user_input_lower, signature_config.get('phrases', []))
@@ -320,6 +328,24 @@ class IncidentSignatureDetector:
             # Apply signal family conflict penalties
             conflict_penalty = self._calculate_conflict_penalty_for_incident(scoped_confidence, signal_families)
             final_confidence = max(0.0, scoped_confidence - conflict_penalty)
+
+            # Weight toward the dominant signal family (prevents permissive keyword matches from winning)
+            incident_family = self._get_incident_signal_family(incident_type)
+            if incident_family and dominant_family and incident_family == dominant_family:
+                # Small deterministic boost; the rest of scoring remains unchanged.
+                final_confidence = min(0.95, final_confidence + 0.08)
+            elif dominant_family and incident_family != dominant_family and dominant_family in signal_families:
+                # If we have a clear dominant family and this incident doesn't explain it, penalize lightly.
+                final_confidence = max(0.0, final_confidence - 0.08)
+
+            # Reward specificity: patterns/phrases are stronger evidence than loose keywords.
+            final_confidence = min(
+                0.95,
+                final_confidence
+                + (0.04 * len(pattern_matches))
+                + (0.02 * len(phrase_matches))
+                + (0.005 * len(keyword_matches)),
+            )
             
             # Store candidate with all scoring information
             candidate_incidents.append({
@@ -336,13 +362,13 @@ class IncidentSignatureDetector:
         # Apply ambiguity blocking rules
         if len(signal_families) >= 3:
             # High ambiguity: require stricter threshold
-            min_threshold = 0.8
+            min_threshold = max(self.min_confidence_threshold, 0.85)
         elif len(signal_families) >= 2:
             # Moderate ambiguity: require moderate threshold
-            min_threshold = 0.7
+            min_threshold = max(self.min_confidence_threshold, 0.8)
         else:
             # Low ambiguity: normal threshold
-            min_threshold = 0.7
+            min_threshold = self.min_confidence_threshold
         
         # Sort candidates by final adjusted confidence
         candidate_incidents.sort(key=lambda x: x['confidence'], reverse=True)
@@ -378,6 +404,95 @@ class IncidentSignatureDetector:
         
         # No confident incident match
         return None
+
+    def _calculate_signal_family_weights(self, user_input_lower: str) -> Dict[str, float]:
+        """Calculate weighted strength per signal family from raw text.
+
+        This is intentionally simple and deterministic: strong phrases contribute more than loose keywords.
+        """
+        weights: Dict[str, float] = {
+            "python_runtime": 0.0,
+            "network_connectivity": 0.0,
+            "permissions": 0.0,
+            "systemd_service": 0.0,
+            "docker_container": 0.0,
+            "git_auth": 0.0,
+            "config_syntax": 0.0,
+            "error": 0.0,
+        }
+
+        # Strong runtime evidence
+        if "traceback" in user_input_lower:
+            weights["python_runtime"] += 2.5
+        if "exception" in user_input_lower or "valueerror" in user_input_lower or "typeerror" in user_input_lower:
+            weights["python_runtime"] += 1.5
+
+        # Strong network/service evidence
+        if "connection refused" in user_input_lower:
+            weights["network_connectivity"] += 2.5
+        if "timed out" in user_input_lower or "timeout" in user_input_lower:
+            weights["network_connectivity"] += 2.0
+        if "port" in user_input_lower and ("not listening" in user_input_lower or "refused" in user_input_lower):
+            weights["network_connectivity"] += 1.5
+
+        # Service management evidence
+        if "systemctl" in user_input_lower or "journalctl" in user_input_lower or "systemd" in user_input_lower:
+            weights["systemd_service"] += 2.0
+        if "failed to start" in user_input_lower and "service" in user_input_lower:
+            weights["systemd_service"] += 1.5
+
+        # Permissions evidence
+        if "permission denied" in user_input_lower:
+            weights["permissions"] += 2.5
+        # Loose permission signals should not overpower stronger families
+        if "permission" in user_input_lower or "denied" in user_input_lower:
+            weights["permissions"] += 0.5
+
+        # Pip-specific evidence (kept as part of permissions, but used for negative filtering)
+        if "pip" in user_input_lower and "install" in user_input_lower:
+            weights["permissions"] += 1.0
+
+        return weights
+
+    def _get_dominant_signal_family(self, signal_weights: Dict[str, float]) -> Optional[str]:
+        """Return the dominant signal family if clearly dominant, else None."""
+        if not signal_weights:
+            return None
+        # Deterministic tie-breaking by key name to keep ordering stable
+        best_family, best_score = sorted(signal_weights.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+        if best_score <= 0.0:
+            return None
+        # Require dominance over runner-up to avoid flip-flopping on weak evidence
+        sorted_scores = sorted(signal_weights.values(), reverse=True)
+        runner_up = sorted_scores[1] if len(sorted_scores) > 1 else 0.0
+        if best_score >= runner_up + 1.0:
+            return best_family
+        return None
+
+    def _passes_negative_filters(self, incident_type: str, user_input_lower: str, signal_weights: Dict[str, float]) -> bool:
+        """Block clearly incorrect incident matches using deterministic negative rules."""
+        # If runtime evidence exists, don't classify pip permission issues.
+        has_traceback = "traceback" in user_input_lower or signal_weights.get("python_runtime", 0.0) >= 2.0
+        has_network = (
+            "connection refused" in user_input_lower
+            or "not listening" in user_input_lower
+            or signal_weights.get("network_connectivity", 0.0) >= 2.0
+        )
+
+        if incident_type == "pip_permission_denied":
+            # Must have explicit pip evidence; generic "permission denied" isn't enough.
+            has_pip_terms = ("pip" in user_input_lower) or ("pip install" in user_input_lower)
+            if not has_pip_terms:
+                return False
+            # If strong network or runtime evidence is present, this is almost certainly not pip permission.
+            if has_traceback or has_network:
+                return False
+
+        # Prefer network/service when strong connectivity signals appear.
+        if has_network and incident_type in ("pip_permission_denied", "config_syntax_error", "git_auth_remote"):
+            return False
+
+        return True
     
     def _apply_subsystem_scoping(self, incident_type: str, signature_config: Dict[str, Any], command_context: Optional[Dict[str, Any]], base_confidence: float) -> float:
         """Apply subsystem scoping and conflict penalties to confidence."""
