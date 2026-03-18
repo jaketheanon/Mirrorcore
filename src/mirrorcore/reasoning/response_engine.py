@@ -1061,20 +1061,38 @@ class ReasoningResponseEngine:
                 styled_response += f"• {action}\n"
             styled_response += "\n"
         
-        # Add historical context if available
+        # Add historical context if available (gated through should_surface_historical_fix_guidance)
         if context.memory_store:
             try:
+                from ..terminal.historical_fix_gate import should_surface_historical_fix_guidance
+
                 ranked_fixes = context.memory_store.get_ranked_fixes_by_incident_type(
                     incident.incident_type, limit=3
                 )
-                
-                if ranked_fixes:
-                    successful_fixes = [f for f in ranked_fixes if f['success_count'] > 0]
-                    if successful_fixes:
+                successful_fixes = [f for f in ranked_fixes if f.get('success_count', 0) > 0] if ranked_fixes else []
+
+                if successful_fixes:
+                    show_hist = should_surface_historical_fix_guidance(
+                        successful_fixes[0],
+                        incident.incident_type,
+                        getattr(incident, "confidence", 0.0) or 0.0,
+                        user_input=context.user_input,
+                        signal_families=getattr(context, "signal_families", None),
+                        detected_subsystem=getattr(context, "detected_subsystem", None),
+                        likely_error_category=getattr(context, "likely_error_category", None),
+                    )
+                    if show_hist:
                         top_fix = successful_fixes[0]
                         styled_response += f"Based on previous outcomes for this issue:\n"
                         styled_response += f"Most successful approach: {top_fix['normalized_fix']}\n"
-                        styled_response += f"  Reason: {top_fix['success_count']} successful, {top_fix['failed_count']} failed attempts\n\n"
+                        styled_response += f"  Reason: {top_fix['success_count']} successful, {top_fix['failed_count']} failed attempts\n"
+                        suggested_fixes.append(top_fix['normalized_fix'])
+                        if len(successful_fixes) > 1:
+                            styled_response += "Other successful approaches:\n"
+                            for i, fix in enumerate(successful_fixes[1:3], 2):
+                                styled_response += f"  {i}. {fix['normalized_fix']} ({fix['success_count']} success)\n"
+                                suggested_fixes.append(fix['normalized_fix'])
+                        styled_response += "\n"
             except Exception:
                 pass  # Don't fail if memory retrieval fails
         
