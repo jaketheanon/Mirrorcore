@@ -763,16 +763,33 @@ def handle_analyze_log(args):
         
         # Get ranked historical fixes for this incident type
         try:
+            from .terminal.historical_fix_gate import should_surface_historical_fix_guidance
+
             ranked_fixes = db_store.get_ranked_fixes_by_incident_type(
                 incident_with_context.incident_type, limit=3
             )
-            
-            if ranked_fixes:
+            successful_ranked = [f for f in ranked_fixes if f.get("success_count", 0) > 0]
+            show_historical = False
+            if successful_ranked:
+                _ctx_text = parsed_log.compact_summary_text
+                if parsed_log.extracted_lines:
+                    _ctx_text = _ctx_text + "\n" + "\n".join(parsed_log.extracted_lines[:5])
+                show_historical = should_surface_historical_fix_guidance(
+                    successful_ranked[0],
+                    incident_with_context.incident_type,
+                    confidence_with,
+                    likely_error_category=parsed_log.likely_error_category,
+                    signal_families=parsed_log.signal_families,
+                    detected_subsystem=parsed_log.detected_subsystem,
+                    user_input=_ctx_text,
+                )
+
+            if ranked_fixes and show_historical:
                 print(f"\n💡 HISTORICAL FIX GUIDANCE")
                 print("-" * 40)
                 
                 # Show top ranked fix with explanation
-                top_fix = ranked_fixes[0]
+                top_fix = successful_ranked[0]
                 print(f"Most successful approach: {top_fix['normalized_fix']}")
                 print(f"   Reason: {top_fix['success_count']} successful, {top_fix['failed_count']} failed attempts")
                 

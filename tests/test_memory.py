@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from mirrorcore.memory.extractor import MemoryExtractor
 from mirrorcore.memory.retrieval import MemoryRetrieval, RetrievalQuery
 from mirrorcore.memory.updater import MemoryUpdater
+from mirrorcore.reasoning.response_engine import RootCauseHypothesis
+from mirrorcore.terminal.historical_fix_gate import should_surface_historical_fix_guidance
 
 
 class TestMemoryExtractor(unittest.TestCase):
@@ -88,6 +90,112 @@ class TestMemoryRetrieval(unittest.TestCase):
         similarity = self.retrieval._calculate_context_similarity(context1, context2)
         self.assertGreater(similarity, 0.0)
         self.assertLessEqual(similarity, 1.0)
+
+    def test_learned_fix_gates_mixed_runtime_network_one_off(self):
+        """Traceback + connectivity signals must not promote a one-off port fix."""
+        store_sessions = [
+            {
+                "detected_subsystem": "python",
+                "top_hypothesis_category": "network",
+                "signal_families": ["connection_refused", "timeout"],
+                "strategies_attempted": ["killed process using port 8080"],
+                "investigation_state": "resolved",
+            }
+        ]
+
+        class _Store:
+            def get_resolved_analysis_sessions(self, limit=200):
+                return store_sessions
+
+        class _Log:
+            detected_subsystem = "python"
+            signal_families = ["python_runtime", "error", "connection_refused", "timeout"]
+            likely_error_category = "traceback"
+
+        hyp = RootCauseHypothesis(
+            text="runtime issue",
+            related_families=_Log.signal_families,
+            related_subsystems=["python"],
+            category="runtime_network",
+            score=1.0,
+            reason="test",
+        )
+        r = self.retrieval.match_best_fix_pattern_for_issue(
+            _Log(), [hyp], _Store()
+        )
+        self.assertIsNone(r)
+
+    def test_learned_fix_shows_repeated_permission_strategy(self):
+        """Repeated successful pip --user still surfaces after two successes."""
+        key = {
+            "detected_subsystem": "python",
+            "top_hypothesis_category": "permissions",
+            "signal_families": ["permission_denied"],
+            "strategies_attempted": ["used pip install --user requests"],
+            "investigation_state": "resolved",
+        }
+
+        class _Store:
+            def get_resolved_analysis_sessions(self, limit=200):
+                return [dict(key), dict(key)]
+
+        class _Log:
+            detected_subsystem = "python"
+            signal_families = ["permission_denied"]
+            likely_error_category = "permission_denied"
+
+        hyp = RootCauseHypothesis(
+            text="perm",
+            related_families=_Log.signal_families,
+            related_subsystems=["python"],
+            category="permissions",
+            score=1.0,
+            reason="test",
+        )
+        r = self.retrieval.match_best_fix_pattern_for_issue(_Log(), [hyp], _Store())
+        self.assertIsNotNone(r)
+        _pattern, strategies = r
+        self.assertGreaterEqual(strategies[0].successful_attempts, 2)
+
+    def test_historical_gate_blocks_traceback_network_one_off(self):
+        """Runtime/traceback + mixed signals: do not show network one-off port fix."""
+        fix = {"success_count": 1, "failed_count": 0, "normalized_fix": "killed process using port 8080"}
+        fams = ["python_runtime", "error", "connection_refused", "timeout"]
+        ok = should_surface_historical_fix_guidance(
+            fix,
+            "network_connectivity",
+            0.9,
+            likely_error_category="traceback",
+            signal_families=fams,
+            detected_subsystem="python",
+            user_input="ValueError: invalid port",
+        )
+        self.assertFalse(ok)
+
+    def test_historical_gate_allows_pip_after_two_successes(self):
+        fix = {"success_count": 2, "failed_count": 0, "normalized_fix": "used pip install --user requests"}
+        ok = should_surface_historical_fix_guidance(
+            fix,
+            "pip_permission_denied",
+            0.9,
+            likely_error_category="permission_denied",
+            signal_families=["permission_denied"],
+            detected_subsystem="pip",
+        )
+        self.assertTrue(ok)
+
+    def test_historical_gate_allows_network_fix_single_success_curl(self):
+        fix = {"success_count": 1, "failed_count": 0, "normalized_fix": "freed port 8080"}
+        ok = should_surface_historical_fix_guidance(
+            fix,
+            "network_connectivity",
+            0.9,
+            likely_error_category="connection_refused",
+            signal_families=["connection_refused"],
+            detected_subsystem="curl",
+            user_input="curl: connection refused",
+        )
+        self.assertTrue(ok)
 
 
 class TestMemoryUpdater(unittest.TestCase):

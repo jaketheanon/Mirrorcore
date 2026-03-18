@@ -1294,23 +1294,25 @@ class ReasoningResponseEngine:
         suggested_fixes = []
         if hasattr(context, 'memory_store') and context.memory_store:
             try:
-                # Get ranked fixes for this incident type
+                from ..terminal.historical_fix_gate import should_surface_historical_fix_guidance
+
                 ranked_fixes = context.memory_store.get_ranked_fixes_by_incident_type(
                     incident.incident_type, limit=3
                 )
-                
-                if ranked_fixes:
+                successful_ranked = [f for f in ranked_fixes if f.get("success_count", 0) > 0]
+                show_hist = bool(successful_ranked) and should_surface_historical_fix_guidance(
+                    successful_ranked[0],
+                    incident.incident_type,
+                    getattr(incident, "confidence", 0.0) or 0.0,
+                    user_input=context.user_input,
+                )
+
+                if ranked_fixes and show_hist:
                     response += "Based on previous outcomes for this issue:\n"
-                    
-                    # Show top ranked fix with explanation
-                    top_fix = ranked_fixes[0]
+                    top_fix = successful_ranked[0]
                     response += f"Most successful approach: {top_fix['normalized_fix']}\n"
                     response += f"  Reason: {top_fix['success_count']} successful, {top_fix['failed_count']} failed attempts\n"
-                    
-                    # Collect suggested fixes for outcome capture
                     suggested_fixes.append(top_fix['normalized_fix'])
-                    
-                    # Show other successful options
                     successful_fixes = [f for f in ranked_fixes if f['success_count'] > 0]
                     if len(successful_fixes) > 1:
                         response += "Other successful approaches:\n"

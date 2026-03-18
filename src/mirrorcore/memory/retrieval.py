@@ -883,85 +883,167 @@ class MemoryRetrieval:
         parsed_log: Any,
         ranked_hypotheses: Optional[List[RootCauseHypothesis]],
         memory_store: Any,
-        min_pattern_score: float = 0.55,
+        min_pattern_score: float = 0.58,
         min_success_rate: float = 0.5,
     ) -> Optional[Tuple[FixPattern, List[StrategyStats]]]:
         """
         Match the current issue to the best learned fix pattern.
 
-        Scoring is deterministic and reuses the same signals as Phase 23
-        retrieval, but with a simpler weighting.
+        Phase 24: Tight alignment (category + signal families + subsystem).
+        Weak or one-off matches are gated out unless pattern score is very high
+        or the strategy has multiple successful past uses.
         """
+        # Stronger bar to promote a fix from a single past success
+        _SINGLE_SUCCESS_MIN_SCORE = 0.78
+
+        _RUNTIME_SF = frozenset({"python_runtime", "error"})
+        _CONN_SF = frozenset({"connection_refused", "timeout", "network_connectivity"})
+        _PERM_SF = frozenset({"permissions", "permission_denied"})
+        _CONFIG_SF = frozenset({"config"})
+
+        def _buckets_from_hypothesis_category(cat: Optional[str]) -> frozenset:
+            if not cat:
+                return frozenset()
+            buckets: set = set()
+            for t in cat.lower().replace("-", "_").split("_"):
+                if t in ("runtime", "error", "validation"):
+                    buckets.add("runtime")
+                elif t in ("network", "service", "docker"):
+                    buckets.add("connectivity")
+                elif t in ("permission", "permissions"):
+                    buckets.add("permission")
+                elif t in ("config", "configuration"):
+                    buckets.add("config")
+            return frozenset(buckets)
+
+        def _buckets_from_lec_and_signals(lec: str, families: List[str]) -> frozenset:
+            """When hypotheses are absent (e.g. analyze-log), infer buckets."""
+            b: set = set()
+            lec_l = (lec or "").lower()
+            if lec_l == "permission_denied":
+                b.add("permission")
+            if lec_l in ("connection_refused", "timeout", "dns", "service_failed"):
+                b.add("connectivity")
+            if lec_l in (
+                "traceback",
+                "exception",
+                "syntax_error",
+                "module_not_found",
+                "import_error",
+                "segmentation_fault",
+                "parse_error",
+            ):
+                b.add("runtime")
+            sf = set(families or [])
+            if sf & _RUNTIME_SF:
+                b.add("runtime")
+            if sf & _CONN_SF:
+                b.add("connectivity")
+            if sf & _PERM_SF:
+                b.add("permission")
+            if sf & _CONFIG_SF:
+                b.add("config")
+            return frozenset(b)
+
         patterns = self.get_successful_fix_patterns(memory_store)
         if not patterns:
             return None
 
         current_subsystem = getattr(parsed_log, "detected_subsystem", None)
         current_signal_families = getattr(parsed_log, "signal_families", None) or []
+        current_set = set(current_signal_families)
 
         current_category: Optional[str] = None
         if ranked_hypotheses:
             current_category = ranked_hypotheses[0].category
 
-        def _keywords(cat: str) -> List[str]:
-            base = cat.lower()
-            kws: List[str] = []
-            for kw in [
-                "permission",
-                "permissions",
-                "auth",
-                "network",
-                "connect",
-                "timeout",
-                "dns",
-                "config",
-                "configuration",
-                "pip",
-                "package",
-            ]:
-                if kw in base:
-                    kws.append(kw)
-            return kws
+        if ranked_hypotheses:
+            cur_buckets = _buckets_from_hypothesis_category(current_category)
+            cur_buckets = frozenset(set(cur_buckets) | set(_buckets_from_lec_and_signals("", current_signal_families)))
+        else:
+            lec = getattr(parsed_log, "likely_error_category", None) or ""
+            cur_buckets = _buckets_from_lec_and_signals(lec, current_signal_families)
+
+        pat_cat_str = lambda pc: (pc or "").lower()
 
         best_score = float("-inf")
         best_pattern: Optional[FixPattern] = None
 
         for pattern in patterns:
             score = 0.0
+            pattern_set = set(pattern.signal_families or [])
+            pat_buckets = _buckets_from_hypothesis_category(pattern.root_cause_category)
 
-            # Subsystem match is the strongest signal
+            # Subsystem: meaningful but not dominant alone (avoid same-subsystem-only matches)
             if current_subsystem and pattern.subsystem:
                 if current_subsystem == pattern.subsystem:
-                    score += 0.5
+                    score += 0.26
                 else:
-                    score -= 0.45
+                    score -= 0.42
+            elif current_subsystem or pattern.subsystem:
+                score -= 0.06
 
-            # Signal family overlap (Jaccard)
-            current_set = set(current_signal_families)
-            pattern_set = set(pattern.signal_families or [])
+            # Signal family overlap (Jaccard), weighted strongly when categories align
+            inter_sf = len(current_set & pattern_set)
             if current_set and pattern_set:
-                intersection = len(current_set & pattern_set)
                 union = len(current_set | pattern_set) or 1
-                jaccard = intersection / union
-                score += 0.3 * jaccard
-                if intersection == 0:
-                    score -= 0.2
+                jaccard = inter_sf / union
+                score += 0.44 * jaccard
+                if inter_sf == 0:
+                    score -= 0.26
+                elif inter_sf >= 2:
+                    score += 0.07
             elif current_set or pattern_set:
-                score -= 0.05
+                score -= 0.08
 
-            # Category similarity (exact or keyword overlap)
-            if current_category and pattern.root_cause_category:
-                if current_category == pattern.root_cause_category:
-                    score += 0.25
-                else:
-                    cur_kw = set(_keywords(current_category))
-                    pat_kw = set(_keywords(pattern.root_cause_category))
-                    if cur_kw and pat_kw and cur_kw & pat_kw:
-                        score += 0.15
+            has_runtime_sig = bool(current_set & _RUNTIME_SF)
+            has_conn_sig = bool(current_set & _CONN_SF)
+            mixed_runtime_network = has_runtime_sig and has_conn_sig
+            pat_connectivity_only = pat_buckets <= frozenset({"connectivity"}) and pat_buckets
+
+            # Category / root-cause alignment (prefer exact or same bucket profile)
+            cat_a = (current_category or "").strip()
+            cat_b = (pattern.root_cause_category or "").strip()
+            if cat_a and cat_b and cat_a == cat_b:
+                score += 0.42
+            elif cur_buckets and pat_buckets:
+                if cur_buckets == pat_buckets:
+                    score += 0.32
+                elif cur_buckets <= pat_buckets or pat_buckets <= cur_buckets:
+                    score += 0.20
+                elif cur_buckets & pat_buckets:
+                    # Overlap only via shared connectivity while current is also runtime-heavy
+                    if (
+                        "runtime" in cur_buckets
+                        and "runtime" not in pat_buckets
+                        and mixed_runtime_network
+                        and pat_connectivity_only
+                    ):
+                        score += 0.06
+                        score -= 0.30
+                    elif "permission" in cur_buckets & pat_buckets:
+                        score += 0.22
+                    elif "connectivity" in cur_buckets & pat_buckets:
+                        score += 0.10
+                        score -= 0.12
                     else:
-                        score -= 0.15
+                        score += 0.08
+                else:
+                    score -= 0.22
+            elif cur_buckets or pat_buckets:
+                score -= 0.14
 
-            # Penalize patterns with no usable strategies
+            if mixed_runtime_network and pat_connectivity_only and inter_sf < 3:
+                score -= 0.14
+
+            # Pip / permission patterns must not weakly match runtime-only issues
+            pat_perm = "permission" in pat_cat_str(pattern.root_cause_category) or (
+                pat_buckets <= frozenset({"permission"})
+            )
+            cur_perm = "permission" in (current_category or "").lower() or "permission" in cur_buckets
+            if pat_perm and not cur_perm and not (current_set & _PERM_SF):
+                score -= 0.55
+
             if not pattern.strategies:
                 score -= 0.5
 
@@ -975,7 +1057,6 @@ class MemoryRetrieval:
         if best_score < min_pattern_score:
             return None
 
-        # Filter strategies again with slightly stricter success criteria for display
         strong_strategies: List[StrategyStats] = [
             s
             for s in best_pattern.strategies
@@ -985,8 +1066,16 @@ class MemoryRetrieval:
         if not strong_strategies:
             return None
 
-        # Limit to the top 3 for display
-        return best_pattern, strong_strategies[:3]
+        # Minimum evidence: repeat success OR very strong pattern match
+        evidence_ok = [
+            s
+            for s in strong_strategies
+            if s.successful_attempts >= 2 or best_score >= _SINGLE_SUCCESS_MIN_SCORE
+        ]
+        if not evidence_ok:
+            return None
+
+        return best_pattern, evidence_ok[:3]
 
     def _rank_results(self, results: List[RetrievedMemory], query: RetrievalQuery) -> List[RetrievedMemory]:
         """Rank results by relevance score."""
