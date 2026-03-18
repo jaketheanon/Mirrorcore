@@ -650,6 +650,7 @@ def handle_analyze_log(args):
     
     db_path = Path("data") / "mirrorcore.db"
     db_store = DatabaseStore(db_path)
+    retrieval = MemoryRetrieval()
     
     print("📋 Paste raw terminal output, logs, or stack traces")
     print("   End input with Ctrl+D (Unix) or Ctrl+Z then Enter (Windows)")
@@ -793,6 +794,28 @@ def handle_analyze_log(args):
             
         except Exception:
             pass  # Don't fail if historical retrieval fails
+
+        # Phase 24: Learned cross-session fix patterns
+        try:
+            matched_pattern = retrieval.match_best_fix_pattern_for_issue(
+                parsed_log=parsed_log,
+                ranked_hypotheses=None,
+                memory_store=db_store,
+            )
+        except Exception:
+            matched_pattern = None
+
+        if matched_pattern:
+            pattern, strategies = matched_pattern
+            print(f"\n💡 LEARNED FIX PATTERNS")
+            print("-" * 40)
+            for idx, strategy in enumerate(strategies, 1):
+                rate_pct = int(round(strategy.success_rate * 100))
+                print(
+                    f"{idx}. {strategy.name} "
+                    f"({rate_pct}% success, "
+                    f"{strategy.successful_attempts}/{strategy.total_attempts} attempts)"
+                )
         
         # Show signal families and subsystem information
         if parsed_log.detected_subsystem:
@@ -929,7 +952,6 @@ def handle_analyze_log(args):
                     print(f"   Reason: {hypothesis.reason}")
             
             # Phase 23: Investigation Memory Retrieval
-            retrieval = MemoryRetrieval()
             similar_investigations = retrieval.retrieve_similar_investigations(
                 parsed_log, ranked_hypotheses, db_store, limit=3
             )
@@ -950,6 +972,28 @@ def handle_analyze_log(args):
                     print()
             else:
                 print("No similar resolved investigations found.\n")
+
+            # Phase 24: Learned cross-session fix patterns
+            try:
+                matched_pattern = retrieval.match_best_fix_pattern_for_issue(
+                    parsed_log=parsed_log,
+                    ranked_hypotheses=ranked_hypotheses,
+                    memory_store=db_store,
+                )
+            except Exception:
+                matched_pattern = None
+
+            if matched_pattern:
+                pattern, strategies = matched_pattern
+                print(f"\n💡 LEARNED FIX PATTERNS")
+                print("-" * 40)
+                for idx, strategy in enumerate(strategies, 1):
+                    rate_pct = int(round(strategy.success_rate * 100))
+                    print(
+                        f"{idx}. {strategy.name} "
+                        f"({rate_pct}% success, "
+                        f"{strategy.successful_attempts}/{strategy.total_attempts} attempts)"
+                    )
             
             # Generate and display diagnostic command suggestions
             if ranked_hypotheses:

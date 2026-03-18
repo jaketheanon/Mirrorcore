@@ -42,6 +42,29 @@ class InvestigationMemoryMatch:
     similarity_score: float
 
 
+@dataclass
+class StrategyStats:
+    """Aggregated statistics for a troubleshooting strategy within a pattern."""
+    name: str
+    total_attempts: int
+    successful_attempts: int
+
+    @property
+    def success_rate(self) -> float:
+        if self.total_attempts <= 0:
+            return 0.0
+        return self.successful_attempts / self.total_attempts
+
+
+@dataclass
+class FixPattern:
+    """Represents a learned cross-session fix pattern."""
+    subsystem: Optional[str]
+    root_cause_category: Optional[str]
+    signal_families: List[str]
+    strategies: List[StrategyStats]
+
+
 class MemoryRetrieval:
     """Retrieves relevant memories based on context and queries."""
     
@@ -745,6 +768,225 @@ class MemoryRetrieval:
         matches.sort(key=lambda m: (-m.similarity_score, m.timestamp or "", m.session_id))
         
         return matches[:limit]
+
+    def get_successful_fix_patterns(
+        self,
+        memory_store: Any,
+        min_strategy_attempts: int = 2,
+    ) -> List[FixPattern]:
+        """
+        Aggregate successful fix patterns from resolved investigation sessions.
+
+        Uses existing stored analysis sessions; does not modify database schema.
+        """
+        if not hasattr(memory_store, "get_resolved_analysis_sessions"):
+            return []
+
+        try:
+            sessions = memory_store.get_resolved_analysis_sessions(limit=200)
+        except Exception:
+            return []
+
+        # Group by coarse problem pattern key
+        grouped: Dict[Tuple[Optional[str], Optional[str], Tuple[str, ...]], Dict[str, Any]] = {}
+
+        for session in sessions:
+            subsystem = session.get("detected_subsystem")
+            category = session.get("top_hypothesis_category")
+            families = session.get("signal_families") or []
+            strategies_attempted = session.get("strategies_attempted") or []
+
+            # Derive an outcome label from investigation_state / session_status if present
+            investigation_state = (session.get("investigation_state") or "").lower()
+            if investigation_state in {"resolved", "completed", "success", "fixed"}:
+                outcome = "success"
+            elif investigation_state in {"stalled", "abandoned"}:
+                outcome = "failed"
+            elif investigation_state in {"active", "updated"}:
+                outcome = "partial"
+            else:
+                # Default to success for sessions returned by get_resolved_analysis_sessions
+                outcome = "success"
+
+            key = (
+                subsystem or None,
+                category or None,
+                tuple(sorted({f for f in families if f})),
+            )
+
+            if key not in grouped:
+                grouped[key] = {
+                    "subsystem": subsystem,
+                    "category": category,
+                    "families": list({f for f in families if f}),
+                    "strategy_stats": {},  # type: ignore[dict-annotated]
+                }
+
+            strategy_stats: Dict[str, Dict[str, int]] = grouped[key]["strategy_stats"]
+
+            for strategy in strategies_attempted:
+                if not strategy:
+                    continue
+                if strategy not in strategy_stats:
+                    strategy_stats[strategy] = {
+                        "total_attempts": 0,
+                        "successful_attempts": 0,
+                    }
+                strategy_stats[strategy]["total_attempts"] += 1
+                if outcome == "success":
+                    strategy_stats[strategy]["successful_attempts"] += 1
+
+        patterns: List[FixPattern] = []
+
+        for data in grouped.values():
+            raw_stats: Dict[str, Dict[str, int]] = data["strategy_stats"]
+
+            # Filter low-signal strategies unless they are the only ones
+            filtered_items = [
+                (name, stats)
+                for name, stats in raw_stats.items()
+                if stats["total_attempts"] >= min_strategy_attempts
+            ]
+            if not filtered_items:
+                filtered_items = list(raw_stats.items())
+
+            strategies: List[StrategyStats] = [
+                StrategyStats(
+                    name=name,
+                    total_attempts=stats["total_attempts"],
+                    successful_attempts=stats["successful_attempts"],
+                )
+                for name, stats in filtered_items
+            ]
+
+            # Rank strategies by success_rate then successful_attempts
+            strategies.sort(
+                key=lambda s: (-s.success_rate, -s.successful_attempts, s.name)
+            )
+
+            if not strategies:
+                continue
+
+            patterns.append(
+                FixPattern(
+                    subsystem=data["subsystem"],
+                    root_cause_category=data["category"],
+                    signal_families=data["families"],
+                    strategies=strategies,
+                )
+            )
+
+        return patterns
+
+    def match_best_fix_pattern_for_issue(
+        self,
+        parsed_log: Any,
+        ranked_hypotheses: Optional[List[RootCauseHypothesis]],
+        memory_store: Any,
+        min_pattern_score: float = 0.55,
+        min_success_rate: float = 0.5,
+    ) -> Optional[Tuple[FixPattern, List[StrategyStats]]]:
+        """
+        Match the current issue to the best learned fix pattern.
+
+        Scoring is deterministic and reuses the same signals as Phase 23
+        retrieval, but with a simpler weighting.
+        """
+        patterns = self.get_successful_fix_patterns(memory_store)
+        if not patterns:
+            return None
+
+        current_subsystem = getattr(parsed_log, "detected_subsystem", None)
+        current_signal_families = getattr(parsed_log, "signal_families", None) or []
+
+        current_category: Optional[str] = None
+        if ranked_hypotheses:
+            current_category = ranked_hypotheses[0].category
+
+        def _keywords(cat: str) -> List[str]:
+            base = cat.lower()
+            kws: List[str] = []
+            for kw in [
+                "permission",
+                "permissions",
+                "auth",
+                "network",
+                "connect",
+                "timeout",
+                "dns",
+                "config",
+                "configuration",
+                "pip",
+                "package",
+            ]:
+                if kw in base:
+                    kws.append(kw)
+            return kws
+
+        best_score = float("-inf")
+        best_pattern: Optional[FixPattern] = None
+
+        for pattern in patterns:
+            score = 0.0
+
+            # Subsystem match is the strongest signal
+            if current_subsystem and pattern.subsystem:
+                if current_subsystem == pattern.subsystem:
+                    score += 0.5
+                else:
+                    score -= 0.45
+
+            # Signal family overlap (Jaccard)
+            current_set = set(current_signal_families)
+            pattern_set = set(pattern.signal_families or [])
+            if current_set and pattern_set:
+                intersection = len(current_set & pattern_set)
+                union = len(current_set | pattern_set) or 1
+                jaccard = intersection / union
+                score += 0.3 * jaccard
+                if intersection == 0:
+                    score -= 0.2
+            elif current_set or pattern_set:
+                score -= 0.05
+
+            # Category similarity (exact or keyword overlap)
+            if current_category and pattern.root_cause_category:
+                if current_category == pattern.root_cause_category:
+                    score += 0.25
+                else:
+                    cur_kw = set(_keywords(current_category))
+                    pat_kw = set(_keywords(pattern.root_cause_category))
+                    if cur_kw and pat_kw and cur_kw & pat_kw:
+                        score += 0.15
+                    else:
+                        score -= 0.15
+
+            # Penalize patterns with no usable strategies
+            if not pattern.strategies:
+                score -= 0.5
+
+            if score > best_score:
+                best_score = score
+                best_pattern = pattern
+
+        if not best_pattern:
+            return None
+
+        if best_score < min_pattern_score:
+            return None
+
+        # Filter strategies again with slightly stricter success criteria for display
+        strong_strategies: List[StrategyStats] = [
+            s
+            for s in best_pattern.strategies
+            if s.success_rate >= min_success_rate and s.successful_attempts > 0
+        ]
+
+        if not strong_strategies:
+            return None
+
+        # Limit to the top 3 for display
+        return best_pattern, strong_strategies[:3]
 
     def _rank_results(self, results: List[RetrievedMemory], query: RetrievalQuery) -> List[RetrievedMemory]:
         """Rank results by relevance score."""
