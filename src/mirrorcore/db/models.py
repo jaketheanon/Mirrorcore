@@ -194,6 +194,17 @@ def initialize_database(conn: sqlite3.Connection):
         )
     """)
     
+    # 8) user_fix_preferences table - Cross-incident-type fix affinity tracking
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_fix_preferences (
+            normalized_fix TEXT PRIMARY KEY,
+            success_count INTEGER NOT NULL DEFAULT 0,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            partial_count INTEGER NOT NULL DEFAULT 0,
+            last_used TIMESTAMP
+        )
+    """)
+    
     # Create indexes for performance
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_persona_profile_trait_name ON persona_profile(trait_name)",
@@ -208,7 +219,8 @@ def initialize_database(conn: sqlite3.Connection):
         "CREATE INDEX IF NOT EXISTS idx_terminal_fix_outcomes_result_status ON terminal_fix_outcomes(result_status)",
         "CREATE INDEX IF NOT EXISTS idx_decision_history_timestamp ON decision_history(timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_decision_history_confidence ON decision_history(confidence)",
-        "CREATE INDEX IF NOT EXISTS idx_session_logs_session_start ON session_logs(session_start)"
+        "CREATE INDEX IF NOT EXISTS idx_session_logs_session_start ON session_logs(session_start)",
+        "CREATE INDEX IF NOT EXISTS idx_user_fix_preferences_last_used ON user_fix_preferences(last_used)"
     ]
     
     for index_sql in indexes:

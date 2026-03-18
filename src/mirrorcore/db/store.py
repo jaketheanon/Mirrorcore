@@ -386,7 +386,48 @@ class DatabaseStore:
         conn.execute(query, (outcome_id, incident_id, suggested_fix, attempted_fix, result_status, confirmed_root_cause, notes, now))
         conn.commit()
         
+        self._update_user_fix_preference(attempted_fix, result_status)
+        
         return outcome_id
+    
+    def _update_user_fix_preference(self, attempted_fix: str, result_status: str):
+        """Upsert cross-incident-type fix preference after each outcome."""
+        normalized = self._normalize_fix_text(attempted_fix.strip().lower())
+        if not normalized:
+            return
+        
+        status = result_status.strip().lower()
+        col_map = {"success": "success_count", "partial": "partial_count", "failed": "failure_count"}
+        col = col_map.get(status)
+        if not col:
+            return
+        
+        conn = self.get_db_connection()
+        now = datetime.utcnow().isoformat()
+        
+        conn.execute(
+            """INSERT INTO user_fix_preferences (normalized_fix, success_count, failure_count, partial_count, last_used)
+               VALUES (?, 0, 0, 0, ?)
+               ON CONFLICT(normalized_fix) DO UPDATE SET last_used = excluded.last_used""",
+            (normalized, now),
+        )
+        conn.execute(
+            f"UPDATE user_fix_preferences SET {col} = {col} + 1 WHERE normalized_fix = ?",
+            (normalized,),
+        )
+        conn.commit()
+    
+    def _get_user_fix_preferences(self, normalized_fixes: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Batch-fetch user fix preferences for a set of normalized fix texts."""
+        if not normalized_fixes:
+            return {}
+        conn = self.get_db_connection()
+        placeholders = ",".join("?" for _ in normalized_fixes)
+        rows = conn.execute(
+            f"SELECT * FROM user_fix_preferences WHERE normalized_fix IN ({placeholders})",
+            tuple(normalized_fixes),
+        ).fetchall()
+        return {row["normalized_fix"]: dict(row) for row in rows}
     
     def get_terminal_fix_outcomes(self, incident_type: str = None, result_status: str = None, limit: int = 50) -> List[Dict[str, Any]]:
         """Get terminal fix outcomes, optionally filtered by incident type or result status."""
@@ -447,11 +488,11 @@ class DatabaseStore:
         search_pattern = f"%{incident_type}%"
         rows = conn.execute(query, (search_pattern, limit * 3)).fetchall()  # Get more for ranking
         
-        # Group and rank fixes
+        # Group and rank fixes (with user preference blending)
         return self._rank_fix_attempts([dict(row) for row in rows], limit)
     
     def _rank_fix_attempts(self, fix_attempts: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-        """Rank fix attempts using deterministic scoring."""
+        """Rank fix attempts using deterministic scoring with user preference blending."""
         # Group similar fix attempts
         grouped_fixes = {}
         
@@ -491,10 +532,14 @@ class DatabaseStore:
                 group['latest_timestamp'] = attempt_time
                 group['latest_result'] = result_status
         
+        # Batch-fetch user preferences for all grouped fixes
+        user_prefs = self._get_user_fix_preferences(list(grouped_fixes.keys()))
+        
         # Calculate scores and rank
         ranked_fixes = []
         for normalized_fix, group in grouped_fixes.items():
-            score = self._calculate_fix_score(group)
+            user_pref = user_prefs.get(normalized_fix)
+            score = self._calculate_fix_score(group, user_pref=user_pref)
             ranked_fixes.append({
                 'normalized_fix': normalized_fix,
                 'original_fixes': group['original_fixes'],
@@ -504,7 +549,8 @@ class DatabaseStore:
                 'failed_count': group['failed_count'],
                 'latest_timestamp': group['latest_timestamp'],
                 'latest_result': group['latest_result'],
-                'total_attempts': len(group['original_fixes'])
+                'total_attempts': len(group['original_fixes']),
+                'user_preference_applied': user_pref is not None
             })
         
         # Sort by score (descending), then by recency for ties
@@ -541,22 +587,29 @@ class DatabaseStore:
         
         return normalized.strip()
     
-    def _calculate_fix_score(self, group: Dict[str, Any]) -> float:
-        """Calculate deterministic score for a fix group."""
-        # Base scoring weights
+    def _calculate_fix_score(self, group: Dict[str, Any], *, user_pref: Dict[str, Any] = None) -> float:
+        """Calculate deterministic score for a fix group.
+
+        Blends per-incident-type counts (global) with cross-incident-type
+        user preference data when available.
+
+        Formula:
+            global_score  = 10*success + 5*partial - 2*failed  (+ recency, penalties)
+            user_bonus    = 3*user_success + 1*user_partial - 2*user_failure
+            final_score   = global_score + USER_PREF_SCALE * user_bonus
+        """
+        # --- Global scoring (unchanged) ---
         success_weight = 10.0
         partial_weight = 5.0
         failure_weight = -2.0
-        recency_bonus = 0.1  # Small bonus for recent attempts
-        
-        # Calculate base score
+        recency_bonus = 0.1
+
         base_score = (
             group['success_count'] * success_weight +
             group['partial_count'] * partial_weight +
             group['failed_count'] * failure_weight
         )
-        
-        # Add recency bonus if recent (within last 30 days)
+
         if group['latest_timestamp']:
             from datetime import datetime, timedelta
             try:
@@ -564,12 +617,21 @@ class DatabaseStore:
                 if datetime.utcnow() - latest_time < timedelta(days=30):
                     base_score += recency_bonus
             except (ValueError, TypeError):
-                pass  # Ignore timestamp parsing errors
-        
-        # Penalize if no successful attempts
+                pass
+
         if group['success_count'] == 0:
             base_score -= 5.0
-        
+
+        # --- User preference bonus (new) ---
+        USER_PREF_SCALE = 0.5
+        if user_pref:
+            user_bonus = (
+                int(user_pref.get('success_count', 0)) * 3.0 +
+                int(user_pref.get('partial_count', 0)) * 1.0 -
+                int(user_pref.get('failure_count', 0)) * 2.0
+            )
+            base_score += USER_PREF_SCALE * user_bonus
+
         return round(base_score, 2)
 
     def get_successful_fixes_by_incident_type(self, incident_type: str, limit: int = 10) -> List[Dict[str, Any]]:
