@@ -988,10 +988,13 @@ def handle_analyze_log(args):
                     print(f"   Reason: {hypothesis.reason}")
             
             # Phase 23: Investigation Memory Retrieval
-            similar_investigations = retrieval.retrieve_similar_investigations(
-                parsed_log, ranked_hypotheses, db_store, limit=3
-            )
-            
+            try:
+                similar_investigations = retrieval.retrieve_similar_investigations(
+                    parsed_log, ranked_hypotheses, db_store, limit=3
+                )
+            except Exception:
+                similar_investigations = None
+
             print(f"\nSIMILAR PAST INVESTIGATIONS")
             print("-" * 40)
             if similar_investigations:
