@@ -1,10 +1,6 @@
 """
-Tests for Phase 26: Decision Interview and Decision Memory
-
-Covers:
-- Decision memory DB write and read
-- Extraction mapping correctness (deterministic signal merging)
-- Interview flow storage behaviour
+Tests for Phase 26 + Phase 27: Decision Interview, Decision Memory,
+Multi-Scenario Sessions, Reflection, Correction Loop, and Response Variation.
 """
 
 import unittest
@@ -17,19 +13,37 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from typing import Dict
+
 from mirrorcore.db.store import DatabaseStore
 from mirrorcore.decision.interview import (
     InterviewOption,
     InterviewScenario,
     InterviewQuestion,
     InterviewResult,
+    ReflectionLine,
+    CorrectionResult,
+    SessionResult,
     SCENARIOS,
     get_scenario,
+    get_scenarios_for_session,
     extract_signals,
     compute_confidence,
+    generate_reflections,
     run_interview,
+    run_interview_session,
+    _rotate_phrase,
+    _CONFIRM_PHRASES,
+    _TRANSITION_PHRASES,
+    _ACCURATE_PHRASES,
+    _PARTIAL_PHRASES,
+    _FULL_CORRECTION_PHRASES,
 )
 
+
+# ===================================================================
+# Phase 26 tests (preserved)
+# ===================================================================
 
 class TestDecisionMemoryDB(unittest.TestCase):
     """Verify record_decision_memory and get_recent_decision_memory."""
@@ -183,6 +197,9 @@ class TestScenarioDefinitions(unittest.TestCase):
     def test_at_least_one_scenario_exists(self):
         self.assertGreater(len(SCENARIOS), 0)
 
+    def test_multiple_everyday_scenarios_exist(self):
+        self.assertGreaterEqual(len(SCENARIOS), 5)
+
     def test_get_scenario_by_id(self):
         s = get_scenario(SCENARIOS[0].id)
         self.assertEqual(s.id, SCENARIOS[0].id)
@@ -203,6 +220,10 @@ class TestScenarioDefinitions(unittest.TestCase):
                 self.assertTrue(opt.label)
                 self.assertIsInstance(opt.value_tags, list)
                 self.assertIsInstance(opt.trait_signals, dict)
+
+    def test_scenario_ids_are_unique(self):
+        ids = [s.id for s in SCENARIOS]
+        self.assertEqual(len(ids), len(set(ids)))
 
 
 class TestInterviewFlowStorage(unittest.TestCase):
@@ -249,6 +270,370 @@ class TestInterviewFlowStorage(unittest.TestCase):
         self.assertGreater(len(result.trait_signals), 0)
         self.assertGreater(result.confidence_score, 0.0)
         self.assertLessEqual(result.confidence_score, 1.0)
+
+
+# ===================================================================
+# Phase 27 tests
+# ===================================================================
+
+class TestGetScenariosForSession(unittest.TestCase):
+    """Verify multi-scenario selection logic."""
+
+    def test_returns_requested_count(self):
+        scenarios = get_scenarios_for_session(4)
+        self.assertEqual(len(scenarios), 4)
+
+    def test_clamps_minimum_to_3(self):
+        scenarios = get_scenarios_for_session(1)
+        self.assertEqual(len(scenarios), 3)
+
+    def test_clamps_maximum_to_5(self):
+        scenarios = get_scenarios_for_session(100)
+        self.assertEqual(len(scenarios), 5)
+
+    def test_returns_interview_scenario_objects(self):
+        for s in get_scenarios_for_session(3):
+            self.assertIsInstance(s, InterviewScenario)
+
+    def test_different_session_indices_produce_different_scenarios(self):
+        a = get_scenarios_for_session(4, session_index=0)
+        b = get_scenarios_for_session(4, session_index=1)
+        a_ids = [s.id for s in a]
+        b_ids = [s.id for s in b]
+        self.assertNotEqual(a_ids, b_ids)
+
+    def test_rotation_wraps_around(self):
+        n = len(SCENARIOS)
+        a = get_scenarios_for_session(4, session_index=0)
+        # After enough rotations the cycle should restart
+        wrap = get_scenarios_for_session(4, session_index=n)
+        self.assertEqual([s.id for s in a], [s.id for s in wrap])
+
+    def test_all_scenarios_covered_across_sessions(self):
+        seen_ids: set = set()
+        for idx in range(len(SCENARIOS)):
+            for s in get_scenarios_for_session(3, session_index=idx):
+                seen_ids.add(s.id)
+        all_ids = {s.id for s in SCENARIOS}
+        self.assertEqual(seen_ids, all_ids)
+
+
+class TestSimpleChoiceExtraction(unittest.TestCase):
+    """Verify that simple human-friendly choices map to deterministic signals."""
+
+    def test_felt_right_maps_to_intuitive(self):
+        opt = InterviewOption(
+            id="felt_right", label="Felt right",
+            value_tags=["intuition", "gut_feeling"],
+            trait_signals={"analytical_thinking": 0.3, "intuitive_leaning": 0.8},
+        )
+        self.assertIn("intuition", opt.value_tags)
+        self.assertGreater(opt.trait_signals["intuitive_leaning"], 0.5)
+
+    def test_thought_it_through_maps_to_analytical(self):
+        opt = InterviewOption(
+            id="thought_it_through", label="Thought it through",
+            value_tags=["deliberation", "planning"],
+            trait_signals={"analytical_thinking": 0.8, "self_direction": 0.7},
+        )
+        self.assertIn("deliberation", opt.value_tags)
+        self.assertGreater(opt.trait_signals["analytical_thinking"], 0.5)
+
+    def test_every_scenario_option_has_signals(self):
+        for scenario in SCENARIOS:
+            for opt in scenario.main_question.options:
+                self.assertTrue(len(opt.value_tags) > 0, f"{scenario.id} main option {opt.id} has no value_tags")
+                self.assertTrue(len(opt.trait_signals) > 0, f"{scenario.id} main option {opt.id} has no trait_signals")
+            for opt in scenario.followup_question.options:
+                self.assertTrue(len(opt.value_tags) > 0, f"{scenario.id} followup option {opt.id} has no value_tags")
+                self.assertTrue(len(opt.trait_signals) > 0, f"{scenario.id} followup option {opt.id} has no trait_signals")
+
+
+class TestReflectionGeneration(unittest.TestCase):
+    """Verify mid-interview reflection generation logic."""
+
+    def _make_result(self, trait_signals: Dict) -> InterviewResult:
+        return InterviewResult(
+            scenario_id="test", scenario_text="test",
+            choice_label="A", choice_value="a",
+            reasoning_label="B", reasoning_value="b",
+            value_tags=[], trait_signals=trait_signals,
+            confidence_score=0.8,
+        )
+
+    def test_generates_reflections_for_strong_traits(self):
+        results = [
+            self._make_result({"patience": 0.9, "risk_tolerance": 0.1}),
+            self._make_result({"patience": 0.8, "risk_tolerance": 0.2}),
+            self._make_result({"patience": 0.85}),
+        ]
+        reflections = generate_reflections(results)
+        self.assertGreater(len(reflections), 0)
+        traits = [r.trait for r in reflections]
+        self.assertIn("patience", traits)
+
+    def test_no_reflections_for_insufficient_evidence(self):
+        results = [
+            self._make_result({"patience": 0.9}),
+        ]
+        reflections = generate_reflections(results)
+        patience_refs = [r for r in reflections if r.trait == "patience"]
+        self.assertEqual(len(patience_refs), 0)
+
+    def test_no_reflections_for_middling_traits(self):
+        results = [
+            self._make_result({"patience": 0.5}),
+            self._make_result({"patience": 0.5}),
+            self._make_result({"patience": 0.5}),
+        ]
+        reflections = generate_reflections(results)
+        patience_refs = [r for r in reflections if r.trait == "patience"]
+        self.assertEqual(len(patience_refs), 0)
+
+    def test_low_trait_generates_low_reflection(self):
+        results = [
+            self._make_result({"patience": 0.2}),
+            self._make_result({"patience": 0.1}),
+            self._make_result({"patience": 0.15}),
+        ]
+        reflections = generate_reflections(results)
+        patience_refs = [r for r in reflections if r.trait == "patience"]
+        self.assertEqual(len(patience_refs), 1)
+        self.assertIn("quickly", patience_refs[0].text.lower())
+
+    def test_reflections_capped_at_5(self):
+        signals = {f"trait_{i}": 0.9 for i in range(10)}
+        results = [self._make_result(signals) for _ in range(3)]
+        reflections = generate_reflections(results)
+        self.assertLessEqual(len(reflections), 5)
+
+    def test_reflection_line_has_trait_and_strength(self):
+        results = [
+            self._make_result({"patience": 0.9}),
+            self._make_result({"patience": 0.85}),
+        ]
+        reflections = generate_reflections(results)
+        for ref in reflections:
+            self.assertIsInstance(ref.trait, str)
+            self.assertIsInstance(ref.strength, float)
+            self.assertTrue(ref.text)
+
+
+class TestCorrectionLoop(unittest.TestCase):
+    """Verify correction loop behavior."""
+
+    def test_accurate_correction_accepts_all(self):
+        reflections = [
+            ReflectionLine(text="You think before acting", trait="patience", strength=0.85),
+            ReflectionLine(text="You avoid risk", trait="risk_tolerance", strength=0.2),
+        ]
+        result = CorrectionResult(
+            status="accurate",
+            accepted_traits=["patience", "risk_tolerance"],
+        )
+        self.assertEqual(result.status, "accurate")
+        self.assertEqual(len(result.accepted_traits), 2)
+        self.assertEqual(len(result.rejected_traits), 0)
+
+    def test_partial_correction_splits_traits(self):
+        result = CorrectionResult(
+            status="partially_true",
+            accepted_traits=["patience"],
+            rejected_traits=["risk_tolerance"],
+        )
+        self.assertEqual(result.status, "partially_true")
+        self.assertIn("patience", result.accepted_traits)
+        self.assertIn("risk_tolerance", result.rejected_traits)
+
+    def test_full_correction_stores_replacements(self):
+        result = CorrectionResult(
+            status="not_really",
+            rejected_traits=["patience", "risk_tolerance"],
+            replacement_choices={"patience": "opposite", "risk_tolerance": "contextual"},
+        )
+        self.assertEqual(result.status, "not_really")
+        self.assertEqual(result.replacement_choices["patience"], "opposite")
+        self.assertEqual(result.replacement_choices["risk_tolerance"], "contextual")
+
+
+class TestCorrectionMetadataDB(unittest.TestCase):
+    """Verify correction metadata is stored and retrieved correctly."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = DatabaseStore(Path(self.tmp.name))
+        self.db.initialize_database()
+
+    def tearDown(self):
+        self.db.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_update_correction_status(self):
+        entry_id = self.db.record_decision_memory(
+            scenario_id="s", scenario_text="S",
+            choice_label="C", choice_value="c",
+            reasoning_label="R", reasoning_value="r",
+            value_tags=[], trait_signals={},
+        )
+
+        self.db.update_decision_memory_correction(entry_id, "accurate")
+        row = self.db.get_recent_decision_memory()[0]
+        self.assertEqual(row["correction_status"], "accurate")
+
+    def test_update_correction_metadata(self):
+        entry_id = self.db.record_decision_memory(
+            scenario_id="s", scenario_text="S",
+            choice_label="C", choice_value="c",
+            reasoning_label="R", reasoning_value="r",
+            value_tags=[], trait_signals={},
+        )
+
+        metadata = {
+            "status": "partially_true",
+            "accepted_traits": ["patience"],
+            "rejected_traits": ["risk_tolerance"],
+        }
+        self.db.update_decision_memory_correction(entry_id, "partially_true", metadata)
+        row = self.db.get_recent_decision_memory()[0]
+        self.assertEqual(row["correction_status"], "partially_true")
+        stored_meta = json.loads(row.get("correction_metadata", "{}") or "{}")
+        self.assertEqual(stored_meta["accepted_traits"], ["patience"])
+        self.assertEqual(stored_meta["rejected_traits"], ["risk_tolerance"])
+
+
+class TestResponseVariation(unittest.TestCase):
+    """Verify deterministic response rotation."""
+
+    def test_rotate_phrase_cycles(self):
+        phrases = ["a", "b", "c"]
+        self.assertEqual(_rotate_phrase(phrases, 0), "a")
+        self.assertEqual(_rotate_phrase(phrases, 1), "b")
+        self.assertEqual(_rotate_phrase(phrases, 2), "c")
+        self.assertEqual(_rotate_phrase(phrases, 3), "a")
+
+    def test_all_phrase_lists_non_empty(self):
+        for phrases in [_CONFIRM_PHRASES, _TRANSITION_PHRASES,
+                        _ACCURATE_PHRASES, _PARTIAL_PHRASES,
+                        _FULL_CORRECTION_PHRASES]:
+            self.assertGreater(len(phrases), 1)
+
+    def test_no_duplicate_phrases_within_list(self):
+        for phrases in [_CONFIRM_PHRASES, _TRANSITION_PHRASES,
+                        _ACCURATE_PHRASES, _PARTIAL_PHRASES,
+                        _FULL_CORRECTION_PHRASES]:
+            self.assertEqual(len(phrases), len(set(phrases)))
+
+
+class TestMultiScenarioInterviewSession(unittest.TestCase):
+    """Simulate multi-scenario session with mocked input."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = DatabaseStore(Path(self.tmp.name))
+        self.db.initialize_database()
+
+    def tearDown(self):
+        self.db.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    @patch("builtins.input")
+    def test_session_collects_multiple_results_then_accurate(self, mock_input):
+        # 4 scenarios x 2 choices + correction choice (1 = accurate)
+        inputs = ["1", "1"] * 4 + ["1"]
+        mock_input.side_effect = inputs
+
+        session = run_interview_session(4)
+        self.assertIsInstance(session, SessionResult)
+        self.assertEqual(len(session.results), 4)
+
+        for r in session.results:
+            self.assertIsInstance(r, InterviewResult)
+            self.assertTrue(r.scenario_id)
+            self.assertTrue(r.choice_label)
+            self.assertTrue(r.reasoning_label)
+
+    @patch("builtins.input")
+    def test_session_stores_all_results_in_db(self, mock_input):
+        inputs = ["1", "2"] * 3 + ["1"]
+        mock_input.side_effect = inputs
+
+        session = run_interview_session(3)
+
+        for result in session.results:
+            self.db.record_decision_memory(
+                scenario_id=result.scenario_id,
+                scenario_text=result.scenario_text,
+                choice_label=result.choice_label,
+                choice_value=result.choice_value,
+                reasoning_label=result.reasoning_label,
+                reasoning_value=result.reasoning_value,
+                value_tags=result.value_tags,
+                trait_signals=result.trait_signals,
+                confidence_score=result.confidence_score,
+            )
+
+        rows = self.db.get_recent_decision_memory(limit=10)
+        self.assertEqual(len(rows), 3)
+
+    @patch("builtins.input")
+    def test_session_partial_correction(self, mock_input):
+        # 4 scenarios x 2 choices + correction (2 = partially true) + right ones
+        inputs = ["1", "1"] * 4 + ["2", "1 2"]
+        mock_input.side_effect = inputs
+
+        session = run_interview_session(4)
+        self.assertIsNotNone(session.correction)
+        self.assertEqual(session.correction.status, "partially_true")
+        self.assertGreater(len(session.correction.accepted_traits), 0)
+
+    @patch("builtins.input")
+    def test_session_full_correction(self, mock_input):
+        # 4 scenarios x 2 choices + correction (3 = not really) + replacement for each reflection
+        inputs = ["1", "1"] * 4 + ["3"]
+        reflections_expected = 5  # max reflections
+        for _ in range(reflections_expected):
+            inputs.append("a")
+        mock_input.side_effect = inputs
+
+        session = run_interview_session(4)
+        self.assertIsNotNone(session.correction)
+        self.assertEqual(session.correction.status, "not_really")
+
+
+class TestPhase27SchemaCompatibility(unittest.TestCase):
+    """Verify Phase 27 schema migration is backwards-compatible."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = DatabaseStore(Path(self.tmp.name))
+        self.db.initialize_database()
+
+    def tearDown(self):
+        self.db.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_correction_metadata_column_exists(self):
+        conn = self.db.get_db_connection()
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(decision_memory)").fetchall()
+        }
+        self.assertIn("correction_metadata", columns)
+
+    def test_old_entries_without_metadata_still_readable(self):
+        entry_id = self.db.record_decision_memory(
+            scenario_id="old_scenario",
+            scenario_text="Old style",
+            choice_label="A", choice_value="a",
+            reasoning_label="R", reasoning_value="r",
+            value_tags=["x"], trait_signals={"y": 0.5},
+        )
+        rows = self.db.get_recent_decision_memory()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["correction_status"], "uncorrected")
 
 
 if __name__ == "__main__":

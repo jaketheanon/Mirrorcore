@@ -221,6 +221,7 @@ def initialize_database(conn: sqlite3.Connection):
             trait_signals_json TEXT,
             confidence_score REAL NOT NULL DEFAULT 0.0,
             correction_status TEXT NOT NULL DEFAULT 'uncorrected',
+            correction_metadata TEXT,
             source TEXT NOT NULL DEFAULT 'interview'
         )
     """)

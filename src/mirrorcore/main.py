@@ -28,6 +28,18 @@ __version__ = "0.1.0"
 __description__ = "A local-first reasoning assistant for personalized troubleshooting and decision support"
 
 
+def _infer_strategy_family(category: Optional[str]) -> str:
+    """Map a hypothesis category to an investigation strategy family."""
+    cat = (category or "").lower()
+    if "network" in cat or "connect" in cat or "timeout" in cat:
+        return "connectivity"
+    if "service" in cat or "systemd" in cat:
+        return "service"
+    if "permission" in cat or "access" in cat:
+        return "permissions"
+    return "configuration"
+
+
 def create_parser():
     """Create the main argument parser."""
     parser = argparse.ArgumentParser(
@@ -1080,7 +1092,7 @@ def handle_analyze_log(args):
                 if 'diagnostic_commands' in locals() and diagnostic_commands:
                     db_store.store_investigation_steps(session_id, diagnostic_commands)
                 # Initialize investigation tracking
-                initial_strategy = 'connectivity' if 'network' in (session_data['top_hypothesis_category'] or '') else 'configuration'
+                initial_strategy = _infer_strategy_family(session_data['top_hypothesis_category'])
                 progress_metrics = {'completion_rate': 0.0, 'strategies_attempted': 1}
                                 
                 db_store.update_investigation_tracking(
@@ -1230,7 +1242,7 @@ def handle_analyze_followup(args):
     tracking_data = db_store.get_investigation_tracking(session['id'])
     current_strategy_family = tracking_data['current_strategy_family']
     if not current_strategy_family:
-        current_strategy_family = 'connectivity' if 'network' in (session.get('top_hypothesis_category') or '') else 'configuration'
+        current_strategy_family = _infer_strategy_family(session.get('top_hypothesis_category'))
 
     strategies_attempted = tracking_data['strategies_attempted'] or [current_strategy_family]
     current_evidence = sorted(set(evidence_signals))
@@ -1724,38 +1736,58 @@ def handle_drift_status(args):
 
 
 def handle_interview(args):
-    """Handle interview command — run a structured decision interview."""
+    """Handle interview command — run a multi-scenario decision interview session."""
     from pathlib import Path
     from .db.store import DatabaseStore
-    from .decision.interview import run_interview
+    from .decision.interview import run_interview_session
 
     db_path = Path("data") / "mirrorcore.db"
     db_store = DatabaseStore(db_path)
 
+    prior_entries = db_store.get_recent_decision_memory(limit=1000)
+    session_index = len(prior_entries)
+
     try:
-        result = run_interview()
+        session = run_interview_session(session_index=session_index)
     except (EOFError, KeyboardInterrupt):
         print("\nInterview cancelled.")
         return
 
-    entry_id = db_store.record_decision_memory(
-        scenario_id=result.scenario_id,
-        scenario_text=result.scenario_text,
-        choice_label=result.choice_label,
-        choice_value=result.choice_value,
-        reasoning_label=result.reasoning_label,
-        reasoning_value=result.reasoning_value,
-        value_tags=result.value_tags,
-        trait_signals=result.trait_signals,
-        confidence_score=result.confidence_score,
-    )
+    entry_ids = []
+    for result in session.results:
+        entry_id = db_store.record_decision_memory(
+            scenario_id=result.scenario_id,
+            scenario_text=result.scenario_text,
+            choice_label=result.choice_label,
+            choice_value=result.choice_value,
+            reasoning_label=result.reasoning_label,
+            reasoning_value=result.reasoning_value,
+            value_tags=result.value_tags,
+            trait_signals=result.trait_signals,
+            confidence_score=result.confidence_score,
+        )
+        entry_ids.append(entry_id)
+
+    if session.correction:
+        correction = session.correction
+        metadata = {
+            "status": correction.status,
+            "accepted_traits": correction.accepted_traits,
+            "rejected_traits": correction.rejected_traits,
+            "replacement_choices": correction.replacement_choices,
+        }
+        correction_status = correction.status
+        for eid in entry_ids:
+            db_store.update_decision_memory_correction(
+                eid, correction_status, metadata
+            )
 
     print("\n" + "-" * 56)
-    print("  Response recorded.")
-    print(f"  Choice:    {result.choice_label}")
-    print(f"  Reasoning: {result.reasoning_label}")
-    print(f"  Confidence: {int(result.confidence_score * 100)}%")
-    print(f"  Entry ID:  {entry_id}")
+    print(f"  Session complete — {len(session.results)} scenarios recorded.")
+    if session.reflections:
+        print(f"  Reflections generated: {len(session.reflections)}")
+    if session.correction:
+        print(f"  Correction: {session.correction.status}")
     print("-" * 56)
 
 

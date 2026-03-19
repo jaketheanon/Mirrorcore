@@ -31,16 +31,33 @@ class DatabaseStore:
         self._connection = None
     
     def get_db_connection(self):
-        """Get a database connection, creating it if needed."""
+        """Get a database connection, creating it if needed.
+
+        On first connection the schema migrations are applied
+        automatically so that callers never need to remember to
+        call ``initialize_database()`` explicitly.
+        """
         if self._connection is None:
             self._connection = get_db_connection(self.db_path)
+            self._run_migrations()
         return self._connection
-    
+
+    def _run_migrations(self):
+        """Apply all idempotent schema migrations on the current connection."""
+        self.ensure_step21_columns()
+        self.ensure_phase27_columns()
+
     def initialize_database(self):
-        """Initialize the database with all required tables."""
+        """Initialize the database with all required tables.
+
+        Safe to call multiple times — the underlying operations are
+        idempotent.  Normally not needed because ``get_db_connection``
+        handles this automatically, but kept for explicit use in
+        ``main()`` and tests.
+        """
         conn = self.get_db_connection()
         initialize_database(conn)
-        self.ensure_step21_columns()
+        self._run_migrations()
         return True
 
     def ensure_step21_columns(self):
@@ -67,7 +84,20 @@ class DatabaseStore:
                 )
 
         conn.commit()
-    
+
+    def ensure_phase27_columns(self):
+        """Ensure Phase 27 correction_metadata column exists on existing databases."""
+        conn = self.get_db_connection()
+        existing_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(decision_memory)").fetchall()
+        }
+        if "correction_metadata" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE decision_memory ADD COLUMN correction_metadata TEXT"
+            )
+            conn.commit()
+
     def close(self):
         """Close database connection."""
         if self._connection:
@@ -1286,3 +1316,21 @@ class DatabaseStore:
             results.append(entry)
 
         return results
+
+    def update_decision_memory_correction(self, entry_id: str,
+                                          correction_status: str,
+                                          correction_metadata: Optional[Dict[str, Any]] = None):
+        """Update correction status and metadata for a decision memory entry."""
+        conn = self.get_db_connection()
+
+        if correction_metadata is not None:
+            conn.execute(
+                "UPDATE decision_memory SET correction_status = ?, correction_metadata = ? WHERE id = ?",
+                (correction_status, json.dumps(correction_metadata), entry_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE decision_memory SET correction_status = ? WHERE id = ?",
+                (correction_status, entry_id),
+            )
+        conn.commit()
