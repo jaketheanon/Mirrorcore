@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Optional, Union, Tuple
 from pathlib import Path
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 from ..memory.extractor import LearningSignal
 from ..persona.drift import DriftEvaluation
@@ -593,44 +593,87 @@ class DatabaseStore:
         Blends per-incident-type counts (global) with cross-incident-type
         user preference data when available.
 
-        Formula:
-            global_score  = 10*success + 5*partial - 2*failed  (+ recency, penalties)
-            user_bonus    = 3*user_success + 1*user_partial - 2*user_failure
-            final_score   = global_score + USER_PREF_SCALE * user_bonus
+        Global score (unchanged):
+            10*success + 5*partial - 2*failed  (+ recency, penalties)
+
+        User preference bonus (guardrailed):
+            raw_bonus  = 3*user_success + 1*user_partial - 2*user_failure
+            Positive bonuses are gated by:
+              - evidence threshold  (< 2 successes → 25% strength)
+              - recency decay       (>30d → 50%, >90d → 25%)
+              - bad-habit cap       (failures >= successes → no boost)
+              - absolute cap        (max +5.0 points)
+              - global safety       (negative global → no rescue)
+            Negative bonuses (penalties) always apply at full scale.
         """
         # --- Global scoring (unchanged) ---
-        success_weight = 10.0
-        partial_weight = 5.0
-        failure_weight = -2.0
-        recency_bonus = 0.1
+        SUCCESS_W = 10.0
+        PARTIAL_W = 5.0
+        FAILURE_W = -2.0
+        RECENCY_BONUS = 0.1
 
         base_score = (
-            group['success_count'] * success_weight +
-            group['partial_count'] * partial_weight +
-            group['failed_count'] * failure_weight
+            group['success_count'] * SUCCESS_W +
+            group['partial_count'] * PARTIAL_W +
+            group['failed_count'] * FAILURE_W
         )
 
         if group['latest_timestamp']:
-            from datetime import datetime, timedelta
             try:
                 latest_time = datetime.fromisoformat(group['latest_timestamp'])
                 if datetime.utcnow() - latest_time < timedelta(days=30):
-                    base_score += recency_bonus
+                    base_score += RECENCY_BONUS
             except (ValueError, TypeError):
                 pass
 
         if group['success_count'] == 0:
             base_score -= 5.0
 
-        # --- User preference bonus (new) ---
+        # --- User preference bonus (guardrailed) ---
         USER_PREF_SCALE = 0.5
+        USER_PREF_CAP = 5.0
+
         if user_pref:
-            user_bonus = (
-                int(user_pref.get('success_count', 0)) * 3.0 +
-                int(user_pref.get('partial_count', 0)) * 1.0 -
-                int(user_pref.get('failure_count', 0)) * 2.0
-            )
-            base_score += USER_PREF_SCALE * user_bonus
+            u_sc = int(user_pref.get('success_count', 0))
+            u_pc = int(user_pref.get('partial_count', 0))
+            u_fc = int(user_pref.get('failure_count', 0))
+            raw_bonus = u_sc * 3.0 + u_pc * 1.0 - u_fc * 2.0
+
+            if raw_bonus > 0:
+                # 1) Evidence threshold: require 2+ successes for full strength
+                u_total = u_sc + u_pc + u_fc
+                evidence_factor = 1.0 if (u_total >= 2 and u_sc >= 2) else 0.25
+
+                # 2) Recency decay based on last_used
+                recency_factor = 1.0
+                last_used = user_pref.get('last_used')
+                if last_used:
+                    try:
+                        age = datetime.utcnow() - datetime.fromisoformat(last_used)
+                        if age > timedelta(days=90):
+                            recency_factor = 0.25
+                        elif age > timedelta(days=30):
+                            recency_factor = 0.5
+                    except (ValueError, TypeError):
+                        pass
+
+                effective = raw_bonus * USER_PREF_SCALE * evidence_factor * recency_factor
+
+                # 3) Bad-habit prevention: failures >= successes → no positive boost
+                if u_fc >= u_sc and u_fc > 0:
+                    effective = 0.0
+
+                # 4) Cap to prevent user preference from dominating
+                effective = min(effective, USER_PREF_CAP)
+
+                # 5) Global safety: don't rescue a globally-poor fix
+                if base_score < 0:
+                    effective = 0.0
+
+                base_score += effective
+            else:
+                # Negative user bonus (penalties) always apply at full scale
+                base_score += raw_bonus * USER_PREF_SCALE
 
         return round(base_score, 2)
 

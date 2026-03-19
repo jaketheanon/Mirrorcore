@@ -198,6 +198,131 @@ class TestMemoryRetrieval(unittest.TestCase):
         self.assertTrue(ok)
 
 
+class TestUserPreferenceGuardrails(unittest.TestCase):
+    """Test guardrails on user-specific fix preference weighting (Phase 25.5)."""
+
+    def setUp(self):
+        import tempfile, os
+        self._tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        self._tmp.close()
+        from mirrorcore.db.store import DatabaseStore
+        self.store = DatabaseStore(Path(self._tmp.name))
+        self._tmp_path = self._tmp.name
+
+    def tearDown(self):
+        import os
+        os.unlink(self._tmp_path)
+
+    def _score(self, group, user_pref=None):
+        return self.store._calculate_fix_score(group, user_pref=user_pref)
+
+    def _group(self, success=0, partial=0, failed=0, ts=None):
+        return {
+            'success_count': success,
+            'partial_count': partial,
+            'failed_count': failed,
+            'latest_timestamp': ts,
+            'latest_result': 'success' if success > 0 else 'failed',
+        }
+
+    def _pref(self, success=0, failure=0, partial=0, last_used=None):
+        return {
+            'success_count': success,
+            'failure_count': failure,
+            'partial_count': partial,
+            'last_used': last_used,
+        }
+
+    def test_one_off_user_success_does_not_dominate(self):
+        """A single user success should add < 1.0 points (evidence threshold)."""
+        group = self._group(success=1)
+        score_base = self._score(group)
+        score_one = self._score(group, self._pref(success=1))
+        diff = score_one - score_base
+        self.assertLess(diff, 1.0, f"One-off user success added {diff} points — too much")
+        self.assertGreaterEqual(diff, 0.0, "One-off success should not penalize")
+
+    def test_repeated_user_success_boosts_ranking(self):
+        """2+ user successes should provide a meaningful boost (>= 2.0 points)."""
+        group = self._group(success=1)
+        score_base = self._score(group)
+        score_repeated = self._score(group, self._pref(success=3))
+        diff = score_repeated - score_base
+        self.assertGreaterEqual(diff, 2.0, f"3 user successes only added {diff} — too weak")
+
+    def test_user_failures_reduce_preference_weight(self):
+        """User failures should reduce the effective user bonus."""
+        group = self._group(success=1)
+        score_good = self._score(group, self._pref(success=3))
+        score_bad = self._score(group, self._pref(success=3, failure=4))
+        self.assertLess(score_bad, score_good,
+                        "User failures did not reduce preference weight")
+
+    def test_user_failures_dominating_prevents_positive_boost(self):
+        """When failures >= successes, user preference must not boost the score."""
+        group = self._group(success=1)
+        score_base = self._score(group)
+        score_with_bad_pref = self._score(group, self._pref(success=2, failure=2))
+        self.assertLessEqual(score_with_bad_pref, score_base,
+                             "Bad-habit fix still received a positive boost")
+
+    def test_stale_preference_weaker_than_recent(self):
+        """Preference last used >90 days ago should have less weight than recent."""
+        from datetime import datetime, timedelta
+        group = self._group(success=1)
+        recent = (datetime.utcnow() - timedelta(days=5)).isoformat()
+        stale = (datetime.utcnow() - timedelta(days=120)).isoformat()
+        score_recent = self._score(group, self._pref(success=3, last_used=recent))
+        score_stale = self._score(group, self._pref(success=3, last_used=stale))
+        self.assertGreater(score_recent, score_stale,
+                           "Stale preference was not weaker than recent")
+
+    def test_mid_age_preference_between_recent_and_stale(self):
+        """Preference 30-90 days old should score between recent and stale."""
+        from datetime import datetime, timedelta
+        group = self._group(success=1)
+        recent = (datetime.utcnow() - timedelta(days=5)).isoformat()
+        mid = (datetime.utcnow() - timedelta(days=60)).isoformat()
+        stale = (datetime.utcnow() - timedelta(days=120)).isoformat()
+        s_recent = self._score(group, self._pref(success=3, last_used=recent))
+        s_mid = self._score(group, self._pref(success=3, last_used=mid))
+        s_stale = self._score(group, self._pref(success=3, last_used=stale))
+        self.assertGreater(s_recent, s_mid)
+        self.assertGreater(s_mid, s_stale)
+
+    def test_user_pref_does_not_rescue_bad_global(self):
+        """User preference must not rescue a fix with negative global evidence."""
+        bad_global = self._group(success=0, failed=5)
+        score_no_pref = self._score(bad_global)
+        score_with_pref = self._score(bad_global, self._pref(success=5))
+        self.assertLess(score_no_pref, 0, "Precondition: global score should be negative")
+        self.assertEqual(score_no_pref, score_with_pref,
+                         "User preference rescued a globally-bad fix")
+
+    def test_user_pref_cap_prevents_dominance(self):
+        """Even with extreme user success, bonus should be capped."""
+        group = self._group(success=1)
+        score_base = self._score(group)
+        score_extreme = self._score(group, self._pref(success=50))
+        diff = score_extreme - score_base
+        self.assertLessEqual(diff, 5.0, f"User preference bonus {diff} exceeded cap")
+
+    def test_negative_user_bonus_always_applies(self):
+        """Penalty from user failures should always apply (not gated by evidence)."""
+        group = self._group(success=1)
+        score_base = self._score(group)
+        score_penalized = self._score(group, self._pref(success=0, failure=3))
+        self.assertLess(score_penalized, score_base,
+                        "Negative user bonus was not applied")
+
+    def test_global_behavior_unchanged_without_user_pref(self):
+        """When no user preference exists, scoring must match original formula."""
+        group = self._group(success=2, partial=1, failed=1)
+        score = self._score(group)
+        expected = 2 * 10.0 + 1 * 5.0 + 1 * (-2.0)
+        self.assertEqual(score, expected, "Global-only score does not match expected")
+
+
 class TestMemoryUpdater(unittest.TestCase):
     """Test the memory updater."""
     
