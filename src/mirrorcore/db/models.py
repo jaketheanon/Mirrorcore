@@ -220,7 +220,7 @@ def initialize_database(conn: sqlite3.Connection):
             value_tags_json TEXT,
             trait_signals_json TEXT,
             confidence_score REAL NOT NULL DEFAULT 0.0,
-            correction_status TEXT NOT NULL DEFAULT 'accepted',
+            correction_status TEXT NOT NULL DEFAULT 'uncorrected',
             source TEXT NOT NULL DEFAULT 'interview'
         )
     """)

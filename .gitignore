@@ -121,3 +121,4 @@ logs/
 # Local configuration
 config.local.json
 secrets.json
+*.zip

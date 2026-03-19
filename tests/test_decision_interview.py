@@ -70,7 +70,7 @@ class TestDecisionMemoryDB(unittest.TestCase):
         self.assertEqual(sorted(row["value_tags"]), ["caution", "quality"])
         self.assertAlmostEqual(row["trait_signals"]["risk_tolerance"], 0.3)
         self.assertAlmostEqual(row["confidence_score"], 0.75)
-        self.assertEqual(row["correction_status"], "accepted")
+        self.assertEqual(row["correction_status"], "uncorrected")
         self.assertEqual(row["source"], "interview")
 
     def test_filter_by_scenario_id(self):

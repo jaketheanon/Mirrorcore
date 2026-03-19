@@ -1226,7 +1226,7 @@ class DatabaseStore:
                                value_tags: List[str], trait_signals: Dict[str, Any],
                                confidence_score: float = 0.8,
                                optional_notes: str = None,
-                               correction_status: str = "accepted",
+                               correction_status: str = "uncorrected",
                                source: str = "interview") -> str:
         """Record a structured decision memory entry."""
         conn = self.get_db_connection()
