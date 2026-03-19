@@ -72,7 +72,7 @@ class InvestigationStallDetection:
     is_stalled: bool
     stall_reason: str
     failed_families: List[str]
-    alternative_family: str
+    alternative_family: Optional[str]
     progress_metrics: Dict[str, float]
 
 class ReasoningResponseEngine:
