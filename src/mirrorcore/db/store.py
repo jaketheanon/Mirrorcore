@@ -1218,3 +1218,71 @@ class DatabaseStore:
         conn = self.get_db_connection()
         result = conn.execute("SELECT COUNT(*) as count FROM session_logs").fetchone()
         return result['count'] if result else 0
+
+    # Decision memory operations (Phase 26)
+    def record_decision_memory(self, scenario_id: str, scenario_text: str,
+                               choice_label: str, choice_value: str,
+                               reasoning_label: str, reasoning_value: str,
+                               value_tags: List[str], trait_signals: Dict[str, Any],
+                               confidence_score: float = 0.8,
+                               optional_notes: str = None,
+                               correction_status: str = "accepted",
+                               source: str = "interview") -> str:
+        """Record a structured decision memory entry."""
+        conn = self.get_db_connection()
+
+        entry_id = str(uuid4())
+        now = datetime.utcnow().isoformat()
+
+        query = """
+            INSERT INTO decision_memory
+            (id, timestamp, scenario_id, scenario_text,
+             choice_label, choice_value, reasoning_label, reasoning_value,
+             optional_notes, value_tags_json, trait_signals_json,
+             confidence_score, correction_status, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        conn.execute(query, (
+            entry_id, now, scenario_id, scenario_text,
+            choice_label, choice_value, reasoning_label, reasoning_value,
+            optional_notes, json.dumps(value_tags), json.dumps(trait_signals),
+            confidence_score, correction_status, source
+        ))
+        conn.commit()
+
+        return entry_id
+
+    def get_recent_decision_memory(self, limit: int = 20,
+                                   scenario_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieve recent decision memory entries."""
+        conn = self.get_db_connection()
+
+        if scenario_id:
+            query = """
+                SELECT * FROM decision_memory
+                WHERE scenario_id = ?
+                ORDER BY timestamp DESC LIMIT ?
+            """
+            rows = conn.execute(query, (scenario_id, limit)).fetchall()
+        else:
+            query = """
+                SELECT * FROM decision_memory
+                ORDER BY timestamp DESC LIMIT ?
+            """
+            rows = conn.execute(query, (limit,)).fetchall()
+
+        results = []
+        for row in rows:
+            entry = dict(row)
+            try:
+                entry['value_tags'] = json.loads(entry.pop('value_tags_json', '[]'))
+            except (json.JSONDecodeError, TypeError):
+                entry['value_tags'] = []
+            try:
+                entry['trait_signals'] = json.loads(entry.pop('trait_signals_json', '{}'))
+            except (json.JSONDecodeError, TypeError):
+                entry['trait_signals'] = {}
+            results.append(entry)
+
+        return results

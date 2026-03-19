@@ -205,6 +205,26 @@ def initialize_database(conn: sqlite3.Connection):
         )
     """)
     
+    # 9) decision_memory table - Structured user decision memory (Phase 26)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS decision_memory (
+            id TEXT PRIMARY KEY,
+            timestamp TIMESTAMP NOT NULL,
+            scenario_id TEXT NOT NULL,
+            scenario_text TEXT NOT NULL,
+            choice_label TEXT NOT NULL,
+            choice_value TEXT NOT NULL,
+            reasoning_label TEXT NOT NULL,
+            reasoning_value TEXT NOT NULL,
+            optional_notes TEXT,
+            value_tags_json TEXT,
+            trait_signals_json TEXT,
+            confidence_score REAL NOT NULL DEFAULT 0.0,
+            correction_status TEXT NOT NULL DEFAULT 'accepted',
+            source TEXT NOT NULL DEFAULT 'interview'
+        )
+    """)
+
     # Create indexes for performance
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_persona_profile_trait_name ON persona_profile(trait_name)",
@@ -220,7 +240,10 @@ def initialize_database(conn: sqlite3.Connection):
         "CREATE INDEX IF NOT EXISTS idx_decision_history_timestamp ON decision_history(timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_decision_history_confidence ON decision_history(confidence)",
         "CREATE INDEX IF NOT EXISTS idx_session_logs_session_start ON session_logs(session_start)",
-        "CREATE INDEX IF NOT EXISTS idx_user_fix_preferences_last_used ON user_fix_preferences(last_used)"
+        "CREATE INDEX IF NOT EXISTS idx_user_fix_preferences_last_used ON user_fix_preferences(last_used)",
+        "CREATE INDEX IF NOT EXISTS idx_decision_memory_timestamp ON decision_memory(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_decision_memory_scenario_id ON decision_memory(scenario_id)",
+        "CREATE INDEX IF NOT EXISTS idx_decision_memory_source ON decision_memory(source)"
     ]
     
     for index_sql in indexes:

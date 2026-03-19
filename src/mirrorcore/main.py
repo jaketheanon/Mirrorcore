@@ -42,6 +42,7 @@ Examples:
   mirrorcore analyze-log                        # Analyze logs interactively
   mirrorcore analyze-followup                   # Update analysis with new evidence
   mirrorcore profile                            # View your profile
+  mirrorcore interview                          # Run a decision interview
         """
     )
     
@@ -176,6 +177,12 @@ Examples:
         help="Memory action"
     )
     
+    # Interview command (Phase 26)
+    interview_parser = subparsers.add_parser(
+        "interview",
+        help="Run a structured decision interview"
+    )
+
     # Status command
     status_parser = subparsers.add_parser(
         "status",
@@ -1731,6 +1738,42 @@ def handle_drift_status(args):
     print("=" * 50)
 
 
+def handle_interview(args):
+    """Handle interview command — run a structured decision interview."""
+    from pathlib import Path
+    from .db.store import DatabaseStore
+    from .decision.interview import run_interview
+
+    db_path = Path("data") / "mirrorcore.db"
+    db_store = DatabaseStore(db_path)
+
+    try:
+        result = run_interview()
+    except (EOFError, KeyboardInterrupt):
+        print("\nInterview cancelled.")
+        return
+
+    entry_id = db_store.record_decision_memory(
+        scenario_id=result.scenario_id,
+        scenario_text=result.scenario_text,
+        choice_label=result.choice_label,
+        choice_value=result.choice_value,
+        reasoning_label=result.reasoning_label,
+        reasoning_value=result.reasoning_value,
+        value_tags=result.value_tags,
+        trait_signals=result.trait_signals,
+        confidence_score=result.confidence_score,
+    )
+
+    print("\n" + "-" * 56)
+    print("  Response recorded.")
+    print(f"  Choice:    {result.choice_label}")
+    print(f"  Reasoning: {result.reasoning_label}")
+    print(f"  Confidence: {int(result.confidence_score * 100)}%")
+    print(f"  Entry ID:  {entry_id}")
+    print("-" * 56)
+
+
 def handle_status(args):
     """Handle status command."""
     print("Mirrorcore System Status")
@@ -1825,7 +1868,8 @@ def main():
         "init": handle_init,
         "memory": handle_memory,
         "status": handle_status,
-        "config": handle_config
+        "config": handle_config,
+        "interview": handle_interview
     }
     
     handler = handlers.get(args.command)
