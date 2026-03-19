@@ -1080,7 +1080,7 @@ def handle_analyze_log(args):
                 if 'diagnostic_commands' in locals() and diagnostic_commands:
                     db_store.store_investigation_steps(session_id, diagnostic_commands)
                 # Initialize investigation tracking
-                initial_strategy = 'connectivity' if 'network' in session_data['top_hypothesis_category'] else 'configuration'
+                initial_strategy = 'connectivity' if 'network' in (session_data['top_hypothesis_category'] or '') else 'configuration'
                 progress_metrics = {'completion_rate': 0.0, 'strategies_attempted': 1}
                                 
                 db_store.update_investigation_tracking(
@@ -1422,21 +1422,6 @@ def handle_debug_history(args):
             
             result = outcome.get('result_status', '').lower()
             if result == 'success':
-                open_session = db_store.get_open_session()
-                if open_session:
-                    db_store.record_investigation_resolution(
-                        session_id=open_session['id'],
-                        fix_summary=suggested_fix,
-
-            final_root_cause_category=confirmed_root_cause or "",
-            winning_strategy_family="",
-            successful_actions=[suggested_fix],
-            resolution_confidence=1.0,
-            resolution_notes=notes or "",
-                    )
-                    print(f" Investigation session {open_session['id']} marked as resolved.")
-                    print("  Future analyze-followup calls will not attach to this session.")
-                
                 incident_types[incident_type]['success'] += 1
             elif result == 'failed':
                 incident_types[incident_type]['failed'] += 1

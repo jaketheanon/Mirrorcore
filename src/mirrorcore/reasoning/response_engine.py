@@ -1031,92 +1031,6 @@ class ReasoningResponseEngine:
         
         return MessageCategory.GENERAL_REASONING
     
-    def _generate_targeted_response(self, incident, context: ResponseContext) -> ResponseResult:
-        """Generate targeted response for recognized incident."""
-        # Extract suggested fixes for outcome capture
-        suggested_fixes = []
-        if incident.recommended_first_checks:
-            suggested_fixes.extend(incident.recommended_first_checks[:2])
-        if incident.low_risk_initial_actions:
-            suggested_fixes.extend(incident.low_risk_initial_actions[:1])
-        
-        # Build styled response
-        styled_response = f"I recognize this as a {incident.incident_type.replace('_', ' ').title()} issue. Let me provide targeted guidance:\n\n"
-        
-        if incident.likely_causes:
-            styled_response += "Most likely causes:\n"
-            for i, cause in enumerate(incident.likely_causes[:3], 1):
-                styled_response += f"{i}. {cause}\n"
-            styled_response += "\n"
-        
-        if incident.recommended_first_checks:
-            styled_response += "First checks to run:\n"
-            for i, check in enumerate(incident.recommended_first_checks[:3], 1):
-                styled_response += f"{i}. {check}\n"
-            styled_response += "\n"
-        
-        if incident.low_risk_initial_actions:
-            styled_response += "Low-risk initial actions:\n"
-            for action in incident.low_risk_initial_actions[:3]:
-                styled_response += f"• {action}\n"
-            styled_response += "\n"
-        
-        # Add historical context if available (gated through should_surface_historical_fix_guidance)
-        if context.memory_store:
-            try:
-                from ..terminal.historical_fix_gate import should_surface_historical_fix_guidance
-
-                ranked_fixes = context.memory_store.get_ranked_fixes_by_incident_type(
-                    incident.incident_type, limit=3
-                )
-                successful_fixes = [f for f in ranked_fixes if f.get('success_count', 0) > 0] if ranked_fixes else []
-
-                if successful_fixes:
-                    show_hist = should_surface_historical_fix_guidance(
-                        successful_fixes[0],
-                        incident.incident_type,
-                        getattr(incident, "confidence", 0.0) or 0.0,
-                        user_input=context.user_input,
-                        signal_families=getattr(context, "signal_families", None),
-                        detected_subsystem=getattr(context, "detected_subsystem", None),
-                        likely_error_category=getattr(context, "likely_error_category", None),
-                    )
-                    if show_hist:
-                        top_fix = successful_fixes[0]
-                        styled_response += f"Based on previous outcomes for this issue:\n"
-                        styled_response += f"Most successful approach: {top_fix['normalized_fix']}\n"
-                        styled_response += f"  Reason: {top_fix['success_count']} successful, {top_fix['failed_count']} failed attempts\n"
-                        suggested_fixes.append(top_fix['normalized_fix'])
-                        if len(successful_fixes) > 1:
-                            styled_response += "Other successful approaches:\n"
-                            for i, fix in enumerate(successful_fixes[1:3], 2):
-                                styled_response += f"  {i}. {fix['normalized_fix']} ({fix['success_count']} success)\n"
-                                suggested_fixes.append(fix['normalized_fix'])
-                        styled_response += "\n"
-            except Exception:
-                pass  # Don't fail if memory retrieval fails
-        
-        styled_response += "These steps should help identify the root cause. Let me know what you discover!"
-        
-        # Evaluate confidence and determine if escalation is needed
-        extracted_signals = getattr(context, 'extracted_signals', [])
-        evaluation = self.evaluate_confidence(incident, context, extracted_signals)
-        
-        # Generate escalation guidance if triggered
-        escalation_guidance = ""
-        if evaluation.escalation_triggered:
-            escalation_guidance = self.generate_escalation_guidance(evaluation)
-        
-        # Return result with outcome capture support and escalation info.
-        # Escalation guidance is returned separately to ensure callers can print it once.
-        return ResponseResult(
-            response=styled_response,
-            should_prompt_outcome=True,  # Enable outcome capture for targeted responses
-            incident_id=getattr(context, 'incident_id', None),
-            suggested_fixes=suggested_fixes,
-            escalation_guidance=escalation_guidance if evaluation.escalation_triggered else None
-        )
-    
     def evaluate_confidence(self, incident, context: ResponseContext, extracted_signals: List[str]) -> ConfidenceEvaluation:
         """Evaluate confidence level and determine if escalation is needed."""
         if not incident:
@@ -1323,6 +1237,9 @@ class ReasoningResponseEngine:
                     incident.incident_type,
                     getattr(incident, "confidence", 0.0) or 0.0,
                     user_input=context.user_input,
+                    signal_families=getattr(context, "signal_families", None),
+                    detected_subsystem=getattr(context, "detected_subsystem", None),
+                    likely_error_category=getattr(context, "likely_error_category", None),
                 )
 
                 if ranked_fixes and show_hist:
