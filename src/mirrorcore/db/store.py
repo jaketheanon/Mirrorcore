@@ -46,6 +46,7 @@ class DatabaseStore:
         """Apply all idempotent schema migrations on the current connection."""
         self.ensure_step21_columns()
         self.ensure_phase27_columns()
+        self.ensure_phase28_style_memory()
 
     def initialize_database(self):
         """Initialize the database with all required tables.
@@ -97,6 +98,39 @@ class DatabaseStore:
                 "ALTER TABLE decision_memory ADD COLUMN correction_metadata TEXT"
             )
             conn.commit()
+
+    def ensure_phase28_style_memory(self):
+        """Ensure Phase 28 style memory table and indexes exist."""
+        conn = self.get_db_connection()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS style_memory (
+                id TEXT PRIMARY KEY,
+                timestamp TIMESTAMP NOT NULL,
+                prompt_id TEXT NOT NULL,
+                prompt_text TEXT NOT NULL,
+                selected_label TEXT NOT NULL,
+                selected_value TEXT NOT NULL,
+                optional_notes TEXT,
+                style_tags_json TEXT,
+                tone_signals_json TEXT,
+                confidence_score REAL NOT NULL DEFAULT 0.0,
+                correction_status TEXT NOT NULL DEFAULT 'uncorrected',
+                correction_metadata TEXT,
+                source TEXT NOT NULL DEFAULT 'style_calibration'
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_style_memory_timestamp ON style_memory(timestamp)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_style_memory_prompt_id ON style_memory(prompt_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_style_memory_source ON style_memory(source)"
+        )
+        conn.commit()
 
     def close(self):
         """Close database connection."""
@@ -1334,3 +1368,76 @@ class DatabaseStore:
                 (correction_status, entry_id),
             )
         conn.commit()
+
+    # Style memory operations (Phase 28)
+    def record_style_memory(self, prompt_id: str, prompt_text: str,
+                            selected_label: str, selected_value: str,
+                            style_tags: List[str], tone_signals: Dict[str, Any],
+                            confidence_score: float = 0.8,
+                            optional_notes: str = None,
+                            correction_status: str = "uncorrected",
+                            correction_metadata: Optional[Dict[str, Any]] = None,
+                            source: str = "style_calibration") -> str:
+        """Record a structured style memory entry."""
+        conn = self.get_db_connection()
+
+        entry_id = str(uuid4())
+        now = datetime.utcnow().isoformat()
+
+        query = """
+            INSERT INTO style_memory
+            (id, timestamp, prompt_id, prompt_text,
+             selected_label, selected_value, optional_notes,
+             style_tags_json, tone_signals_json, confidence_score,
+             correction_status, correction_metadata, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        conn.execute(query, (
+            entry_id, now, prompt_id, prompt_text,
+            selected_label, selected_value, optional_notes,
+            json.dumps(style_tags), json.dumps(tone_signals), confidence_score,
+            correction_status,
+            json.dumps(correction_metadata) if correction_metadata is not None else None,
+            source
+        ))
+        conn.commit()
+        return entry_id
+
+    def get_recent_style_memory(self, limit: int = 20,
+                                prompt_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieve recent style memory entries."""
+        conn = self.get_db_connection()
+
+        if prompt_id:
+            query = """
+                SELECT * FROM style_memory
+                WHERE prompt_id = ?
+                ORDER BY timestamp DESC LIMIT ?
+            """
+            rows = conn.execute(query, (prompt_id, limit)).fetchall()
+        else:
+            query = """
+                SELECT * FROM style_memory
+                ORDER BY timestamp DESC LIMIT ?
+            """
+            rows = conn.execute(query, (limit,)).fetchall()
+
+        results = []
+        for row in rows:
+            entry = dict(row)
+            try:
+                entry["style_tags"] = json.loads(entry.pop("style_tags_json", "[]"))
+            except (json.JSONDecodeError, TypeError):
+                entry["style_tags"] = []
+            try:
+                entry["tone_signals"] = json.loads(entry.pop("tone_signals_json", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                entry["tone_signals"] = {}
+            try:
+                entry["correction_metadata"] = json.loads(entry.get("correction_metadata") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                entry["correction_metadata"] = {}
+            results.append(entry)
+
+        return results

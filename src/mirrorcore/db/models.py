@@ -226,6 +226,25 @@ def initialize_database(conn: sqlite3.Connection):
         )
     """)
 
+    # 10) style_memory table - Structured style/persona calibration memory (Phase 28)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS style_memory (
+            id TEXT PRIMARY KEY,
+            timestamp TIMESTAMP NOT NULL,
+            prompt_id TEXT NOT NULL,
+            prompt_text TEXT NOT NULL,
+            selected_label TEXT NOT NULL,
+            selected_value TEXT NOT NULL,
+            optional_notes TEXT,
+            style_tags_json TEXT,
+            tone_signals_json TEXT,
+            confidence_score REAL NOT NULL DEFAULT 0.0,
+            correction_status TEXT NOT NULL DEFAULT 'uncorrected',
+            correction_metadata TEXT,
+            source TEXT NOT NULL DEFAULT 'style_calibration'
+        )
+    """)
+
     # Create indexes for performance
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_persona_profile_trait_name ON persona_profile(trait_name)",
@@ -244,7 +263,10 @@ def initialize_database(conn: sqlite3.Connection):
         "CREATE INDEX IF NOT EXISTS idx_user_fix_preferences_last_used ON user_fix_preferences(last_used)",
         "CREATE INDEX IF NOT EXISTS idx_decision_memory_timestamp ON decision_memory(timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_decision_memory_scenario_id ON decision_memory(scenario_id)",
-        "CREATE INDEX IF NOT EXISTS idx_decision_memory_source ON decision_memory(source)"
+        "CREATE INDEX IF NOT EXISTS idx_decision_memory_source ON decision_memory(source)",
+        "CREATE INDEX IF NOT EXISTS idx_style_memory_timestamp ON style_memory(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_style_memory_prompt_id ON style_memory(prompt_id)",
+        "CREATE INDEX IF NOT EXISTS idx_style_memory_source ON style_memory(source)"
     ]
     
     for index_sql in indexes:

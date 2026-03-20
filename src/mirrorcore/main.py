@@ -195,6 +195,12 @@ Examples:
         help="Run a structured decision interview"
     )
 
+    # Style calibration command (Phase 28)
+    calibrate_style_parser = subparsers.add_parser(
+        "calibrate-style",
+        help="Run a short style/persona calibration session"
+    )
+
     # Status command
     status_parser = subparsers.add_parser(
         "status",
@@ -1794,6 +1800,61 @@ def handle_interview(args):
     print("-" * 56)
 
 
+def handle_calibrate_style(args):
+    """Handle calibrate-style command — run style calibration session."""
+    from pathlib import Path
+    from .db.store import DatabaseStore
+    from .persona.calibration import run_style_calibration_session
+
+    db_path = Path("data") / "mirrorcore.db"
+    db_store = DatabaseStore(db_path)
+
+    prior_entries = db_store.get_recent_style_memory(limit=1000)
+    session_index = len(prior_entries)
+
+    try:
+        session = run_style_calibration_session(session_index=session_index)
+    except (EOFError, KeyboardInterrupt):
+        print("\nStyle calibration cancelled.")
+        return
+
+    correction_status = "uncorrected"
+    correction_metadata = None
+    if session.correction:
+        correction_status = session.correction.status
+        correction_metadata = {
+            "status": session.correction.status,
+            "accepted_traits": session.correction.accepted_traits,
+            "rejected_traits": session.correction.rejected_traits,
+            "replacement_choices": session.correction.replacement_choices,
+        }
+
+    entry_ids = []
+    for result in session.results:
+        entry_id = db_store.record_style_memory(
+            prompt_id=result.prompt_id,
+            prompt_text=result.prompt_text,
+            selected_label=result.selected_label,
+            selected_value=result.selected_value,
+            style_tags=result.style_tags,
+            tone_signals=result.tone_signals,
+            confidence_score=result.confidence_score,
+            optional_notes=result.optional_notes,
+            correction_status=correction_status,
+            correction_metadata=correction_metadata,
+            source="style_calibration",
+        )
+        entry_ids.append(entry_id)
+
+    print("\n" + "-" * 56)
+    print(f"  Session complete — {len(entry_ids)} style prompts recorded.")
+    if session.reflections:
+        print(f"  Reflections generated: {len(session.reflections)}")
+    if session.correction:
+        print(f"  Correction: {session.correction.status}")
+    print("-" * 56)
+
+
 def handle_status(args):
     """Handle status command."""
     print("Mirrorcore System Status")
@@ -1889,7 +1950,8 @@ def main():
         "memory": handle_memory,
         "status": handle_status,
         "config": handle_config,
-        "interview": handle_interview
+        "interview": handle_interview,
+        "calibrate-style": handle_calibrate_style
     }
     
     handler = handlers.get(args.command)
