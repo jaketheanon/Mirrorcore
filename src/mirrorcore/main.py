@@ -55,6 +55,7 @@ Examples:
   mirrorcore analyze-followup                   # Update analysis with new evidence
   mirrorcore profile                            # View your profile
   mirrorcore interview                          # Run a decision interview
+  mirrorcore respond-like-me                    # Likely-you answer from saved memory
         """
     )
     
@@ -199,6 +200,17 @@ Examples:
     calibrate_style_parser = subparsers.add_parser(
         "calibrate-style",
         help="Run a short style/persona calibration session"
+    )
+
+    respond_like_me_parser = subparsers.add_parser(
+        "respond-like-me",
+        help="Generate a likely-you response from saved decision and style memory",
+    )
+    respond_like_me_parser.add_argument(
+        "scenario",
+        nargs="?",
+        default=None,
+        help="Scenario or question (omit to type it when prompted)",
     )
 
     # Status command
@@ -1800,6 +1812,62 @@ def handle_interview(args):
     print("-" * 56)
 
 
+def handle_respond_like_me(args):
+    """Handle respond-like-me — grounded likely-you reply from stored memory."""
+    from pathlib import Path
+    from .db.store import DatabaseStore
+    from .persona.respond import generate_personal_response
+
+    db_path = Path("data") / "mirrorcore.db"
+    db_store = DatabaseStore(db_path)
+
+    scenario = (args.scenario or "").strip()
+    if not scenario:
+        if PROMPT_TOOLKIT_AVAILABLE:
+            try:
+                scenario = prompt(
+                    "Describe a situation or question (your scenario): "
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled.")
+                return
+        else:
+            try:
+                scenario = input(
+                    "Describe a situation or question (your scenario): "
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled.")
+                return
+
+    if not scenario:
+        print("No scenario text — nothing to respond to.")
+        return
+
+    pr = generate_personal_response(scenario, db_store)
+    print()
+    print("Likely response")
+    print("-" * min(48, max(24, len(scenario) // 2 + 24)))
+    print(pr.likely_answer)
+    print()
+    print("Why (brief)")
+    print("-" * 13)
+    print(pr.reasoning_brief)
+    print()
+    print(
+        f"Confidence: {pr.confidence_label} ({pr.confidence:.2f})"
+    )
+    if pr.memory_basis:
+        print("Grounded in:")
+        for line in pr.memory_basis[:5]:
+            print(f"  • {line}")
+    elif pr.profile_hint:
+        print(f"Grounded in: your saved tendencies ({pr.profile_hint})")
+    else:
+        print("Grounded in: little or no matching stored memory — see confidence above.")
+    print()
+
+
 def handle_calibrate_style(args):
     """Handle calibrate-style command — run style calibration session."""
     from pathlib import Path
@@ -1951,7 +2019,8 @@ def main():
         "status": handle_status,
         "config": handle_config,
         "interview": handle_interview,
-        "calibrate-style": handle_calibrate_style
+        "calibrate-style": handle_calibrate_style,
+        "respond-like-me": handle_respond_like_me,
     }
     
     handler = handlers.get(args.command)

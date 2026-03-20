@@ -497,7 +497,9 @@ class TestCorrectionMetadataDB(unittest.TestCase):
         self.db.update_decision_memory_correction(entry_id, "partially_true", metadata)
         row = self.db.get_recent_decision_memory()[0]
         self.assertEqual(row["correction_status"], "partially_true")
-        stored_meta = json.loads(row.get("correction_metadata", "{}") or "{}")
+        stored_meta = row.get("correction_metadata") or {}
+        if isinstance(stored_meta, str):
+            stored_meta = json.loads(stored_meta or "{}")
         self.assertEqual(stored_meta["accepted_traits"], ["patience"])
         self.assertEqual(stored_meta["rejected_traits"], ["risk_tolerance"])
 

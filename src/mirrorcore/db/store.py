@@ -1359,6 +1359,14 @@ class DatabaseStore:
                 entry['trait_signals'] = json.loads(entry.pop('trait_signals_json', '{}'))
             except (json.JSONDecodeError, TypeError):
                 entry['trait_signals'] = {}
+            raw_meta = entry.get("correction_metadata")
+            if isinstance(raw_meta, str):
+                try:
+                    entry["correction_metadata"] = json.loads(raw_meta or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    entry["correction_metadata"] = {}
+            elif raw_meta is None:
+                entry["correction_metadata"] = {}
             results.append(entry)
 
         return results
