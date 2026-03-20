@@ -207,13 +207,11 @@ def _bluntness_from_profile(profile: PersonalProfile) -> float:
 
 
 def _confidence_bucket(value: float) -> str:
-    if value < 0.28:
+    if value < 0.35:
         return "low"
-    if value < 0.42:
+    if value < 0.70:
         return "moderate"
-    if value < 0.58:
-        return "fair"
-    if value < 0.72:
+    if value < 0.90:
         return "fairly high"
     return "high"
 
