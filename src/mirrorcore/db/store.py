@@ -64,6 +64,12 @@ class DatabaseStore:
     def ensure_step21_columns(self):
         """Ensure Step 21 investigation tracking columns exist on existing databases."""
         conn = self.get_db_connection()
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'analysis_sessions' LIMIT 1"
+        ).fetchone()
+        if not table_exists:
+            return
+
         existing_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(analysis_sessions)").fetchall()
@@ -89,6 +95,12 @@ class DatabaseStore:
     def ensure_phase27_columns(self):
         """Ensure Phase 27 correction_metadata column exists on existing databases."""
         conn = self.get_db_connection()
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'decision_memory' LIMIT 1"
+        ).fetchone()
+        if not table_exists:
+            return
+
         existing_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(decision_memory)").fetchall()
