@@ -27,6 +27,7 @@ from mirrorcore.decision.interview import (
     SCENARIOS,
     get_scenario,
     get_scenarios_for_session,
+    get_followup_question_for_main,
     extract_signals,
     compute_confidence,
     generate_reflections,
@@ -149,7 +150,9 @@ class TestExtractionMapping(unittest.TestCase):
 
         self.assertEqual(tags, ["efficiency", "pragmatism", "speed"])
         self.assertAlmostEqual(signals["risk_tolerance"], 0.7)
-        self.assertAlmostEqual(signals["self_direction"], 0.6)
+        # Follow-up-only traits are softened toward a neutral baseline.
+        # MAIN_WEIGHT=0.7, NEUTRAL=0.5 → 0.7*0.5 + 0.3*0.6 = 0.53
+        self.assertAlmostEqual(signals["self_direction"], 0.53)
 
     def test_extract_signals_averages_shared_traits(self):
         main = InterviewOption(
@@ -165,8 +168,9 @@ class TestExtractionMapping(unittest.TestCase):
 
         _, signals = extract_signals(main, followup)
 
-        self.assertAlmostEqual(signals["risk_tolerance"], 0.5)
-        self.assertAlmostEqual(signals["thoroughness"], 0.5)
+        # MAIN_WEIGHT=0.7, FOLLOW_WEIGHT=0.3
+        self.assertAlmostEqual(signals["risk_tolerance"], 0.62)
+        self.assertAlmostEqual(signals["thoroughness"], 0.46)
 
     def test_compute_confidence_full_overlap(self):
         a = InterviewOption(id="a", label="A", value_tags=["quality", "caution"])
@@ -213,7 +217,14 @@ class TestScenarioDefinitions(unittest.TestCase):
             self.assertTrue(scenario.id)
             self.assertTrue(scenario.text)
             self.assertGreaterEqual(len(scenario.main_question.options), 2)
-            self.assertGreaterEqual(len(scenario.followup_question.options), 2)
+            main_ids = {o.id for o in scenario.main_question.options}
+            self.assertEqual(
+                set(scenario.followup_by_main_choice.keys()),
+                main_ids,
+                f"{scenario.id}: follow-up map must cover every main option",
+            )
+            for mid, fq in scenario.followup_by_main_choice.items():
+                self.assertGreaterEqual(len(fq.options), 2, f"{scenario.id}/{mid}")
 
             for opt in scenario.main_question.options:
                 self.assertTrue(opt.id)
@@ -224,6 +235,36 @@ class TestScenarioDefinitions(unittest.TestCase):
     def test_scenario_ids_are_unique(self):
         ids = [s.id for s in SCENARIOS]
         self.assertEqual(len(ids), len(set(ids)))
+
+    def test_followup_option_ids_are_unique_across_scenarios(self):
+        ids = []
+        for scenario in SCENARIOS:
+            for _mid, fq in scenario.followup_by_main_choice.items():
+                for opt in fq.options:
+                    ids.append(opt.id)
+        # Follow-up option IDs should not be reused across scenarios.
+        # This is a lightweight guardrail against copying a generic reason pool.
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_speed_vs_safety_followup_is_contextual(self):
+        s = get_scenario("speed_vs_safety_v1")
+        short = get_followup_question_for_main(s, "take_shortcut")
+        labels = [o.label.lower() for o in short.options]
+        self.assertTrue(any("move fast" in l for l in labels))
+        right = get_followup_question_for_main(s, "do_it_right")
+        labels_r = [o.label.lower() for o in right.options]
+        self.assertTrue(any("proper" in l for l in labels_r))
+        self.assertTrue(any("mess" in l for l in labels_r))
+        self.assertFalse(any("save money" in l for l in labels + labels_r))
+
+    def test_help_overwhelmed_say_no_reasons_match_boundary(self):
+        s = get_scenario("help_when_overwhelmed_v1")
+        fq = get_followup_question_for_main(s, "say_no")
+        labels = " ".join(o.label.lower() for o in fq.options)
+        self.assertIn("protect", labels)
+        self.assertIn("overload", labels)
+        self.assertIn("regret", labels)
+        self.assertNotIn("small way", labels)
 
 
 class TestInterviewFlowStorage(unittest.TestCase):
@@ -344,9 +385,16 @@ class TestSimpleChoiceExtraction(unittest.TestCase):
             for opt in scenario.main_question.options:
                 self.assertTrue(len(opt.value_tags) > 0, f"{scenario.id} main option {opt.id} has no value_tags")
                 self.assertTrue(len(opt.trait_signals) > 0, f"{scenario.id} main option {opt.id} has no trait_signals")
-            for opt in scenario.followup_question.options:
-                self.assertTrue(len(opt.value_tags) > 0, f"{scenario.id} followup option {opt.id} has no value_tags")
-                self.assertTrue(len(opt.trait_signals) > 0, f"{scenario.id} followup option {opt.id} has no trait_signals")
+            for mid, fq in scenario.followup_by_main_choice.items():
+                for opt in fq.options:
+                    self.assertTrue(
+                        len(opt.value_tags) > 0,
+                        f"{scenario.id}/{mid} followup option {opt.id} has no value_tags",
+                    )
+                    self.assertTrue(
+                        len(opt.trait_signals) > 0,
+                        f"{scenario.id}/{mid} followup option {opt.id} has no trait_signals",
+                    )
 
 
 class TestReflectionGeneration(unittest.TestCase):
@@ -417,6 +465,42 @@ class TestReflectionGeneration(unittest.TestCase):
             self.assertIsInstance(ref.trait, str)
             self.assertIsInstance(ref.strength, float)
             self.assertTrue(ref.text)
+
+    def test_low_reflection_for_risk_tolerance_is_specific(self):
+        # Two results → enough evidence to surface a reflection.
+        results = [
+            self._make_result({"risk_tolerance": 0.1}),
+            self._make_result({"risk_tolerance": 0.2}),
+        ]
+        reflections = generate_reflections(results)
+        risk_refs = [r for r in reflections if r.trait == "risk_tolerance"]
+        self.assertEqual(len(risk_refs), 1)
+        self.assertIn("avoid unnecessary risk", risk_refs[0].text.lower())
+
+    def test_intuitive_reflection_does_not_overpower_cautious_main(self):
+        # Main choice is cautious (low risk); follow-up is "gut-ish".
+        # Extract logic should soften follow-up-only gut signals.
+        main = InterviewOption(
+            id="do_it_right",
+            label="Do it the proper way",
+            value_tags=[],
+            trait_signals={"risk_tolerance": 0.2, "thoroughness": 0.9},
+        )
+        followup = InterviewOption(
+            id="wanted_it_now",
+            label="Wanted it now",
+            value_tags=[],
+            trait_signals={"intuitive_leaning": 0.8, "analytical_thinking": 0.2},
+        )
+        _, trait_signals = extract_signals(main, followup)
+
+        results = [
+            self._make_result(trait_signals),
+            self._make_result(trait_signals),
+        ]
+        reflections = generate_reflections(results)
+        traits = [r.trait for r in reflections]
+        self.assertNotIn("intuitive_leaning", traits)
 
 
 class TestCorrectionLoop(unittest.TestCase):
@@ -582,7 +666,8 @@ class TestMultiScenarioInterviewSession(unittest.TestCase):
     @patch("builtins.input")
     def test_session_partial_correction(self, mock_input):
         # 4 scenarios x 2 choices + correction (2 = partially true) + right ones
-        inputs = ["1", "1"] * 4 + ["2", "1 2"]
+        # Provide a valid "right ones" input even if fewer reflections appear.
+        inputs = ["1", "1"] * 4 + ["2", "1"]
         mock_input.side_effect = inputs
 
         session = run_interview_session(4)
@@ -636,6 +721,36 @@ class TestPhase27SchemaCompatibility(unittest.TestCase):
         rows = self.db.get_recent_decision_memory()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["correction_status"], "uncorrected")
+
+
+class TestDecisionInterviewRotationPersistence(unittest.TestCase):
+    """Verify scenario rotation persists across process runs."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = DatabaseStore(Path(self.tmp.name))
+        self.db.initialize_database()
+
+    def tearDown(self):
+        self.db.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_rotation_counter_persists_and_changes_scenario_order(self):
+        idx1 = self.db.get_next_decision_interview_rotation_index()
+        idx2 = self.db.get_next_decision_interview_rotation_index()
+        self.assertEqual(idx1, 0)
+        self.assertEqual(idx2, 1)
+
+        first = [s.id for s in get_scenarios_for_session(4, session_index=idx1)]
+        second = [s.id for s in get_scenarios_for_session(4, session_index=idx2)]
+        self.assertNotEqual(first, second)
+
+        # Simulate a new process run by reopening the same DB file.
+        self.db.close()
+        self.db = DatabaseStore(Path(self.tmp.name))
+        idx3 = self.db.get_next_decision_interview_rotation_index()
+        self.assertEqual(idx3, 2)
 
 
 if __name__ == "__main__":

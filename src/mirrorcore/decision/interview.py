@@ -10,6 +10,10 @@ Phase 27 additions:
 - Mid-interview reflection generation
 - Correction loop with structured correction metadata
 - Deterministic response variation
+
+Phase 30.1+:
+- Follow-up “why” options are keyed by the selected main choice (no shared pool
+  per scenario) so reasons match the action taken.
 """
 
 from typing import Dict, Any, List, Optional, Tuple
@@ -34,11 +38,11 @@ class InterviewQuestion:
 
 @dataclass
 class InterviewScenario:
-    """A complete interview scenario with a main choice and a follow-up."""
+    """Scenario with a main question and follow-up reasons per main choice."""
     id: str
     text: str
     main_question: InterviewQuestion
-    followup_question: InterviewQuestion
+    followup_by_main_choice: Dict[str, InterviewQuestion]
 
 
 @dataclass
@@ -111,29 +115,121 @@ SCENARIOS: List[InterviewScenario] = [
                 ),
             ],
         ),
-        followup_question=InterviewQuestion(
-            prompt="Why that approach?",
-            options=[
-                InterviewOption(
-                    id="felt_right",
-                    label="Felt right",
-                    value_tags=["intuition", "gut_feeling"],
-                    trait_signals={"analytical_thinking": 0.3, "intuitive_leaning": 0.8},
-                ),
-                InterviewOption(
-                    id="save_money",
-                    label="Wanted to save money",
-                    value_tags=["frugality", "security"],
-                    trait_signals={"financial_caution": 0.9, "self_direction": 0.6},
-                ),
-                InterviewOption(
-                    id="no_problems_later",
-                    label="Didn't want problems later",
-                    value_tags=["foresight", "caution"],
-                    trait_signals={"future_orientation": 0.8, "anxiety_avoidance": 0.6},
-                ),
-            ],
-        ),
+        followup_by_main_choice={
+            "buy_now": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="exp_buy_wanted_now",
+                        label="Wanted it now",
+                        value_tags=["impulse", "speed", "reward_seeking"],
+                        trait_signals={
+                            "analytical_thinking": 0.25,
+                            "intuitive_leaning": 0.75,
+                            "efficiency": 0.7,
+                            "self_reward": 0.8,
+                        },
+                    ),
+                    InterviewOption(
+                        id="exp_buy_treat_myself",
+                        label="Wanted to treat myself",
+                        value_tags=["reward_seeking", "self_care"],
+                        trait_signals={
+                            "self_reward": 0.85,
+                            "analytical_thinking": 0.35,
+                            "intuitive_leaning": 0.65,
+                        },
+                    ),
+                    InterviewOption(
+                        id="exp_buy_no_delay",
+                        label="Didn't want to wait and overthink",
+                        value_tags=["decisiveness", "momentum"],
+                        trait_signals={
+                            "decisiveness": 0.75,
+                            "patience": 0.25,
+                            "analytical_thinking": 0.4,
+                            "intuitive_leaning": 0.6,
+                        },
+                    ),
+                ],
+            ),
+            "wait_and_think": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="exp_wait_sleep_on_it",
+                        label="Needed time to think it through",
+                        value_tags=["caution", "deliberation"],
+                        trait_signals={
+                            "patience": 0.9,
+                            "risk_tolerance": 0.2,
+                            "analytical_thinking": 0.85,
+                            "intuitive_leaning": 0.2,
+                            "future_orientation": 0.7,
+                        },
+                    ),
+                    InterviewOption(
+                        id="exp_wait_avoid_impulse",
+                        label="Wanted to avoid an impulse buy",
+                        value_tags=["caution", "foresight"],
+                        trait_signals={
+                            "future_orientation": 0.8,
+                            "financial_caution": 0.75,
+                            "analytical_thinking": 0.8,
+                            "intuitive_leaning": 0.25,
+                        },
+                    ),
+                    InterviewOption(
+                        id="exp_wait_compare",
+                        label="Wanted to compare options calmly",
+                        value_tags=["deliberation", "pragmatism"],
+                        trait_signals={
+                            "analytical_thinking": 0.85,
+                            "resourcefulness": 0.65,
+                            "patience": 0.75,
+                            "risk_tolerance": 0.3,
+                        },
+                    ),
+                ],
+            ),
+            "find_cheaper": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="exp_cheap_save",
+                        label="Wanted to save money",
+                        value_tags=["frugality", "security"],
+                        trait_signals={
+                            "financial_caution": 0.9,
+                            "resourcefulness": 0.85,
+                            "self_direction": 0.65,
+                            "risk_tolerance": 0.25,
+                        },
+                    ),
+                    InterviewOption(
+                        id="exp_cheap_value",
+                        label="Wanted better value for the price",
+                        value_tags=["pragmatism", "resourcefulness"],
+                        trait_signals={
+                            "resourcefulness": 0.85,
+                            "financial_caution": 0.7,
+                            "analytical_thinking": 0.75,
+                        },
+                    ),
+                    InterviewOption(
+                        id="exp_cheap_still_get",
+                        label="Still wanted it, just smarter",
+                        value_tags=["pragmatism", "reward_seeking"],
+                        trait_signals={
+                            "self_reward": 0.55,
+                            "resourcefulness": 0.8,
+                            "patience": 0.65,
+                            "analytical_thinking": 0.6,
+                        },
+                    ),
+                ],
+            ),
+        },
     ),
     InterviewScenario(
         id="conflict_handling_v1",
@@ -161,29 +257,121 @@ SCENARIOS: List[InterviewScenario] = [
                 ),
             ],
         ),
-        followup_question=InterviewQuestion(
-            prompt="Why that approach?",
-            options=[
-                InterviewOption(
-                    id="didnt_think_much",
-                    label="Didn't think much about it",
-                    value_tags=["spontaneity", "low_deliberation"],
-                    trait_signals={"analytical_thinking": 0.2, "intuitive_leaning": 0.7},
-                ),
-                InterviewOption(
-                    id="seemed_safest",
-                    label="Seemed safest",
-                    value_tags=["safety", "caution"],
-                    trait_signals={"risk_tolerance": 0.2, "anxiety_avoidance": 0.8},
-                ),
-                InterviewOption(
-                    id="thought_it_through",
-                    label="Thought it through",
-                    value_tags=["deliberation", "planning"],
-                    trait_signals={"analytical_thinking": 0.8, "self_direction": 0.7},
-                ),
-            ],
-        ),
+        followup_by_main_choice={
+            "speak_up": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="conf_speak_honest",
+                        label="Wanted to be honest in the moment",
+                        value_tags=["honesty", "directness"],
+                        trait_signals={
+                            "directness": 0.85,
+                            "conflict_comfort": 0.75,
+                            "patience": 0.35,
+                            "analytical_thinking": 0.55,
+                            "intuitive_leaning": 0.45,
+                        },
+                    ),
+                    InterviewOption(
+                        id="conf_speak_stop_bothering",
+                        label="Wanted it to stop bothering me",
+                        value_tags=["directness", "self_care"],
+                        trait_signals={
+                            "directness": 0.8,
+                            "conflict_comfort": 0.7,
+                            "anxiety_avoidance": 0.55,
+                        },
+                    ),
+                    InterviewOption(
+                        id="conf_speak_clear_air",
+                        label="Wanted to clear the air now",
+                        value_tags=["directness", "assertiveness"],
+                        trait_signals={
+                            "directness": 0.85,
+                            "decisiveness": 0.65,
+                            "conflict_comfort": 0.75,
+                        },
+                    ),
+                ],
+            ),
+            "let_it_go": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="conf_letgo_not_worth",
+                        label="It wasn't worth the energy",
+                        value_tags=["avoidance", "pragmatism"],
+                        trait_signals={
+                            "conflict_comfort": 0.25,
+                            "patience": 0.65,
+                            "analytical_thinking": 0.55,
+                            "risk_tolerance": 0.35,
+                        },
+                    ),
+                    InterviewOption(
+                        id="conf_letgo_keep_peace",
+                        label="Wanted to keep the peace",
+                        value_tags=["peace_keeping", "avoidance"],
+                        trait_signals={
+                            "conflict_comfort": 0.2,
+                            "anxiety_avoidance": 0.75,
+                            "empathy": 0.55,
+                            "patience": 0.7,
+                        },
+                    ),
+                    InterviewOption(
+                        id="conf_letgo_pick_battles",
+                        label="Pick my battles",
+                        value_tags=["pragmatism", "timing"],
+                        trait_signals={
+                            "future_orientation": 0.65,
+                            "patience": 0.75,
+                            "analytical_thinking": 0.6,
+                            "conflict_comfort": 0.35,
+                        },
+                    ),
+                ],
+            ),
+            "bring_up_later": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="conf_later_better_moment",
+                        label="Waited for a better moment",
+                        value_tags=["diplomacy", "timing"],
+                        trait_signals={
+                            "patience": 0.85,
+                            "directness": 0.55,
+                            "conflict_comfort": 0.55,
+                            "analytical_thinking": 0.8,
+                            "future_orientation": 0.75,
+                        },
+                    ),
+                    InterviewOption(
+                        id="conf_later_cooler_heads",
+                        label="Cooler heads would help",
+                        value_tags=["composure", "caution"],
+                        trait_signals={
+                            "patience": 0.8,
+                            "anxiety_avoidance": 0.6,
+                            "analytical_thinking": 0.75,
+                        },
+                    ),
+                    InterviewOption(
+                        id="conf_later_thought_first",
+                        label="Wanted to think before I spoke",
+                        value_tags=["deliberation", "planning"],
+                        trait_signals={
+                            "analytical_thinking": 0.85,
+                            "patience": 0.8,
+                            "directness": 0.5,
+                            "intuitive_leaning": 0.3,
+                        },
+                    ),
+                ],
+            ),
+        },
     ),
     InterviewScenario(
         id="help_when_overwhelmed_v1",
@@ -211,29 +399,122 @@ SCENARIOS: List[InterviewScenario] = [
                 ),
             ],
         ),
-        followup_question=InterviewQuestion(
-            prompt="Why that approach?",
-            options=[
-                InterviewOption(
-                    id="felt_right",
-                    label="Felt right",
-                    value_tags=["intuition", "gut_feeling"],
-                    trait_signals={"analytical_thinking": 0.3, "intuitive_leaning": 0.8},
-                ),
-                InterviewOption(
-                    id="no_problems_later",
-                    label="Didn't want problems later",
-                    value_tags=["foresight", "caution"],
-                    trait_signals={"future_orientation": 0.8, "anxiety_avoidance": 0.6},
-                ),
-                InterviewOption(
-                    id="thought_it_through",
-                    label="Thought it through",
-                    value_tags=["deliberation", "planning"],
-                    trait_signals={"analytical_thinking": 0.8, "self_direction": 0.7},
-                ),
-            ],
-        ),
+        followup_by_main_choice={
+            "help_anyway": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="help_anyway_couldnt_say_no",
+                        label="Couldn't bring myself to say no",
+                        value_tags=["selflessness", "people_pleasing"],
+                        trait_signals={
+                            "empathy": 0.85,
+                            "boundary_setting": 0.25,
+                            "self_care": 0.35,
+                            "analytical_thinking": 0.4,
+                            "intuitive_leaning": 0.55,
+                        },
+                    ),
+                    InterviewOption(
+                        id="help_anyway_they_needed",
+                        label="They really needed the help",
+                        value_tags=["empathy", "responsibility"],
+                        trait_signals={
+                            "empathy": 0.9,
+                            "boundary_setting": 0.3,
+                            "self_care": 0.35,
+                        },
+                    ),
+                    InterviewOption(
+                        id="help_anyway_guilt",
+                        label="Would have felt guilty saying no",
+                        value_tags=["guilt", "people_pleasing"],
+                        trait_signals={
+                            "empathy": 0.75,
+                            "anxiety_avoidance": 0.65,
+                            "boundary_setting": 0.3,
+                            "intuitive_leaning": 0.5,
+                        },
+                    ),
+                ],
+            ),
+            "say_no": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="help_no_protect_time",
+                        label="Needed to protect my own time or energy",
+                        value_tags=["boundaries", "self_care"],
+                        trait_signals={
+                            "boundary_setting": 0.9,
+                            "self_care": 0.85,
+                            "empathy": 0.45,
+                            "analytical_thinking": 0.75,
+                            "intuitive_leaning": 0.25,
+                        },
+                    ),
+                    InterviewOption(
+                        id="help_no_overloaded",
+                        label="I was already overloaded",
+                        value_tags=["stress", "honesty"],
+                        trait_signals={
+                            "self_care": 0.85,
+                            "stress_tolerance": 0.45,
+                            "boundary_setting": 0.85,
+                            "empathy": 0.45,
+                        },
+                    ),
+                    InterviewOption(
+                        id="help_no_regret_yes",
+                        label="Didn't want to say yes and regret it later",
+                        value_tags=["foresight", "caution"],
+                        trait_signals={
+                            "future_orientation": 0.8,
+                            "boundary_setting": 0.85,
+                            "anxiety_avoidance": 0.6,
+                            "analytical_thinking": 0.75,
+                        },
+                    ),
+                ],
+            ),
+            "help_a_little": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="help_little_what_i_could",
+                        label="It was what I could realistically offer",
+                        value_tags=["compromise", "balance"],
+                        trait_signals={
+                            "boundary_setting": 0.55,
+                            "empathy": 0.65,
+                            "self_care": 0.55,
+                            "analytical_thinking": 0.65,
+                        },
+                    ),
+                    InterviewOption(
+                        id="help_little_better_than_nothing",
+                        label="A little felt better than nothing",
+                        value_tags=["compromise", "empathy"],
+                        trait_signals={
+                            "empathy": 0.7,
+                            "boundary_setting": 0.5,
+                            "self_care": 0.5,
+                        },
+                    ),
+                    InterviewOption(
+                        id="help_little_test_waters",
+                        label="Wanted to help without giving everything",
+                        value_tags=["boundaries", "balance"],
+                        trait_signals={
+                            "boundary_setting": 0.65,
+                            "empathy": 0.6,
+                            "self_care": 0.55,
+                            "analytical_thinking": 0.6,
+                        },
+                    ),
+                ],
+            ),
+        },
     ),
     InterviewScenario(
         id="speed_vs_safety_v1",
@@ -261,29 +542,122 @@ SCENARIOS: List[InterviewScenario] = [
                 ),
             ],
         ),
-        followup_question=InterviewQuestion(
-            prompt="Why that approach?",
-            options=[
-                InterviewOption(
-                    id="didnt_think_much",
-                    label="Didn't think much about it",
-                    value_tags=["spontaneity", "low_deliberation"],
-                    trait_signals={"analytical_thinking": 0.2, "intuitive_leaning": 0.7},
-                ),
-                InterviewOption(
-                    id="seemed_safest",
-                    label="Seemed safest",
-                    value_tags=["safety", "caution"],
-                    trait_signals={"risk_tolerance": 0.2, "anxiety_avoidance": 0.8},
-                ),
-                InterviewOption(
-                    id="save_money",
-                    label="Wanted to save money",
-                    value_tags=["frugality", "security"],
-                    trait_signals={"financial_caution": 0.9, "self_direction": 0.6},
-                ),
-            ],
-        ),
+        followup_by_main_choice={
+            "take_shortcut": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="speed_short_move_fast",
+                        label="Needed to move fast",
+                        value_tags=["speed", "pragmatism", "momentum"],
+                        trait_signals={
+                            "efficiency": 0.9,
+                            "risk_tolerance": 0.65,
+                            "thoroughness": 0.25,
+                            "analytical_thinking": 0.3,
+                            "intuitive_leaning": 0.75,
+                            "decisiveness": 0.6,
+                        },
+                    ),
+                    InterviewOption(
+                        id="speed_short_deadline",
+                        label="Had a deadline or pressure",
+                        value_tags=["speed", "stress"],
+                        trait_signals={
+                            "efficiency": 0.85,
+                            "stress_tolerance": 0.55,
+                            "risk_tolerance": 0.6,
+                        },
+                    ),
+                    InterviewOption(
+                        id="speed_short_good_enough",
+                        label="Good enough was good enough",
+                        value_tags=["pragmatism", "efficiency"],
+                        trait_signals={
+                            "efficiency": 0.8,
+                            "thoroughness": 0.35,
+                            "risk_tolerance": 0.55,
+                        },
+                    ),
+                ],
+            ),
+            "do_it_right": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="speed_right_proper",
+                        label="Wanted it done the proper way",
+                        value_tags=["quality", "caution", "safety"],
+                        trait_signals={
+                            "thoroughness": 0.85,
+                            "risk_tolerance": 0.2,
+                            "anxiety_avoidance": 0.7,
+                            "future_orientation": 0.6,
+                            "analytical_thinking": 0.85,
+                            "intuitive_leaning": 0.2,
+                            "efficiency": 0.4,
+                        },
+                    ),
+                    InterviewOption(
+                        id="speed_right_avoid_mess",
+                        label="Wanted to avoid a mess later",
+                        value_tags=["foresight", "caution"],
+                        trait_signals={
+                            "future_orientation": 0.85,
+                            "anxiety_avoidance": 0.65,
+                            "thoroughness": 0.75,
+                            "risk_tolerance": 0.2,
+                        },
+                    ),
+                    InterviewOption(
+                        id="speed_right_standards",
+                        label="My standards mattered here",
+                        value_tags=["quality", "integrity"],
+                        trait_signals={
+                            "thoroughness": 0.85,
+                            "self_direction": 0.7,
+                            "risk_tolerance": 0.25,
+                        },
+                    ),
+                ],
+            ),
+            "mix_both": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="speed_mix_balance",
+                        label="Wanted a practical balance",
+                        value_tags=["balance", "pragmatism"],
+                        trait_signals={
+                            "risk_tolerance": 0.5,
+                            "thoroughness": 0.6,
+                            "efficiency": 0.7,
+                            "analytical_thinking": 0.65,
+                        },
+                    ),
+                    InterviewOption(
+                        id="speed_mix_control_risk",
+                        label="Kept risk under control",
+                        value_tags=["caution", "pragmatism"],
+                        trait_signals={
+                            "risk_tolerance": 0.45,
+                            "future_orientation": 0.6,
+                            "thoroughness": 0.55,
+                        },
+                    ),
+                    InterviewOption(
+                        id="speed_mix_middle_ground",
+                        label="Middle ground felt safest",
+                        value_tags=["caution", "balance"],
+                        trait_signals={
+                            "anxiety_avoidance": 0.55,
+                            "risk_tolerance": 0.45,
+                            "patience": 0.55,
+                        },
+                    ),
+                ],
+            ),
+        },
     ),
     InterviewScenario(
         id="wait_or_act_v1",
@@ -311,29 +685,123 @@ SCENARIOS: List[InterviewScenario] = [
                 ),
             ],
         ),
-        followup_question=InterviewQuestion(
-            prompt="Why that approach?",
-            options=[
-                InterviewOption(
-                    id="felt_right",
-                    label="Felt right",
-                    value_tags=["intuition", "gut_feeling"],
-                    trait_signals={"analytical_thinking": 0.3, "intuitive_leaning": 0.8},
-                ),
-                InterviewOption(
-                    id="thought_it_through",
-                    label="Thought it through",
-                    value_tags=["deliberation", "planning"],
-                    trait_signals={"analytical_thinking": 0.8, "self_direction": 0.7},
-                ),
-                InterviewOption(
-                    id="no_problems_later",
-                    label="Didn't want problems later",
-                    value_tags=["foresight", "caution"],
-                    trait_signals={"future_orientation": 0.8, "anxiety_avoidance": 0.6},
-                ),
-            ],
-        ),
+        followup_by_main_choice={
+            "act_now": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="wait_act_ready",
+                        label="Felt ready to act",
+                        value_tags=["decisiveness", "action_bias", "momentum"],
+                        trait_signals={
+                            "decisiveness": 0.9,
+                            "risk_tolerance": 0.7,
+                            "patience": 0.25,
+                            "analytical_thinking": 0.35,
+                            "intuitive_leaning": 0.7,
+                            "efficiency": 0.65,
+                        },
+                    ),
+                    InterviewOption(
+                        id="wait_act_enough",
+                        label="Had enough to go on",
+                        value_tags=["decisiveness", "confidence"],
+                        trait_signals={
+                            "decisiveness": 0.85,
+                            "self_direction": 0.7,
+                            "risk_tolerance": 0.6,
+                        },
+                    ),
+                    InterviewOption(
+                        id="wait_act_momentum",
+                        label="Wanted momentum instead of stalling",
+                        value_tags=["action_bias", "efficiency"],
+                        trait_signals={
+                            "decisiveness": 0.8,
+                            "patience": 0.3,
+                            "efficiency": 0.65,
+                        },
+                    ),
+                ],
+            ),
+            "wait_more": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="wait_more_info",
+                        label="Wanted more information first",
+                        value_tags=["caution", "information_seeking", "deliberation"],
+                        trait_signals={
+                            "patience": 0.9,
+                            "decisiveness": 0.3,
+                            "risk_tolerance": 0.2,
+                            "analytical_thinking": 0.85,
+                            "intuitive_leaning": 0.25,
+                            "future_orientation": 0.7,
+                        },
+                    ),
+                    InterviewOption(
+                        id="wait_more_risk",
+                        label="Wanted to reduce risk before committing",
+                        value_tags=["caution", "foresight"],
+                        trait_signals={
+                            "risk_tolerance": 0.2,
+                            "future_orientation": 0.8,
+                            "analytical_thinking": 0.85,
+                            "patience": 0.85,
+                        },
+                    ),
+                    InterviewOption(
+                        id="wait_more_uncertain",
+                        label="Uncertainty felt too high to decide",
+                        value_tags=["caution", "information_seeking"],
+                        trait_signals={
+                            "anxiety_avoidance": 0.65,
+                            "patience": 0.85,
+                            "analytical_thinking": 0.75,
+                        },
+                    ),
+                ],
+            ),
+            "small_step": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="wait_step_trial",
+                        label="Wanted a small trial first",
+                        value_tags=["incremental", "pragmatism", "balance"],
+                        trait_signals={
+                            "patience": 0.55,
+                            "decisiveness": 0.6,
+                            "risk_tolerance": 0.5,
+                            "analytical_thinking": 0.65,
+                            "intuitive_leaning": 0.4,
+                            "future_orientation": 0.5,
+                        },
+                    ),
+                    InterviewOption(
+                        id="wait_step_learn",
+                        label="Learn more before going all in",
+                        value_tags=["incremental", "caution"],
+                        trait_signals={
+                            "analytical_thinking": 0.75,
+                            "patience": 0.6,
+                            "risk_tolerance": 0.45,
+                        },
+                    ),
+                    InterviewOption(
+                        id="wait_step_test",
+                        label="Test the waters safely",
+                        value_tags=["caution", "pragmatism"],
+                        trait_signals={
+                            "risk_tolerance": 0.45,
+                            "future_orientation": 0.55,
+                            "patience": 0.55,
+                        },
+                    ),
+                ],
+            ),
+        },
     ),
     InterviewScenario(
         id="unexpected_change_v1",
@@ -361,29 +829,122 @@ SCENARIOS: List[InterviewScenario] = [
                 ),
             ],
         ),
-        followup_question=InterviewQuestion(
-            prompt="Why that approach?",
-            options=[
-                InterviewOption(
-                    id="felt_right",
-                    label="Felt right",
-                    value_tags=["intuition", "gut_feeling"],
-                    trait_signals={"analytical_thinking": 0.3, "intuitive_leaning": 0.8},
-                ),
-                InterviewOption(
-                    id="seemed_safest",
-                    label="Seemed safest",
-                    value_tags=["safety", "caution"],
-                    trait_signals={"risk_tolerance": 0.2, "anxiety_avoidance": 0.8},
-                ),
-                InterviewOption(
-                    id="didnt_think_much",
-                    label="Didn't think much about it",
-                    value_tags=["spontaneity", "low_deliberation"],
-                    trait_signals={"analytical_thinking": 0.2, "intuitive_leaning": 0.7},
-                ),
-            ],
-        ),
+        followup_by_main_choice={
+            "make_new_plan": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="change_plan_now",
+                        label="Needed a new plan right away",
+                        value_tags=["adaptability", "action_bias"],
+                        trait_signals={
+                            "adaptability": 0.9,
+                            "stress_tolerance": 0.7,
+                            "patience": 0.3,
+                            "analytical_thinking": 0.35,
+                            "intuitive_leaning": 0.65,
+                            "decisiveness": 0.6,
+                        },
+                    ),
+                    InterviewOption(
+                        id="change_plan_keep_moving",
+                        label="Couldn't afford to freeze",
+                        value_tags=["resilience", "action_bias"],
+                        trait_signals={
+                            "decisiveness": 0.7,
+                            "stress_tolerance": 0.65,
+                            "adaptability": 0.85,
+                        },
+                    ),
+                    InterviewOption(
+                        id="change_plan_adapt",
+                        label="I'm used to adapting when plans break",
+                        value_tags=["adaptability", "experience"],
+                        trait_signals={
+                            "adaptability": 0.85,
+                            "stress_tolerance": 0.65,
+                            "self_direction": 0.6,
+                        },
+                    ),
+                ],
+            ),
+            "take_a_break": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="change_break_regroup",
+                        label="Needed a moment to regroup",
+                        value_tags=["self_care", "composure"],
+                        trait_signals={
+                            "adaptability": 0.5,
+                            "stress_tolerance": 0.6,
+                            "patience": 0.85,
+                            "analytical_thinking": 0.8,
+                            "intuitive_leaning": 0.2,
+                            "risk_tolerance": 0.25,
+                        },
+                    ),
+                    InterviewOption(
+                        id="change_break_clear_head",
+                        label="Needed a clearer head before deciding",
+                        value_tags=["self_care", "deliberation"],
+                        trait_signals={
+                            "self_care": 0.8,
+                            "patience": 0.8,
+                            "analytical_thinking": 0.75,
+                        },
+                    ),
+                    InterviewOption(
+                        id="change_break_nerves",
+                        label="My nerves needed a reset first",
+                        value_tags=["self_care", "stress"],
+                        trait_signals={
+                            "stress_tolerance": 0.45,
+                            "self_care": 0.75,
+                            "anxiety_avoidance": 0.55,
+                        },
+                    ),
+                ],
+            ),
+            "frustrated": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="change_proc_feelings",
+                        label="Let myself feel the frustration first",
+                        value_tags=["processing", "emotional_honesty"],
+                        trait_signals={
+                            "adaptability": 0.35,
+                            "stress_tolerance": 0.4,
+                            "patience": 0.6,
+                            "self_care": 0.75,
+                            "analytical_thinking": 0.5,
+                            "intuitive_leaning": 0.45,
+                        },
+                    ),
+                    InterviewOption(
+                        id="change_proc_honest",
+                        label="Bad news hits me hard before I pivot",
+                        value_tags=["emotional_honesty", "processing"],
+                        trait_signals={
+                            "stress_tolerance": 0.35,
+                            "self_care": 0.65,
+                            "empathy": 0.45,
+                        },
+                    ),
+                    InterviewOption(
+                        id="change_proc_space",
+                        label="Needed space before I could think straight",
+                        value_tags=["processing", "self_care"],
+                        trait_signals={
+                            "patience": 0.65,
+                            "self_care": 0.7,
+                            "analytical_thinking": 0.55,
+                        },
+                    ),
+                ],
+            ),
+        },
     ),
     InterviewScenario(
         id="favor_request_v1",
@@ -411,31 +972,135 @@ SCENARIOS: List[InterviewScenario] = [
                 ),
             ],
         ),
-        followup_question=InterviewQuestion(
-            prompt="Why that approach?",
-            options=[
-                InterviewOption(
-                    id="no_problems_later",
-                    label="Didn't want problems later",
-                    value_tags=["foresight", "caution"],
-                    trait_signals={"future_orientation": 0.8, "anxiety_avoidance": 0.6},
-                ),
-                InterviewOption(
-                    id="felt_right",
-                    label="Felt right",
-                    value_tags=["intuition", "gut_feeling"],
-                    trait_signals={"analytical_thinking": 0.3, "intuitive_leaning": 0.8},
-                ),
-                InterviewOption(
-                    id="thought_it_through",
-                    label="Thought it through",
-                    value_tags=["deliberation", "planning"],
-                    trait_signals={"analytical_thinking": 0.8, "self_direction": 0.7},
-                ),
-            ],
-        ),
+        followup_by_main_choice={
+            "say_yes": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="favor_yes_easy",
+                        label="It felt easy to say yes",
+                        value_tags=["agreeableness", "generosity"],
+                        trait_signals={
+                            "agreeableness": 0.9,
+                            "empathy": 0.75,
+                            "boundary_setting": 0.25,
+                            "analytical_thinking": 0.35,
+                            "intuitive_leaning": 0.6,
+                        },
+                    ),
+                    InterviewOption(
+                        id="favor_yes_disappoint",
+                        label="Didn't want to disappoint them",
+                        value_tags=["agreeableness", "empathy"],
+                        trait_signals={
+                            "empathy": 0.85,
+                            "agreeableness": 0.85,
+                            "anxiety_avoidance": 0.55,
+                        },
+                    ),
+                    InterviewOption(
+                        id="favor_yes_right_thing",
+                        label="Felt like the right thing to do",
+                        value_tags=["generosity", "integrity"],
+                        trait_signals={
+                            "empathy": 0.75,
+                            "self_direction": 0.65,
+                            "agreeableness": 0.8,
+                        },
+                    ),
+                ],
+            ),
+            "negotiate": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="favor_neg_time",
+                        label="Wanted to help on my terms",
+                        value_tags=["diplomacy", "balance"],
+                        trait_signals={
+                            "boundary_setting": 0.65,
+                            "empathy": 0.6,
+                            "agreeableness": 0.6,
+                            "analytical_thinking": 0.75,
+                            "future_orientation": 0.55,
+                        },
+                    ),
+                    InterviewOption(
+                        id="favor_neg_partial",
+                        label="Could only manage part of it",
+                        value_tags=["compromise", "honesty"],
+                        trait_signals={
+                            "boundary_setting": 0.6,
+                            "empathy": 0.6,
+                            "self_care": 0.55,
+                        },
+                    ),
+                    InterviewOption(
+                        id="favor_neg_fair",
+                        label="Wanted something fair for both of us",
+                        value_tags=["diplomacy", "fairness"],
+                        trait_signals={
+                            "empathy": 0.65,
+                            "analytical_thinking": 0.7,
+                            "agreeableness": 0.55,
+                        },
+                    ),
+                ],
+            ),
+            "decline": InterviewQuestion(
+                prompt="Why that approach?",
+                options=[
+                    InterviewOption(
+                        id="favor_decl_protect",
+                        label="Needed to protect my time or energy",
+                        value_tags=["boundaries", "self_care"],
+                        trait_signals={
+                            "boundary_setting": 0.9,
+                            "self_care": 0.85,
+                            "empathy": 0.4,
+                            "agreeableness": 0.3,
+                            "analytical_thinking": 0.85,
+                            "intuitive_leaning": 0.2,
+                        },
+                    ),
+                    InterviewOption(
+                        id="favor_decl_stretched",
+                        label="Already stretched too thin",
+                        value_tags=["honesty", "self_care"],
+                        trait_signals={
+                            "self_care": 0.85,
+                            "stress_tolerance": 0.4,
+                            "boundary_setting": 0.85,
+                        },
+                    ),
+                    InterviewOption(
+                        id="favor_decl_not_fit",
+                        label="Wasn't the right fit for me to take on",
+                        value_tags=["boundaries", "self_direction"],
+                        trait_signals={
+                            "boundary_setting": 0.85,
+                            "self_direction": 0.7,
+                            "empathy": 0.45,
+                        },
+                    ),
+                ],
+            ),
+        },
     ),
 ]
+
+
+def get_followup_question_for_main(
+    scenario: InterviewScenario, main_choice_id: str
+) -> InterviewQuestion:
+    """Return the follow-up question for the selected main option."""
+    q = scenario.followup_by_main_choice.get(main_choice_id)
+    if q is None:
+        raise KeyError(
+            f"No follow-up question for main choice {main_choice_id!r} "
+            f"in scenario {scenario.id!r}"
+        )
+    return q
 
 
 def get_scenario(scenario_id: Optional[str] = None) -> InterviewScenario:
@@ -462,7 +1127,9 @@ def get_scenarios_for_session(count: int = 4,
     n = len(pool)
     if count >= n:
         return pool[:count]
-    offset = (session_index * count) % n
+    # Shift the window start by 1 each session so consecutive runs are visibly
+    # different, even when ``count`` divides the scenario pool size.
+    offset = session_index % n
     selected: List[InterviewScenario] = []
     for i in range(count):
         selected.append(pool[(offset + i) % n])
@@ -479,20 +1146,36 @@ def extract_signals(
 ) -> Tuple[List[str], Dict[str, float]]:
     """Merge value tags and trait signals from both choices.
 
-    Trait signals from main and follow-up are averaged when both
-    contribute to the same trait; otherwise they are kept as-is.
+    Trait signals are merged deterministically with a main-choice bias:
+    - If both choices contribute to the same trait, main gets higher weight.
+    - If only the follow-up contributes to a trait, that signal is softened
+      toward a neutral baseline so it can't overpower the main choice.
     """
     merged_tags = sorted(set(main_choice.value_tags + followup_choice.value_tags))
 
-    all_traits: Dict[str, List[float]] = {}
-    for signals in (main_choice.trait_signals, followup_choice.trait_signals):
-        for trait, value in signals.items():
-            all_traits.setdefault(trait, []).append(value)
+    MAIN_WEIGHT = 0.7
+    FOLLOW_WEIGHT = 1.0 - MAIN_WEIGHT
+    NEUTRAL = 0.5
 
-    merged_signals = {
-        trait: round(sum(vals) / len(vals), 2)
-        for trait, vals in all_traits.items()
-    }
+    merged_signals: Dict[str, float] = {}
+    all_traits = set(main_choice.trait_signals.keys()) | set(followup_choice.trait_signals.keys())
+    for trait in all_traits:
+        in_main = trait in main_choice.trait_signals
+        in_follow = trait in followup_choice.trait_signals
+
+        if in_main and in_follow:
+            m = main_choice.trait_signals[trait]
+            f = followup_choice.trait_signals[trait]
+            merged = MAIN_WEIGHT * m + FOLLOW_WEIGHT * f
+        elif in_main:
+            # If follow-up has no view on this trait, don't dilute the signal.
+            merged = main_choice.trait_signals[trait]
+        else:
+            # Follow-up-only traits get softened to prevent "reason wording"
+            # from overpowering the actual action choice.
+            merged = MAIN_WEIGHT * NEUTRAL + FOLLOW_WEIGHT * followup_choice.trait_signals[trait]
+
+        merged_signals[trait] = round(float(merged), 2)
 
     return merged_tags, merged_signals
 
@@ -568,38 +1251,38 @@ def _rotate_phrase(phrases: List[str], counter: int) -> str:
 # ---------------------------------------------------------------------------
 
 _TRAIT_REFLECTION_MAP: Dict[str, str] = {
-    "patience": "You seem to think before acting",
-    "risk_tolerance": "You tend to be comfortable with some risk",
+    "patience": "You seem to slow down before acting",
+    "risk_tolerance": "You may accept some risk when it helps you move forward",
     "thoroughness": "You usually prefer doing things carefully",
     "empathy": "You tend to consider how others feel",
     "boundary_setting": "You seem to know when to say no",
     "directness": "You lean toward being straightforward",
     "conflict_comfort": "You don't seem to shy away from difficult conversations",
     "analytical_thinking": "You tend to think things through",
-    "intuitive_leaning": "You often go with your gut",
-    "adaptability": "You seem to adjust quickly when things change",
+    "intuitive_leaning": "When time is tight, you sometimes rely on instinct",
+    "adaptability": "You adjust pretty quickly when plans change",
     "self_care": "You seem to look after yourself",
     "future_orientation": "You usually try to avoid unnecessary problems",
     "decisiveness": "You tend to make decisions without a lot of back-and-forth",
     "self_direction": "You seem to trust your own judgment",
     "financial_caution": "You seem careful with money",
-    "anxiety_avoidance": "You tend to steer clear of situations that might cause stress",
+    "anxiety_avoidance": "You tend to steer clear of situations that might be stressful",
     "agreeableness": "You tend to go along with what others need",
     "resourcefulness": "You seem to find practical ways around problems",
     "stress_tolerance": "You seem to handle pressure reasonably well",
-    "self_reward": "You give yourself permission to enjoy things",
+    "self_reward": "You let yourself enjoy things",
     "efficiency": "You value getting things done quickly",
 }
 
 _TRAIT_LOW_REFLECTION_MAP: Dict[str, str] = {
-    "patience": "You tend to act quickly rather than wait",
-    "risk_tolerance": "You seem careful about risk",
+    "patience": "You tend to move quickly rather than wait",
+    "risk_tolerance": "You seem to avoid unnecessary risk and prefer lower-regret choices",
     "thoroughness": "You don't get bogged down in details",
     "empathy": "You focus more on the practical side than feelings",
     "boundary_setting": "You tend to say yes even when it's hard",
-    "directness": "You tend to be diplomatic rather than blunt",
+    "directness": "You tend to be more diplomatic than blunt",
     "conflict_comfort": "You tend to avoid confrontation",
-    "analytical_thinking": "You tend to decide intuitively rather than analytically",
+    "analytical_thinking": "When you're deciding, you may lean on what feels right instead of careful analysis",
     "adaptability": "Changes of plan tend to bother you",
     "decisiveness": "You prefer to take your time before deciding",
 }
@@ -607,6 +1290,11 @@ _TRAIT_LOW_REFLECTION_MAP: Dict[str, str] = {
 _REFLECTION_THRESHOLD_HIGH = 0.65
 _REFLECTION_THRESHOLD_LOW = 0.35
 _MIN_EVIDENCE_FOR_REFLECTION = 2
+
+_TRAIT_HIGH_THRESHOLD_OVERRIDES: Dict[str, float] = {
+    # Require stronger evidence before surfacing "gut/instinct" style.
+    "intuitive_leaning": 0.7,
+}
 
 
 def generate_reflections(results: List[InterviewResult]) -> List[ReflectionLine]:
@@ -624,7 +1312,8 @@ def generate_reflections(results: List[InterviewResult]) -> List[ReflectionLine]
         if len(values) < _MIN_EVIDENCE_FOR_REFLECTION:
             continue
         avg = sum(values) / len(values)
-        if avg >= _REFLECTION_THRESHOLD_HIGH and trait in _TRAIT_REFLECTION_MAP:
+        high_threshold = _TRAIT_HIGH_THRESHOLD_OVERRIDES.get(trait, _REFLECTION_THRESHOLD_HIGH)
+        if avg >= high_threshold and trait in _TRAIT_REFLECTION_MAP:
             reflections.append(ReflectionLine(
                 text=_TRAIT_REFLECTION_MAP[trait],
                 trait=trait,
@@ -793,7 +1482,8 @@ def run_interview(scenario: Optional[InterviewScenario] = None) -> InterviewResu
     print(f"\n  {scenario.text}")
 
     main_choice = _prompt_choice(scenario.main_question)
-    followup_choice = _prompt_choice(scenario.followup_question)
+    followup_q = get_followup_question_for_main(scenario, main_choice.id)
+    followup_choice = _prompt_choice(followup_q)
 
     value_tags, trait_signals = extract_signals(main_choice, followup_choice)
     confidence = compute_confidence(main_choice, followup_choice)
@@ -845,7 +1535,8 @@ def run_interview_session(scenario_count: int = 4,
         print(f"\n  {scenario.text}")
 
         main_choice = _prompt_choice(scenario.main_question)
-        followup_choice = _prompt_choice(scenario.followup_question)
+        followup_q = get_followup_question_for_main(scenario, main_choice.id)
+        followup_choice = _prompt_choice(followup_q)
 
         value_tags, trait_signals = extract_signals(main_choice, followup_choice)
         confidence = compute_confidence(main_choice, followup_choice)

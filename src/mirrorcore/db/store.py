@@ -47,6 +47,7 @@ class DatabaseStore:
         self.ensure_step21_columns()
         self.ensure_phase27_columns()
         self.ensure_phase28_style_memory()
+        self.ensure_phase30_1_interview_rotation_state()
 
     def initialize_database(self):
         """Initialize the database with all required tables.
@@ -143,6 +144,60 @@ class DatabaseStore:
             "CREATE INDEX IF NOT EXISTS idx_style_memory_source ON style_memory(source)"
         )
         conn.commit()
+
+    def ensure_phase30_1_interview_rotation_state(self):
+        """Ensure Phase 30.1 interview rotation state table exists."""
+        conn = self.get_db_connection()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS interview_rotation_state (
+                id TEXT PRIMARY KEY,
+                counter INTEGER NOT NULL,
+                updated_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+    def get_next_decision_interview_rotation_index(self) -> int:
+        """Return the next persisted rotation index for interview scenarios.
+
+        This index increments once per completed decision interview session, so
+        scenario rotation is stable across process runs.
+        """
+        conn = self.get_db_connection()
+        rotation_id = "decision_interview_rotation"
+        now = datetime.utcnow().isoformat()
+
+        row = conn.execute(
+            "SELECT counter FROM interview_rotation_state WHERE id = ?",
+            (rotation_id,),
+        ).fetchone()
+
+        if not row:
+            conn.execute(
+                """
+                INSERT INTO interview_rotation_state (id, counter, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                # Store the *next* index value so the second call advances.
+                (rotation_id, 1, now),
+            )
+            conn.commit()
+            return 0
+
+        current = int(row["counter"])
+        next_value = current + 1
+        conn.execute(
+            """
+            UPDATE interview_rotation_state
+            SET counter = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (next_value, now, rotation_id),
+        )
+        conn.commit()
+        return current
 
     def close(self):
         """Close database connection."""
@@ -1461,3 +1516,15 @@ class DatabaseStore:
             results.append(entry)
 
         return results
+
+    def count_decision_memory_rows(self) -> int:
+        """Return total rows in decision_memory (for onboarding / progress)."""
+        conn = self.get_db_connection()
+        row = conn.execute("SELECT COUNT(*) AS count FROM decision_memory").fetchone()
+        return int(row["count"]) if row else 0
+
+    def count_style_memory_rows(self) -> int:
+        """Return total rows in style_memory (for onboarding / progress)."""
+        conn = self.get_db_connection()
+        row = conn.execute("SELECT COUNT(*) AS count FROM style_memory").fetchone()
+        return int(row["count"]) if row else 0

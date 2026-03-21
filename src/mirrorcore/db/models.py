@@ -193,8 +193,18 @@ def initialize_database(conn: sqlite3.Connection):
             notes TEXT
         )
     """)
+
+    # 6) interview_rotation_state table - Persist deterministic interview rotations
+    #    across process runs (Phase 30.1).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS interview_rotation_state (
+            id TEXT PRIMARY KEY,
+            counter INTEGER NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        )
+    """)
     
-    # 8) user_fix_preferences table - Cross-incident-type fix affinity tracking
+    # 9) user_fix_preferences table - Cross-incident-type fix affinity tracking
     conn.execute("""
         CREATE TABLE IF NOT EXISTS user_fix_preferences (
             normalized_fix TEXT PRIMARY KEY,

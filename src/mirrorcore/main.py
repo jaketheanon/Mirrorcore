@@ -48,6 +48,7 @@ def create_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  mirrorcore start                              # Guided entry menu
   mirrorcore                                    # Start interactive session
   mirrorcore debug "git push failed"            # Debug a command
   mirrorcore decide "use PostgreSQL or SQLite" # Get decision help
@@ -87,6 +88,12 @@ Examples:
     # Subcommands
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
+    # Guided entry (Phase 30)
+    subparsers.add_parser(
+        "start",
+        help="Guided onboarding and quick access to main features",
+    )
+
     # Interactive mode (default)
     interactive_parser = subparsers.add_parser(
         "interactive",
@@ -236,6 +243,27 @@ Examples:
     )
     
     return parser
+
+
+def handle_start(args):
+    """Unified guided entry — routes into existing command handlers."""
+    from pathlib import Path
+    from .db.store import DatabaseStore
+    from .onboarding import default_read_choice, run_start_menu
+
+    db_path = Path("data") / "mirrorcore.db"
+    db_store = DatabaseStore(db_path)
+
+    run_start_menu(
+        db_store,
+        handle_interview=handle_interview,
+        handle_calibrate_style=handle_calibrate_style,
+        handle_respond_like_me=handle_respond_like_me,
+        handle_analyze_log=handle_analyze_log,
+        handle_analyze_followup=handle_analyze_followup,
+        args_namespace=args,
+        read_choice=default_read_choice,
+    )
 
 
 def handle_interactive(args):
@@ -1765,8 +1793,8 @@ def handle_interview(args):
     db_path = Path("data") / "mirrorcore.db"
     db_store = DatabaseStore(db_path)
 
-    prior_entries = db_store.get_recent_decision_memory(limit=1000)
-    session_index = len(prior_entries)
+    # Use a persisted rotation index so scenario order varies across runs.
+    session_index = db_store.get_next_decision_interview_rotation_index()
 
     try:
         session = run_interview_session(session_index=session_index)
@@ -2005,6 +2033,7 @@ def main():
     
     # Route to appropriate handler
     handlers = {
+        "start": handle_start,
         "interactive": handle_interactive,
         "debug": handle_debug,
         "debug-outcome": handle_debug_outcome,
