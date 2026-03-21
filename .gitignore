@@ -126,3 +126,4 @@ archives/*
 phasecheck
 *.zip
 .ruff_cache/
+phasesnap
