@@ -528,23 +528,28 @@ class DatabaseStore:
             return
         
         status = result_status.strip().lower()
-        col_map = {"success": "success_count", "partial": "partial_count", "failed": "failure_count"}
-        col = col_map.get(status)
-        if not col:
+        if status not in ("success", "partial", "failed"):
             return
-        
+
+        # One-hot delta for this outcome (used for insert and as excluded.* on conflict).
+        s = 1 if status == "success" else 0
+        f = 1 if status == "failed" else 0
+        p = 1 if status == "partial" else 0
+
         conn = self.get_db_connection()
         now = datetime.utcnow().isoformat()
-        
+
         conn.execute(
-            """INSERT INTO user_fix_preferences (normalized_fix, success_count, failure_count, partial_count, last_used)
-               VALUES (?, 0, 0, 0, ?)
-               ON CONFLICT(normalized_fix) DO UPDATE SET last_used = excluded.last_used""",
-            (normalized, now),
-        )
-        conn.execute(
-            f"UPDATE user_fix_preferences SET {col} = {col} + 1 WHERE normalized_fix = ?",
-            (normalized,),
+            """
+            INSERT INTO user_fix_preferences (normalized_fix, success_count, failure_count, partial_count, last_used)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(normalized_fix) DO UPDATE SET
+                success_count = user_fix_preferences.success_count + excluded.success_count,
+                failure_count = user_fix_preferences.failure_count + excluded.failure_count,
+                partial_count = user_fix_preferences.partial_count + excluded.partial_count,
+                last_used = excluded.last_used
+            """,
+            (normalized, s, f, p, now),
         )
         conn.commit()
     
@@ -1079,17 +1084,23 @@ class DatabaseStore:
         
         conn = self.get_db_connection()
         
+        # Open sessions: `session_status` is only set to 'active' on insert and
+        # 'completed' (or rarely 'resolved') when closed — never 'updated'/'stalled'.
+        # Stall/progress lives in `investigation_state` (see update_investigation_tracking).
+        open_status_sql = (
+            "(session_status IS NULL OR session_status NOT IN ('completed', 'resolved'))"
+        )
         if subsystem:
-            query = """
-            SELECT * FROM analysis_sessions 
-            WHERE detected_subsystem = ? AND session_status IN ('active','updated','stalled')
+            query = f"""
+            SELECT * FROM analysis_sessions
+            WHERE detected_subsystem = ? AND {open_status_sql}
             ORDER BY timestamp DESC LIMIT 1
             """
             result = conn.execute(query, (subsystem,)).fetchone()
         else:
-            query = """
-            SELECT * FROM analysis_sessions 
-            WHERE session_status IN ('active','updated','stalled')
+            query = f"""
+            SELECT * FROM analysis_sessions
+            WHERE {open_status_sql}
             ORDER BY timestamp DESC LIMIT 1
             """
             result = conn.execute(query).fetchone()
@@ -1104,7 +1115,9 @@ class DatabaseStore:
                 'top_hypothesis_category': result['top_hypothesis_category'],
                 'suggested_commands': json.loads(result['suggested_commands'] or '[]'),
                 'analysis_summary': result['analysis_summary'],
-                'session_status': result['session_status']
+                'session_status': result['session_status'],
+                # Exposed for follow-up / UI; stall lives here, not in session_status.
+                'investigation_state': result['investigation_state'] or 'active',
             }
             return session
         

@@ -1562,7 +1562,9 @@ def handle_debug_outcome(args):
             except Exception:
                 open_session = None
             
-            if open_session and open_session.get("session_status") in ("active", "updated", "stalled"):
+            # Match get_latest_analysis_session: open = not completed/resolved
+            _ss = (open_session.get("session_status") or "").lower()
+            if open_session and _ss not in ("completed", "resolved"):
                 try:
                     db_store.update_analysis_session_status(open_session["id"], "completed")
                     print(f"\n Investigation session {open_session['id']} marked as resolved.")
