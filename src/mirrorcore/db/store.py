@@ -811,8 +811,7 @@ class DatabaseStore:
 
             if raw_bonus > 0:
                 # 1) Evidence threshold: require 2+ successes for full strength
-                u_total = u_sc + u_pc + u_fc
-                evidence_factor = 1.0 if (u_total >= 2 and u_sc >= 2) else 0.25
+                evidence_factor = 1.0 if u_sc >= 2 else 0.25
 
                 # 2) Recency decay based on last_used
                 recency_factor = 1.0
