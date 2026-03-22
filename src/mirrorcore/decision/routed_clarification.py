@@ -1,6 +1,6 @@
 """
-Routed decision engine: ontology (families + dimensions), slot-based clarification,
-and structured situation/tendency memory (Phase 31.2 refactor of 31.1).
+Routed decision engine: slot-based clarification and structured situation/tendency
+memory. Core family scoring and ontology axes live in ``decision.ontology`` (Phase 33).
 
 Deterministic, inspectable, one question at a time. Used from ``mirrorcore ask``.
 """
@@ -10,10 +10,26 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Dict, FrozenSet, List, MutableMapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 from ..persona.profile import PersonalProfile, build_personal_profile
 from ..router import normalize_input
+from .ontology import (
+    CONFLICT_FAMILY,
+    CONVENIENCE_QUALITY,
+    GENERAL,
+    LOYALTY_BOUNDARY,
+    OBLIGATION_OVERLOAD,
+    RISK_TIMING,
+    SPENDING,
+    rank_families_full,
+    score_decision_domains as _ontology_score_decision_domains,
+    score_dimensions,
+    slot_ids_covered_by_context,
+)
+
+# Phase 31 API alias (same as ontology.MONEY)
+MONEY = SPENDING
 
 MAX_CLARIFICATION_ROUNDS = 2
 
@@ -26,351 +42,15 @@ def _stable_index(key: str, modulo: int) -> int:
     return int(h[:12], 16) % modulo
 
 
-# --- Decision families (broad ontology) ---
-SPENDING = "spending"
-OBLIGATION_OVERLOAD = "obligation_overload"
-CONFLICT_FAMILY = "conflict"
-RISK_TIMING = "risk_timing"
-LOYALTY_BOUNDARY = "loyalty_boundary"
-CONVENIENCE_QUALITY = "convenience_quality"
-GENERAL = "general"
-
-# Backwards-compatible aliases (Phase 31.1 tests and callers)
-MONEY = SPENDING
-CONFLICT = CONFLICT_FAMILY
-TIMING = RISK_TIMING
-OBLIGATION = OBLIGATION_OVERLOAD
-RISK = RISK_TIMING
-
-
-# --- Dimensions (weighted signals; drive family scores + slot boosts) ---
-# Note: do not use bare "should i" under obligation — it fires on every decision question.
-_DIMENSION_RULES: Tuple[Tuple[str, Tuple[str, ...], float], ...] = (
-    ("money_pressure", ("rent", "broke", "afford", "bill", "debt", "salary", "budget", "pay", "late", "$", "dollar", "money tight", "skint"), 1.0),
-    ("need_vs_want_signal", ("need", "want", "luxury", "essential", "nice to have"), 0.85),
-    ("urgency", ("now", "today", "asap", "deadline", "rush", "right away", "immediately"), 0.9),
-    ("uncertainty", ("unsure", "don t know", "dont know", "what if", "maybe", "confused", "unclear", "not sure yet"), 0.85),
-    (
-        "obligation",
-        (
-            "owe",
-            "expected to",
-            "duty",
-            "guilt",
-            "asked me to",
-            "have to help",
-            " should i help",
-            "pick up a shift",
-            "cover for",
-            "cover their",
-            "cover a shift",
-            "cover my shift",
-            "cover the shift",
-            "cover shift",
-            "covering a shift",
-            "covering for",
-            "needs me to cover",
-            "want me to cover",
-            " extra shift",
-            " extra hours",
-            "do them a favor",
-        ),
-        0.95,
-    ),
-    (
-        "overload",
-        (
-            "exhausted",
-            "burnout",
-            "burned out",
-            "burnt out",
-            "too much",
-            "overwhelmed",
-            "overloaded",
-            "no energy",
-            "at capacity",
-            "double shift",
-            "extra shift",
-            "extra hours",
-            "drained",
-            "wiped out",
-        ),
-        1.1,
-    ),
-    ("boundary_strain", ("boundary", "say no", "can't keep", "cant keep", "people pleasing", "walk all over"), 0.95),
-    (
-        "interpersonal_hurt",
-        (
-            "bothered",
-            "bother me",
-            "bothers me",
-            "upset",
-            "disrespect",
-            "disrespected",
-            "rude",
-            "talking shit",
-            " talk shit",
-            "let it go",
-            "say something",
-            "hurt my feelings",
-            "insulted",
-            "crossed the line",
-            "offended",
-            "offensive",
-            "argument",
-            "confrontation",
-            "confront",
-            "unfair",
-            "snubbed",
-            "dismissed me",
-        ),
-        1.15,
-    ),
-    ("conflict_intensity", ("argue", "fight", "angry", "resent", "toxic", "unfair", "silent treatment"), 1.0),
-    (
-        "wait_vs_act",
-        (
-            "wait or",
-            "whether to wait",
-            "act now",
-            "hold off",
-            "move now",
-            "not sure yet",
-            " timing",
-            "pull the trigger",
-            "more information",
-            "gather more info",
-            "sooner or later",
-            "know whether",
-        ),
-        1.2,
-    ),
-    ("relationship_stakes", ("friend", "partner", "family", "coworker", "boss", "team", "marriage"), 0.75),
-    ("regret_risk", ("regret", "resent", "wish i hadn't", "worse if i say yes", "worse if i say no"), 0.9),
-    ("risk_level", ("risk", "safe", "gamble", "nervous", "scared"), 0.8),
-    ("convenience_vs_correctness", ("quick", "shortcut", "fast", "good enough", "proper", "right way", "correct"), 0.85),
-    ("short_vs_long", ("short term", "long term", "later me", "future", "temporary fix"), 0.8),
-)
-
-# Dimension -> (family, bonus score)
-_DIMENSION_FAMILY_BOOST: Tuple[Tuple[str, str, float], ...] = (
-    ("money_pressure", SPENDING, 2.2),
-    ("need_vs_want_signal", SPENDING, 1.0),
-    ("overload", OBLIGATION_OVERLOAD, 2.0),
-    ("obligation", OBLIGATION_OVERLOAD, 1.6),
-    ("boundary_strain", OBLIGATION_OVERLOAD, 1.2),
-    ("boundary_strain", LOYALTY_BOUNDARY, 1.0),
-    ("interpersonal_hurt", CONFLICT_FAMILY, 3.2),
-    ("conflict_intensity", CONFLICT_FAMILY, 2.2),
-    ("relationship_stakes", CONFLICT_FAMILY, 1.0),
-    ("relationship_stakes", LOYALTY_BOUNDARY, 1.2),
-    ("regret_risk", RISK_TIMING, 1.0),
-    ("regret_risk", LOYALTY_BOUNDARY, 1.0),
-    ("uncertainty", RISK_TIMING, 1.5),
-    ("wait_vs_act", RISK_TIMING, 2.9),
-    ("risk_level", RISK_TIMING, 1.6),
-    ("urgency", RISK_TIMING, 1.2),
-    ("convenience_vs_correctness", CONVENIENCE_QUALITY, 2.0),
-    ("short_vs_long", CONVENIENCE_QUALITY, 1.2),
-)
-
-# Base family keywords (weight per hit)
-_FAMILY_KEYWORDS: Dict[str, Tuple[Tuple[str, float], ...]] = {
-    SPENDING: (
-        ("buy", 1.0), ("purchase", 1.0), ("spend", 1.0), ("afford", 1.1), ("price", 0.9),
-        ("rent", 1.2), ("bill", 1.0), ("loan", 0.9), ("save", 0.7), ("cheap", 0.8), ("expensive", 0.9),
-    ),
-    OBLIGATION_OVERLOAD: (
-        (" help ", 0.9),
-        ("help me", 0.8),
-        ("favor", 1.0),
-        ("shift", 1.0),
-        ("overtime", 1.0),
-        ("exhausted", 1.2),
-        ("burnout", 1.3),
-        ("burnt out", 1.25),
-        ("too much", 1.1),
-        ("extra hours", 1.15),
-        ("cover for", 1.0),
-        ("cover a shift", 1.1),
-        ("cover shift", 1.0),
-        ("pick up", 0.65),
-    ),
-    CONFLICT_FAMILY: (
-        ("confront", 1.1),
-        ("argument", 1.0),
-        ("boundary", 0.9),
-        ("boss", 0.8),
-        # Not listed: bare "coworker" — that alone pulled shift/favor asks into conflict;
-        # relationship_stakes still nudges when a peer term appears.
-        ("apologize", 0.7),
-        ("resent", 1.0),
-        ("unfair", 0.9),
-        ("bothered", 1.3),
-        ("bother me", 1.2),
-        ("upset", 1.0),
-        ("disrespect", 1.2),
-        ("rude", 1.0),
-        ("let it go", 1.1),
-        ("say something", 1.1),
-    ),
-    RISK_TIMING: (
-        ("wait", 0.9),
-        ("act now", 1.4),
-        ("hold off", 1.2),
-        ("whether", 0.9),
-        ("timing", 1.0),
-        ("now", 0.55),
-        ("deadline", 1.1),
-        ("risk", 1.0),
-        ("uncertain", 1.0),
-        ("reversible", 0.8),
-        ("one-way", 0.9),
-        ("permanent", 0.9),
-    ),
-    LOYALTY_BOUNDARY: (
-        ("loyal", 1.0), ("betray", 0.9), ("family", 0.8), ("guilt", 1.0), ("selfish", 0.8),
-        ("protect myself", 1.0), ("people pleaser", 1.1),
-    ),
-    CONVENIENCE_QUALITY: (
-        ("quick", 1.0), ("shortcut", 1.1), ("hack", 0.7), ("proper", 0.9), ("good enough", 1.0),
-    ),
-    GENERAL: (("choice", 0.3), ("decide", 0.4), ("should i", 0.5)),
-}
-
-
-def score_dimensions(norm_text: str) -> Dict[str, float]:
-    padded = f" {norm_text} "
-    out: Dict[str, float] = {}
-    for dim, phrases, w in _DIMENSION_RULES:
-        s = 0.0
-        for p in phrases:
-            if p in padded or p in norm_text:
-                s += w
-        if s > 0:
-            out[dim] = s
-    return out
-
-
-def infer_family_scores(norm_text: str, dimensions: Optional[Dict[str, float]] = None) -> Dict[str, float]:
-    dimensions = dimensions or score_dimensions(norm_text)
-    scores: Dict[str, float] = {f: 0.05 for f in _FAMILY_KEYWORDS}
-    scores[GENERAL] = 0.15
-    padded = f" {norm_text} "
-    for fam, kws in _FAMILY_KEYWORDS.items():
-        for kw, wt in kws:
-            if kw in padded or kw in norm_text:
-                scores[fam] = scores.get(fam, 0) + wt
-    for dim, fam, bonus in _DIMENSION_FAMILY_BOOST:
-        if dim in dimensions:
-            scores[fam] = scores.get(fam, 0) + bonus * min(1.2, dimensions[dim] / 2.5)
-    return scores
-
-
-# Strong obligation/overload cues — required before we demote conflict into obligation slots.
-_OBLIGATION_OVERLOAD_CUES: Tuple[str, ...] = (
-    " exhausted",
-    " burnout",
-    " burnt out",
-    "burned out",
-    " shift",
-    " overtime",
-    " favor",
-    " help them",
-    " help her",
-    " help him",
-    " cover for",
-    " cover a shift",
-    "needs me to cover",
-    " pick up",
-    " asked me to",
-    " too much on",
-    " extra shift",
-    " extra hours",
-    " owe ",
-    "guilt trip",
-    "can t cover",
-    "can't cover",
-)
-
-
-def _boost_obligation_for_cover_shift_fatigue(
-    norm_text: str,
-    dimensions: Dict[str, float],
-    scores: MutableMapping[str, float],
-) -> None:
-    """Workplace cover/shift asks + fatigue/strain → obligation-overload, not conflict."""
-    padded = f" {norm_text} "
-    peer = any(
-        x in padded
-        for x in (
-            " coworker ",
-            " colleague ",
-            " boss ",
-            " teammate ",
-            " manager ",
-        )
-    ) or norm_text.startswith(("coworker ", "colleague "))
-    shift_like = any(
-        x in padded or x in norm_text
-        for x in (
-            " shift ",
-            " shifts ",
-            " cover ",
-            " covering ",
-            " overtime ",
-            " extra hours ",
-            "pick up a shift",
-            "pick up another shift",
-            "cover a shift",
-            "cover my shift",
-            "cover shift",
-            "covering a shift",
-            "covering for",
-        )
-    )
-    strain = dimensions.get("overload", 0) >= 0.95 or dimensions.get("obligation", 0) >= 0.55
-    if not (peer and shift_like and strain):
-        return
-    scores[OBLIGATION_OVERLOAD] = scores.get(OBLIGATION_OVERLOAD, 0) + 2.75
-    if dimensions.get("interpersonal_hurt", 0) < 0.55:
-        scores[CONFLICT_FAMILY] = scores.get(CONFLICT_FAMILY, 0) * 0.62
-
-
-def _social_conflict_without_obligation(norm_text: str, dimensions: Dict[str, float]) -> bool:
-    """Interpersonal upset / confrontation without favors, shifts, or exhaustion context."""
-    if dimensions.get("interpersonal_hurt", 0) <= 0:
-        return False
-    padded = f" {norm_text} "
-    if not any(m in padded or m in norm_text for m in _OBLIGATION_OVERLOAD_CUES):
-        if dimensions.get("overload", 0) < 0.55 and dimensions.get("obligation", 0) < 0.55:
-            return True
-    return False
-
-
-def _adjust_family_scores_for_social_conflict(
-    norm_text: str, dimensions: Dict[str, float], scores: MutableMapping[str, float],
-) -> None:
-    """Keep 'someone bothered me' style questions out of obligation/overload unless cues match."""
-    if not _social_conflict_without_obligation(norm_text, dimensions):
-        return
-    scores[CONFLICT_FAMILY] = scores.get(CONFLICT_FAMILY, 0) + 5.0
-    scores[OBLIGATION_OVERLOAD] = scores.get(OBLIGATION_OVERLOAD, 0) * 0.32
-
-
 def rank_families(norm_text: str) -> Tuple[List[Tuple[str, float]], Dict[str, float]]:
-    dims = score_dimensions(norm_text)
-    raw = infer_family_scores(norm_text, dims)
-    _boost_obligation_for_cover_shift_fatigue(norm_text, dims, raw)
-    _adjust_family_scores_for_social_conflict(norm_text, dims, raw)
-    ordered = sorted(raw.items(), key=lambda x: (-x[1], x[0]))
+    """Rank families + legacy dimensions (Phase 33 ontology core)."""
+    ordered, dims, _axes = rank_families_full(norm_text)
     return ordered, dims
 
 
 def score_decision_domains(norm_text: str) -> List[Tuple[str, float]]:
     """Back-compat: ranked (family, score) list."""
-    ordered, _ = rank_families(norm_text)
-    return ordered
+    return _ontology_score_decision_domains(norm_text)
 
 
 @dataclass(frozen=True)
@@ -662,15 +342,17 @@ def pick_next_question(
     """Pick the next single slot: family order × priority × missing markers × dimension boosts."""
     asked = set(asked_ids)
     ctx = _padded_ctx(context_parts)
-    dims = dimensions if dimensions is not None else score_dimensions(
-        normalize_input(" ".join(context_parts))
-    )
+    merged_norm = normalize_input(" ".join(context_parts))
+    covered = slot_ids_covered_by_context(merged_norm)
+    dims = dimensions if dimensions is not None else score_dimensions(merged_norm)
     slots = _slots_tuple()
     for fam in domain_order:
         tier = [s for s in slots if fam in s.families]
         tier.sort(key=lambda s: (_effective_priority(s, dims), s.slot_id))
         for slot in tier:
             if slot.slot_id in asked:
+                continue
+            if slot.slot_id in covered:
                 continue
             if any(m in ctx for m in slot.filled_markers):
                 continue

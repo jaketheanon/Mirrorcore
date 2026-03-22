@@ -136,6 +136,22 @@ class TestRouterMemoryStore(unittest.TestCase):
         finally:
             store.close()
 
+    def test_tendency_conflict_dampens_high_strength(self):
+        """Phase 33: a very low follow-up signal pulls strength down vs blind accumulation."""
+        store = DatabaseStore(self.db_path)
+        try:
+            store.initialize_database()
+            store.merge_router_tendency("tendency_test_conflict", 0.72)
+            store.merge_router_tendency("tendency_test_conflict", 0.12)
+            row = store.get_db_connection().execute(
+                "SELECT strength FROM decision_router_tendencies WHERE slot_key = ?",
+                ("tendency_test_conflict",),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertLess(float(row["strength"]), 0.72)
+        finally:
+            store.close()
+
 
 class TestDomainScoring(unittest.TestCase):
     def test_laptop_rent_money_primary(self):
@@ -175,8 +191,12 @@ class TestQuestionPicking(unittest.TestCase):
             domain_order=[MONEY, "general"],
         )
         self.assertIsNotNone(q)
-        self.assertIn("rent", q.text.lower())
         self.assertLessEqual(q.text.count("?"), 1)
+        # Rent already stated → skip redundant bills check; next slot should still fit spending.
+        self.assertIn(
+            q.slot_id,
+            ("bills_basics", "need_vs_want", "purpose_purchase", "can_wait_purchase", "cheaper_ok"),
+        )
 
     def test_second_question_after_answer(self):
         ctx = [
@@ -205,7 +225,10 @@ class TestSlotWordingVariation(unittest.TestCase):
         b = q.wording(seed)
         self.assertEqual(a, b)
         low = a.lower()
-        self.assertTrue("rent" in low or "bill" in low, msg=a)
+        self.assertTrue(
+            "rent" in low or "bill" in low or "need" in low or "want" in low,
+            msg=a,
+        )
 
     def test_variants_share_slot_id_and_markers(self):
         q = pick_next_question(
@@ -214,7 +237,7 @@ class TestSlotWordingVariation(unittest.TestCase):
             domain_order=[MONEY, "general"],
         )
         self.assertIsNotNone(q)
-        self.assertEqual(q.slot_id, "bills_basics")
+        self.assertEqual(q.slot_id, "need_vs_want")
         seeds = [f"s{i}" for i in range(24)]
         texts = {q.wording(s) for s in seeds}
         self.assertGreaterEqual(len(texts), 2, msg="expected multiple surface wordings")

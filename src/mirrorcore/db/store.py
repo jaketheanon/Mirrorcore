@@ -1601,7 +1601,11 @@ class DatabaseStore:
         if row:
             old = float(row["strength"] or 0.0)
             n = int(row["sample_count"] or 0) + 1
-            merged = min(1.0, old * 0.92 + signal * 0.22)
+            # Conflicting low-signal updates pull strength down instead of climbing (Phase 33).
+            if old >= 0.48 and signal < 0.28:
+                merged = max(0.0, old * 0.86 - (0.28 - signal) * 0.5)
+            else:
+                merged = min(1.0, old * 0.92 + signal * 0.22)
             conn.execute(
                 """
                 UPDATE decision_router_tendencies
