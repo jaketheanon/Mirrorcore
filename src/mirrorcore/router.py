@@ -1,5 +1,5 @@
 """
-Deterministic conversational router (Phase 31).
+Deterministic conversational router (Phase 31 + Phase 32 quiet routing).
 
 Single-input intent classification and lightweight disambiguation — no LLM.
 """
@@ -7,7 +7,7 @@ Single-input intent classification and lightweight disambiguation — no LLM.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, MutableMapping, Optional, Tuple
 
 # --- Thresholds (inspectable, deterministic) ---
 
@@ -83,7 +83,12 @@ _PHRASE_RULES: List[Tuple[str, str, float]] = [
     (" help me choose ", DECISION_HELP, 4.0),
     (" which option ", DECISION_HELP, 3.5),
     (" what to do ", DECISION_HELP, 3.0),
+    (" what do i do ", DECISION_HELP, 4.5),
+    (" what do we do ", DECISION_HELP, 4.0),
     (" figure out what to do ", DECISION_HELP, 3.5),
+    (" should i do it ", DECISION_HELP, 4.0),
+    (" should i say yes ", DECISION_HELP, 3.8),
+    (" do i say yes ", DECISION_HELP, 3.5),
     # Timing / wait vs act (normalized text strips apostrophes → "don t" etc.)
     (" wait or ", DECISION_HELP, 4.0),
     (" wait or act ", DECISION_HELP, 4.5),
@@ -199,6 +204,69 @@ def _padded(norm: str) -> str:
     return f" {norm} "
 
 
+def _apply_shift_obligation_decision_boost(norm: str, padded: str, scores: MutableMapping[str, float]) -> None:
+    """Strong decision_help for shift/cover asks + fatigue / workplace — avoids false weak_input."""
+    peer = any(
+        s in padded
+        for s in (
+            " coworker ",
+            " colleague ",
+            " boss ",
+            " manager ",
+            " teammate ",
+        )
+    )
+    if norm.startswith("coworker ") or norm.startswith("colleague "):
+        peer = True
+
+    shift_like = (
+        " cover " in padded
+        or " covering " in padded
+        or " shift " in padded
+        or " shifts " in padded
+        or " overtime " in padded
+        or " pick up " in padded
+        or "pick up a shift" in norm
+        or "pick up another shift" in norm
+        or " cover for" in norm
+        or "cover their" in norm
+        or "cover his" in norm
+        or "cover her" in norm
+    )
+
+    ask_signal = (
+        " wants me " in padded
+        or " want me to " in padded
+        or " asked me " in padded
+        or " asking me " in padded
+    )
+
+    fatigue = any(
+        w in norm
+        for w in (
+            "exhausted",
+            "tired",
+            "wiped",
+            "drained",
+            "overwhelmed",
+            "burnout",
+            "burned out",
+            "burnt out",
+            "no energy",
+            "too tired",
+        )
+    )
+
+    favor = " favor " in padded or " favour " in padded
+
+    if fatigue and shift_like and (peer or ask_signal):
+        scores[DECISION_HELP] += 5.25
+    elif fatigue and shift_like:
+        scores[DECISION_HELP] += 3.75
+    elif shift_like and ask_signal and (" help " in padded or favor):
+        scores[DECISION_HELP] += 4.25
+
+
 def _apply_multiline_debug_boost(raw: str, norm: str, scores: Dict[str, float]) -> None:
     lines = [ln for ln in raw.splitlines() if ln.strip()]
     if len(lines) >= 3 and any(
@@ -246,6 +314,7 @@ def classify_intent(text: str) -> IntentClassification:
             scores[DEBUG_HELP] += 0.85
 
     _apply_multiline_debug_boost(raw, norm, scores)
+    _apply_shift_obligation_decision_boost(norm, padded, scores)
 
     if norm in _ONBOARDING_EXACT:
         scores[ONBOARDING_OR_HELP] += 4.0
@@ -331,7 +400,7 @@ def disambiguate_profile(
 ) -> str:
     """Ask one short question; return PROFILE_INTERVIEW or PROFILE_STYLE."""
     print()
-    print("That sounds like shaping your profile. Which fits better right now?")
+    print("This looks like profile stuff. Which do you want to do right now?")
     print("  1) How I decide (short interview)")
     print("  2) How I talk (style calibration)")
     choice = (read_choice("Pick 1 or 2: ").strip() or "").lower()
@@ -353,7 +422,7 @@ def disambiguate_intent(
         return r
 
     print()
-    print("That could go a couple of ways — which is closer?")
+    print("That could mean a few different things — which one's closest?")
     labels = []
     for i, cat in enumerate(opts, start=1):
         labels.append((str(i), cat))
@@ -378,40 +447,31 @@ def disambiguate_intent(
 
 def _human_label(cat: str) -> str:
     return {
-        DECISION_HELP: "A decision I'm weighing",
-        PERSONAL_RESPONSE: "How I'd probably answer or say something",
-        DEBUG_HELP: "Something broke / logs or errors",
-        PROFILE_BUILDING: "Building how MirrorCore learns me",
+        DECISION_HELP: "A choice I'm trying to make",
+        PERSONAL_RESPONSE: "How I'd probably answer out loud",
+        DEBUG_HELP: "Something broke — logs or errors",
+        PROFILE_BUILDING: "Teaching MirrorCore how I work",
         ONBOARDING_OR_HELP: "What MirrorCore can do / where to start",
     }.get(cat, cat)
 
 
 def routing_feedback(route: ResolvedRoute) -> str:
-    """One short natural line before dispatch."""
+    """Optional line before dispatch (Phase 32: quiet by default)."""
     if route.from_disambiguation and route.category == ONBOARDING_OR_HELP:
-        return "Okay — opening the main menu."
+        return "Alright — here's the main menu."
 
-    if route.category == DECISION_HELP:
-        return "This sounds like a decision question. I'll treat it that way."
-
-    if route.category == PERSONAL_RESPONSE:
-        return "This looks like a likely-you response request."
+    # Ambiguous inputs already went through a menu; stay quiet after they pick.
+    if route.from_disambiguation:
+        return ""
 
     if route.category == DEBUG_HELP:
-        return (
-            "This sounds like troubleshooting. I'll open log analysis — "
-            "paste the output when you're ready."
-        )
-
-    if route.category == PROFILE_BUILDING:
-        if route.profile_target == PROFILE_STYLE:
-            return "This sounds like tuning how you talk. Starting style calibration."
-        return "This sounds like capturing how you decide. Starting the interview flow."
+        # One plain hint so it’s obvious what to paste next.
+        return "Paste the error or log output when you’re ready."
 
     if route.category == ONBOARDING_OR_HELP:
-        return "I'll show what you can do and where to start."
+        return "Here’s what you can do and where to start."
 
-    return "Here's what I can do next."
+    return ""
 
 
 def resolve_full_route(

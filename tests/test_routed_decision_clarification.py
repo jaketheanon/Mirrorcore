@@ -17,6 +17,7 @@ from mirrorcore.decision.routed_clarification import (
     MONEY,
     OBLIGATION_OVERLOAD,
     RISK_TIMING,
+    SPENDING,
     build_routed_decision_guidance,
     extract_clarification_evidence,
     pick_next_question,
@@ -58,6 +59,45 @@ class TestOntology(unittest.TestCase):
             normalize_input("Should I confront my boss about unfair treatment?")
         )
         self.assertEqual(ordered[0][0], CONFLICT_FAMILY)
+
+    def test_coworker_cover_shift_burnt_out_is_obligation_not_conflict(self):
+        """Phase 32: peer + shift cover + fatigue → obligation/overload, not conflict slots."""
+        text = normalize_input(
+            "a coworker needs me to cover a shift but im burnt out. what do i do?"
+        )
+        ordered, dims = rank_families(text)
+        self.assertEqual(ordered[0][0], OBLIGATION_OVERLOAD)
+        self.assertGreater(dims.get("overload", 0), 0)
+        self.assertGreater(dims.get("obligation", 0), 0)
+        fam_order = [f for f, sc in ordered if sc >= 0.4][:6]
+        if "general" not in fam_order:
+            fam_order.append("general")
+        q = pick_next_question(
+            context_parts=[
+                "a coworker needs me to cover a shift but im burnt out. what do i do?"
+            ],
+            asked_ids=[],
+            domain_order=fam_order,
+            dimensions=dims,
+        )
+        self.assertIsNotNone(q)
+        self.assertNotEqual(q.slot_id, "peace_vs_clarity")
+        self.assertNotEqual(q.slot_id, "pattern_vs_once")
+        self.assertIn(q.slot_id, ("energy_capacity", "guilt_axis", "consequence_no", "pressure_source"))
+
+    def test_cover_shift_burnt_out_ranks_obligation(self):
+        ordered, _ = rank_families(
+            normalize_input("can i say no to covering a shift im burnt out")
+        )
+        self.assertEqual(ordered[0][0], OBLIGATION_OVERLOAD)
+
+    def test_extra_hours_while_overloaded_is_obligation(self):
+        ordered, _ = rank_families(
+            normalize_input(
+                "they keep asking for extra hours helping out but im overloaded already"
+            )
+        )
+        self.assertEqual(ordered[0][0], OBLIGATION_OVERLOAD)
 
 
 class TestEvidenceExtraction(unittest.TestCase):
@@ -152,6 +192,34 @@ class TestQuestionPicking(unittest.TestCase):
         self.assertNotEqual(q.qid, "m_rent")
 
 
+class TestSlotWordingVariation(unittest.TestCase):
+    def test_same_seed_same_wording(self):
+        q = pick_next_question(
+            context_parts=["Should I buy an $800 laptop if my rent is late?"],
+            asked_ids=[],
+            domain_order=[MONEY, "general"],
+        )
+        self.assertIsNotNone(q)
+        seed = "deadbeefcafe"
+        a = q.wording(seed)
+        b = q.wording(seed)
+        self.assertEqual(a, b)
+        low = a.lower()
+        self.assertTrue("rent" in low or "bill" in low, msg=a)
+
+    def test_variants_share_slot_id_and_markers(self):
+        q = pick_next_question(
+            context_parts=["Should I buy an $800 laptop if my rent is late?"],
+            asked_ids=[],
+            domain_order=[MONEY, "general"],
+        )
+        self.assertIsNotNone(q)
+        self.assertEqual(q.slot_id, "bills_basics")
+        seeds = [f"s{i}" for i in range(24)]
+        texts = {q.wording(s) for s in seeds}
+        self.assertGreaterEqual(len(texts), 2, msg="expected multiple surface wordings")
+
+
 class TestGuidanceWording(unittest.TestCase):
     def test_housing_pattern_not_surfaced_without_money_context(self):
         g = build_routed_decision_guidance(
@@ -163,6 +231,26 @@ class TestGuidanceWording(unittest.TestCase):
             situation_repeat_counts={"housing_bill_pressure=open": 5},
         )
         self.assertNotIn("housing or bill pressure", g.lower())
+
+    def test_housing_pattern_requires_spending_and_high_count(self):
+        g = build_routed_decision_guidance(
+            original_question="Should I buy a laptop if rent is late?",
+            qa_pairs=[],
+            domain_order=[SPENDING],
+            profile=None,
+            tendency_map={},
+            situation_repeat_counts={"housing_bill_pressure=open": 2},
+        )
+        self.assertNotIn("past clarifications", g.lower())
+        g2 = build_routed_decision_guidance(
+            original_question="Should I buy a laptop if rent is late?",
+            qa_pairs=[],
+            domain_order=[SPENDING],
+            profile=None,
+            tendency_map={},
+            situation_repeat_counts={"housing_bill_pressure=open": 3},
+        )
+        self.assertIn("past clarifications", g2.lower())
 
     def test_no_legacy_generic_phrases(self):
         g = build_routed_decision_guidance(

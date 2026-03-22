@@ -304,7 +304,9 @@ def handle_ask(args):
             "Opening the main menu so you can choose."
         )
     else:
-        print(routing_feedback(route))
+        fb = routing_feedback(route)
+        if fb:
+            print(fb)
     print()
 
     if route.category == "onboarding_or_help":
@@ -1657,15 +1659,16 @@ def handle_debug_outcome(args):
                 open_session = None
             
             # Match get_latest_analysis_session: open = not completed/resolved
-            _ss = (open_session.get("session_status") or "").lower()
-            if open_session and _ss not in ("completed", "resolved"):
-                try:
-                    db_store.update_analysis_session_status(open_session["id"], "completed")
-                    print(f"\n Investigation session {open_session['id']} marked as resolved.")
-                    print("  Future analyze-followup calls will not attach to this session.")
-                except Exception:
-                    # Do not fail debug-outcome if session resolution update fails
-                    pass
+            if open_session:
+                _ss = (open_session.get("session_status") or "").lower()
+                if _ss not in ("completed", "resolved"):
+                    try:
+                        db_store.update_analysis_session_status(open_session["id"], "completed")
+                        print(f"\n Investigation session {open_session['id']} marked as resolved.")
+                        print("  Future analyze-followup calls will not attach to this session.")
+                    except Exception:
+                        # Do not fail debug-outcome if session resolution update fails
+                        pass
         
     except (ValueError, KeyboardInterrupt):
         print("\nCancelled.")

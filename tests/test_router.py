@@ -68,6 +68,32 @@ class TestClassifyIntent(unittest.TestCase):
         self.assertFalse(c.weak_input)
         self.assertEqual(c.ordered[0][0], DECISION_HELP)
 
+    def test_what_do_i_do_phrase_decision(self):
+        c = classify_intent("A coworker wants me to cover, but I'm exhausted. What do I do?")
+        self.assertFalse(c.weak_input)
+        self.assertEqual(c.ordered[0][0], DECISION_HELP)
+
+    def test_shift_cover_fatigue_without_should_i(self):
+        c = classify_intent(
+            "colleague asked me to pick up a shift tomorrow and I'm drained"
+        )
+        self.assertFalse(c.weak_input)
+        self.assertEqual(c.ordered[0][0], DECISION_HELP)
+
+    def test_should_i_cover_with_overload_cues(self):
+        c = classify_intent(
+            "should I cover for my coworker? I'm overwhelmed with hours already"
+        )
+        self.assertFalse(c.weak_input)
+        self.assertEqual(c.ordered[0][0], DECISION_HELP)
+
+    def test_wants_help_favor_bias_decision(self):
+        c = classify_intent(
+            "my manager wants me to do a huge favor covering tonight - help?"
+        )
+        self.assertFalse(c.weak_input)
+        self.assertEqual(c.ordered[0][0], DECISION_HELP)
+
     def test_ambiguous_top_two(self):
         c = classify_intent("help me decide stack trace")
         self.assertTrue(c.needs_intent_disambiguation)
@@ -114,15 +140,46 @@ class TestDisambiguation(unittest.TestCase):
 
 
 class TestRoutingFeedback(unittest.TestCase):
-    def test_lines(self):
+    def test_quiet_decision_and_profile_routes(self):
         from mirrorcore.router import ResolvedRoute
 
-        self.assertIn(
-            "decision",
-            routing_feedback(
-                ResolvedRoute(category=DECISION_HELP, profile_target=None)
-            ).lower(),
+        self.assertEqual(
+            routing_feedback(ResolvedRoute(category=DECISION_HELP, profile_target=None)),
+            "",
         )
+        self.assertEqual(
+            routing_feedback(
+                ResolvedRoute(category=PROFILE_BUILDING, profile_target=PROFILE_INTERVIEW)
+            ),
+            "",
+        )
+
+    def test_debug_hint_stays_short(self):
+        from mirrorcore.router import ResolvedRoute
+
+        fb = routing_feedback(ResolvedRoute(category=DEBUG_HELP, profile_target=None))
+        self.assertTrue(fb)
+        self.assertIn("paste", fb.lower())
+
+    def test_onboarding_menu_line(self):
+        from mirrorcore.router import ResolvedRoute
+
+        fb = routing_feedback(
+            ResolvedRoute(category=ONBOARDING_OR_HELP, profile_target=None)
+        )
+        self.assertIn("can do", fb.lower())
+
+    def test_after_disambiguation_menu(self):
+        from mirrorcore.router import ResolvedRoute
+
+        fb = routing_feedback(
+            ResolvedRoute(
+                category=ONBOARDING_OR_HELP,
+                profile_target=None,
+                from_disambiguation=True,
+            )
+        )
+        self.assertIn("menu", fb.lower())
 
 
 class TestAskCommand(unittest.TestCase):

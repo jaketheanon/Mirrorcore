@@ -102,7 +102,7 @@ class PersonalProfile:
                 parts.append("shorter, direct explanations")
         if dip and bln and dip.confidence >= 0.3 and bln.confidence >= 0.3:
             if dip.weighted_mean >= bln.weighted_mean + 0.15:
-                parts.append("diplomatic phrasing")
+                parts.append("softer wording")
             elif bln.weighted_mean >= dip.weighted_mean + 0.15:
                 parts.append("blunter phrasing")
         if not parts:

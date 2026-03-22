@@ -88,6 +88,43 @@ class TestPersonalProfileAggregation(unittest.TestCase):
 
 
 class TestRetrieval(unittest.TestCase):
+    def test_conflict_prompt_downranks_money_scenario_memory(self):
+        rent_row = {
+            "id": "r1",
+            "timestamp": "2025-01-01",
+            "scenario_id": "rent_v1",
+            "scenario_text": "Rent is late and I want to buy something expensive.",
+            "choice_label": "Wait",
+            "choice_value": "w",
+            "reasoning_label": "Bills first",
+            "reasoning_value": "b",
+            "value_tags": ["caution"],
+            "trait_signals": {"financial_caution": 0.8},
+            "correction_status": "accurate",
+            "confidence_score": 0.9,
+        }
+        social_row = {
+            "id": "s1",
+            "timestamp": "2025-01-02",
+            "scenario_id": "rude_v1",
+            "scenario_text": "Coworker was rude in a meeting.",
+            "choice_label": "Say something",
+            "choice_value": "x",
+            "reasoning_label": "Clear the air",
+            "reasoning_value": "y",
+            "value_tags": ["directness"],
+            "trait_signals": {"directness": 0.7},
+            "correction_status": "accurate",
+            "confidence_score": 0.88,
+        }
+        ranked = retrieve_relevant_decision_memories(
+            [rent_row, social_row],
+            "Someone was rude to me at work what should I do",
+            top_k=2,
+        )
+        self.assertEqual(ranked[0][0]["id"], "s1")
+        self.assertLess(ranked[1][1], ranked[0][1])
+
     def test_deterministic_ranking_tiebreak(self):
         rows = [
             {

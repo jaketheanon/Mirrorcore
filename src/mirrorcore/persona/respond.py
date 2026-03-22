@@ -13,6 +13,13 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ..db.store import DatabaseStore
+from ..decision.routed_clarification import (
+    CONFLICT_FAMILY,
+    SPENDING,
+    rank_families,
+    score_dimensions,
+)
+from ..router import normalize_input
 from .profile import PersonalProfile, build_personal_profile_from_rows
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+", re.I)
@@ -37,6 +44,68 @@ def _correction_retrieval_factor(status: str) -> float:
         "partially_true": 0.78,
         "not_really": 0.12,
     }.get((status or "").strip(), 0.85)
+
+
+def _decision_row_text_blob(row: Mapping[str, Any]) -> str:
+    return " ".join(
+        [
+            str(row.get("scenario_text") or ""),
+            str(row.get("choice_label") or ""),
+            str(row.get("reasoning_label") or ""),
+            " ".join(str(t) for t in (row.get("value_tags") or [])),
+        ]
+    )
+
+
+def _decision_memory_relevance_multiplier(
+    prompt_norm: str, row: Mapping[str, Any], raw_score: float
+) -> float:
+    """Down-rank memory from unrelated decision families (Phase 32)."""
+    if raw_score >= 2.25:
+        return 1.0
+    row_norm = normalize_input(_decision_row_text_blob(row))
+    if not row_norm.strip():
+        return 0.5
+
+    ordered_p, _ = rank_families(prompt_norm)
+    ordered_r, _ = rank_families(row_norm)
+    top_p = ordered_p[0][0]
+    top_r = ordered_r[0][0]
+    dp = score_dimensions(prompt_norm)
+    dr = score_dimensions(row_norm)
+    keys = set(dp) & set(dr)
+    overlap = sum(min(dp[k], dr[k]) for k in keys) if keys else 0.0
+
+    if top_p == top_r:
+        return 1.0
+    if overlap >= 1.35:
+        return 0.9
+    if overlap >= 0.9:
+        return 0.75
+
+    money_row = dr.get("money_pressure", 0) >= 1.0 or any(
+        x in row_norm for x in ("rent", "bill", "$", "afford", "pay", "loan", "salary", "broke")
+    )
+    money_prompt = dp.get("money_pressure", 0) >= 0.85 or any(
+        x in prompt_norm
+        for x in ("rent", "bill", "$", "afford", "pay", "loan", "salary", "buy", "spend", "money")
+    )
+    if money_row and not money_prompt and dp.get("money_pressure", 0) < 0.55:
+        return 0.18
+
+    obl_row = dr.get("obligation", 0) + dr.get("overload", 0) >= 1.25
+    obl_prompt = dp.get("obligation", 0) + dp.get("overload", 0) >= 0.8
+    if obl_row and not obl_prompt:
+        return 0.22
+
+    conf_row = dr.get("interpersonal_hurt", 0) + dr.get("conflict_intensity", 0) >= 1.1
+    conf_prompt = dp.get("interpersonal_hurt", 0) + dp.get("conflict_intensity", 0) >= 0.85
+    if conf_row and not conf_prompt:
+        return 0.2
+
+    if overlap >= 0.4:
+        return max(0.25, 0.45 + 0.1 * min(1.0, overlap))
+    return 0.22
 
 
 def _count_occurrences(keys: Sequence[str]) -> Dict[str, int]:
@@ -152,10 +221,12 @@ def retrieve_relevant_decision_memories(
     top_k: int = 5,
 ) -> List[Tuple[Dict[str, Any], float, List[str]]]:
     keywords = tokenize_prompt(prompt)
+    prompt_norm = normalize_input(prompt)
     scenario_counts = _count_occurrences([str(r.get("scenario_id") or "") for r in rows])
     scored: List[Tuple[Dict[str, Any], float, List[str], str, str]] = []
     for row in rows:
         s, reasons = score_decision_memory_row(row, keywords, scenario_counts)
+        s *= _decision_memory_relevance_multiplier(prompt_norm, row, s)
         scored.append(
             (
                 row,
@@ -328,7 +399,7 @@ def generate_personal_response(
         memory_basis.append(f"Style memory ({pid})")
 
     # Compose answer
-    if top_d and top_score >= 0.55 and top_d[0].get("correction_status") != "not_really":
+    if top_d and top_score >= 0.62 and top_d[0].get("correction_status") != "not_really":
         row = top_d[0]
         choice = str(row.get("choice_label") or "").strip()
         why = str(row.get("reasoning_label") or "").strip()
@@ -344,31 +415,30 @@ def generate_personal_response(
                 answer_core += f". Mostly because {why_sent}"
         answer = _shorten_sentence(answer_core.rstrip("."), aggressive_short) + "."
         reasoning = (
-            "Pulled from your closest matching saved decision pattern; "
-            "it rhymes with how you answered similar interview scenarios."
+            "Pulled from your closest matching saved decision; "
+            "it lines up with how you answered similar interview questions."
         )
         if agreement_boost >= 0.3:
-            reasoning += " A few saved choices line up on the same value tags."
+            reasoning += " A few saved picks share the same value tags."
         if profile.has_trait_conflict:
-            reasoning += " Your saved signals don’t fully agree, so treat this as a sketch, not a verdict."
+            reasoning += " Your saved signals don’t fully match, so treat this as a rough guess."
     elif profile.total_evidence_weight >= 1.2 and profile_hint:
         answer = (
-            "From what’s saved, I don’t have a strong scenario match for this exact question. "
-            f"If I had to speak in your usual style, I’d keep it {profile_hint} — "
-            "but I’d want more context before committing."
+            "From what’s saved, I don’t have a tight match for this exact question. "
+            f"If I had to talk like you usually do, I’d keep it {profile_hint} — "
+            "but I’d want more detail before I’d commit."
         )
         reasoning = (
-            "Style/value tendencies come from aggregated calibration and interview memory, "
-            "not from a specific matching decision."
+            "That read comes from your saved style and values, not one specific past decision."
         )
         conf = min(conf, 0.48)
     else:
         answer = (
-            "I don’t have enough matching saved decisions or style calibration to say what you’d "
-            "probably do here. I’d sit with it, gather one or two more facts, and decide once the tradeoffs are clear."
+            "I don’t have enough saved decisions or style picks to say what you’d "
+            "probably do here. I’d sit with it, grab one or two more facts, then choose once the tradeoffs are clear."
         )
         reasoning = (
-            "There’s little or no relevant grounded memory for this prompt; this is a cautious generic stance."
+            "There’s little saved memory that fits this prompt; this is a careful generic take."
         )
         conf = min(conf, 0.28)
 

@@ -7,6 +7,7 @@ Deterministic, inspectable, one question at a time. Used from ``mirrorcore ask``
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable, Dict, FrozenSet, List, MutableMapping, Optional, Sequence, Tuple
@@ -15,6 +16,15 @@ from ..persona.profile import PersonalProfile, build_personal_profile
 from ..router import normalize_input
 
 MAX_CLARIFICATION_ROUNDS = 2
+
+
+def _stable_index(key: str, modulo: int) -> int:
+    """Deterministic pick in ``0..modulo-1`` (no ``hash()`` salt)."""
+    if modulo <= 1:
+        return 0
+    h = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return int(h[:12], 16) % modulo
+
 
 # --- Decision families (broad ontology) ---
 SPENDING = "spending"
@@ -53,12 +63,40 @@ _DIMENSION_RULES: Tuple[Tuple[str, Tuple[str, ...], float], ...] = (
             "pick up a shift",
             "cover for",
             "cover their",
-            "do them a favor",
+            "cover a shift",
+            "cover my shift",
+            "cover the shift",
+            "cover shift",
+            "covering a shift",
+            "covering for",
+            "needs me to cover",
+            "want me to cover",
             " extra shift",
+            " extra hours",
+            "do them a favor",
         ),
         0.95,
     ),
-    ("overload", ("exhausted", "burnout", "burned out", "too much", "overwhelmed", "no energy", "at capacity", "double shift", "extra shift"), 1.1),
+    (
+        "overload",
+        (
+            "exhausted",
+            "burnout",
+            "burned out",
+            "burnt out",
+            "too much",
+            "overwhelmed",
+            "overloaded",
+            "no energy",
+            "at capacity",
+            "double shift",
+            "extra shift",
+            "extra hours",
+            "drained",
+            "wiped out",
+        ),
+        1.1,
+    ),
     ("boundary_strain", ("boundary", "say no", "can't keep", "cant keep", "people pleasing", "walk all over"), 0.95),
     (
         "interpersonal_hurt",
@@ -150,8 +188,12 @@ _FAMILY_KEYWORDS: Dict[str, Tuple[Tuple[str, float], ...]] = {
         ("overtime", 1.0),
         ("exhausted", 1.2),
         ("burnout", 1.3),
+        ("burnt out", 1.25),
         ("too much", 1.1),
+        ("extra hours", 1.15),
         ("cover for", 1.0),
+        ("cover a shift", 1.1),
+        ("cover shift", 1.0),
         ("pick up", 0.65),
     ),
     CONFLICT_FAMILY: (
@@ -159,7 +201,8 @@ _FAMILY_KEYWORDS: Dict[str, Tuple[Tuple[str, float], ...]] = {
         ("argument", 1.0),
         ("boundary", 0.9),
         ("boss", 0.8),
-        ("coworker", 0.8),
+        # Not listed: bare "coworker" — that alone pulled shift/favor asks into conflict;
+        # relationship_stakes still nudges when a peer term appears.
         ("apologize", 0.7),
         ("resent", 1.0),
         ("unfair", 0.9),
@@ -228,6 +271,8 @@ def infer_family_scores(norm_text: str, dimensions: Optional[Dict[str, float]] =
 _OBLIGATION_OVERLOAD_CUES: Tuple[str, ...] = (
     " exhausted",
     " burnout",
+    " burnt out",
+    "burned out",
     " shift",
     " overtime",
     " favor",
@@ -235,15 +280,61 @@ _OBLIGATION_OVERLOAD_CUES: Tuple[str, ...] = (
     " help her",
     " help him",
     " cover for",
+    " cover a shift",
+    "needs me to cover",
     " pick up",
     " asked me to",
     " too much on",
     " extra shift",
+    " extra hours",
     " owe ",
     "guilt trip",
     "can t cover",
     "can't cover",
 )
+
+
+def _boost_obligation_for_cover_shift_fatigue(
+    norm_text: str,
+    dimensions: Dict[str, float],
+    scores: MutableMapping[str, float],
+) -> None:
+    """Workplace cover/shift asks + fatigue/strain → obligation-overload, not conflict."""
+    padded = f" {norm_text} "
+    peer = any(
+        x in padded
+        for x in (
+            " coworker ",
+            " colleague ",
+            " boss ",
+            " teammate ",
+            " manager ",
+        )
+    ) or norm_text.startswith(("coworker ", "colleague "))
+    shift_like = any(
+        x in padded or x in norm_text
+        for x in (
+            " shift ",
+            " shifts ",
+            " cover ",
+            " covering ",
+            " overtime ",
+            " extra hours ",
+            "pick up a shift",
+            "pick up another shift",
+            "cover a shift",
+            "cover my shift",
+            "cover shift",
+            "covering a shift",
+            "covering for",
+        )
+    )
+    strain = dimensions.get("overload", 0) >= 0.95 or dimensions.get("obligation", 0) >= 0.55
+    if not (peer and shift_like and strain):
+        return
+    scores[OBLIGATION_OVERLOAD] = scores.get(OBLIGATION_OVERLOAD, 0) + 2.75
+    if dimensions.get("interpersonal_hurt", 0) < 0.55:
+        scores[CONFLICT_FAMILY] = scores.get(CONFLICT_FAMILY, 0) * 0.62
 
 
 def _social_conflict_without_obligation(norm_text: str, dimensions: Dict[str, float]) -> bool:
@@ -270,6 +361,7 @@ def _adjust_family_scores_for_social_conflict(
 def rank_families(norm_text: str) -> Tuple[List[Tuple[str, float]], Dict[str, float]]:
     dims = score_dimensions(norm_text)
     raw = infer_family_scores(norm_text, dims)
+    _boost_obligation_for_cover_shift_fatigue(norm_text, dims, raw)
     _adjust_family_scores_for_social_conflict(norm_text, dims, raw)
     ordered = sorted(raw.items(), key=lambda x: (-x[1], x[0]))
     return ordered, dims
@@ -292,6 +384,8 @@ class ClarificationSlot:
     filled_markers: Tuple[str, ...] = ()
     # Dimensions that lower effective priority (more urgent to ask) when active
     boost_dims: Tuple[str, ...] = ()
+    # Same slot / logic; surface wording only (Phase 32).
+    question_variants: Tuple[str, ...] = ()
 
     @property
     def qid(self) -> str:
@@ -300,6 +394,11 @@ class ClarificationSlot:
     @property
     def text(self) -> str:
         return self.question
+
+    def wording(self, session_seed: str) -> str:
+        variants = (self.question,) + self.question_variants
+        i = _stable_index(f"{session_seed}:{self.slot_id}", len(variants))
+        return variants[i]
 
     @property
     def skip_if_any(self) -> Tuple[str, ...]:
@@ -320,6 +419,10 @@ def _all_slots() -> Tuple[ClarificationSlot, ...]:
                 "rent covered", "rent sorted",
             ),
             boost_dims=("money_pressure",),
+            question_variants=(
+                "Are rent and the big monthly bills squared away yet, or still hanging over you?",
+                "Have the important bills been handled yet, or not really?",
+            ),
         ),
         ClarificationSlot(
             "need_vs_want",
@@ -331,6 +434,10 @@ def _all_slots() -> Tuple[ClarificationSlot, ...]:
                 "for my job", "essential", "luxury",
             ),
             boost_dims=("need_vs_want_signal",),
+            question_variants=(
+                "Honestly — real need right now, or mostly a want?",
+                "Is this a must-have for you at the moment, or a nice-to-have?",
+            ),
         ),
         ClarificationSlot(
             "purpose_purchase",
@@ -368,6 +475,10 @@ def _all_slots() -> Tuple[ClarificationSlot, ...]:
             "Do you actually have the energy for this without screwing yourself over?",
             filled_markers=("energy", "exhausted", "at capacity", "no bandwidth", "burnt out", "burned out"),
             boost_dims=("overload",),
+            question_variants=(
+                "Do you have enough gas left for this without wiping yourself out?",
+                "Realistically — do you have the bandwidth for this right now?",
+            ),
         ),
         ClarificationSlot(
             "guilt_axis",
@@ -379,6 +490,10 @@ def _all_slots() -> Tuple[ClarificationSlot, ...]:
                 "people pleasing",
             ),
             boost_dims=("regret_risk", "obligation"),
+            question_variants=(
+                "What scares you more — saying no, or saying yes and wishing you hadn’t?",
+                "Is the hard part letting them down, or ending up bitter if you agree?",
+            ),
         ),
         ClarificationSlot(
             "consequence_no",
@@ -404,6 +519,10 @@ def _all_slots() -> Tuple[ClarificationSlot, ...]:
                 "keep the peace", "clear the air", "speak up", "stay quiet", "peace",
             ),
             boost_dims=("conflict_intensity",),
+            question_variants=(
+                "Want to keep things calm, or say the thing that’s on your mind?",
+                "More important right now — smooth things over, or get it out in the open?",
+            ),
         ),
         ClarificationSlot(
             "pattern_vs_once",
@@ -437,6 +556,10 @@ def _all_slots() -> Tuple[ClarificationSlot, ...]:
             "Is there a real deadline, or does it mostly feel urgent?",
             filled_markers=("deadline", "real deadline", "no deadline", "feel urgent", "emotionally"),
             boost_dims=("urgency", "uncertainty"),
+            question_variants=(
+                "Is there an actual cutoff, or is it mostly nerves talking?",
+                "Hard deadline somewhere, or just feels like it has to be now?",
+            ),
         ),
         ClarificationSlot(
             "reversibility",
@@ -492,6 +615,10 @@ def _all_slots() -> Tuple[ClarificationSlot, ...]:
             50,
             "In one line each, what are the two paths you're choosing between?",
             filled_markers=("two paths", "two options", "either", "on one hand"),
+            question_variants=(
+                "What are the two real options in one short line each?",
+                "Name the two choices you’re actually stuck between — one line per choice.",
+            ),
         ),
         ClarificationSlot(
             "week_okay",
@@ -499,6 +626,10 @@ def _all_slots() -> Tuple[ClarificationSlot, ...]:
             60,
             "A week later, what would make you feel okay about how you chose?",
             filled_markers=("week later", "feel okay", "at peace", "no regrets"),
+            question_variants=(
+                "Picture next week — what would make you glad you picked the way you did?",
+                "A week from now, what would ‘glad I chose that’ look like for you?",
+            ),
         ),
     )
 
@@ -647,52 +778,96 @@ def _situation_counts_recent(store, limit: int = 30) -> Dict[str, int]:
 
 # --- Guidance (data-driven checks on merged context + memory) ---
 
-def _profile_lines(profile: Optional[PersonalProfile]) -> List[str]:
-    if not profile or profile.total_evidence_weight < 0.85:
+def _profile_lines(profile: Optional[PersonalProfile], seed: str) -> List[str]:
+    """At most one rotated line; higher evidence bar (Phase 32)."""
+    if not profile or profile.total_evidence_weight < 1.15:
         return []
-    out: List[str] = []
+    candidates: List[str] = []
     risk = profile.decision_risk_summary()
-    if risk:
+    risk_ok = any(
+        t.name == "risk_tolerance" and t.confidence >= 0.48
+        for t in profile.trait_estimates
+    )
+    if risk and risk_ok:
         if risk == "leans cautious":
-            risk_phrase = "tend to be cautious when the stakes feel high"
+            risk_phrase = "often slow down when a call feels heavy"
         elif risk == "leans risk-tolerant":
-            risk_phrase = "have been okay taking more risk in past choices"
+            risk_phrase = "been okay taking bigger swings before"
         else:
             risk_phrase = risk
-        out.append(
-            f"From what you've saved before, you {risk_phrase} — "
-            "only you know if this moment matches that pattern."
+        candidates.append(
+            f"From older saves, you {risk_phrase} — only you know if this fits today."
         )
     ds = next((t for t in profile.trait_estimates if t.name == "decision_speed"), None)
-    if ds and ds.confidence >= 0.35 and ds.weighted_mean <= 0.38:
-        out.append(
-            "Your past answers suggest you like a little extra time before big calls — "
-            "that's fine to honor if nothing is truly on fire."
+    if ds and ds.confidence >= 0.48 and ds.weighted_mean <= 0.38:
+        candidates.append(
+            "Older answers suggest you like a beat before big calls — "
+            "that’s fine if nothing is actually on fire."
         )
-    vt = [x[0].lower() for x in profile.value_tag_weights[:5]]
-    if any("regret" in v or "security" in v for v in vt):
-        out.append(
-            "You've weighted avoiding regret or protecting stability before — "
-            "worth weighing that against what you'd give up here."
+    vt = profile.value_tag_weights[:6]
+    if any(
+        ("regret" in x[0].lower() or "security" in x[0].lower()) and x[1] >= 1.15
+        for x in vt
+    ):
+        candidates.append(
+            "You’ve leaned toward playing it safe before — weigh that against what you’d give up here."
         )
-    return out[:2]
+    if not candidates:
+        return []
+    idx = _stable_index(f"{seed}:profile_line", len(candidates))
+    return [candidates[idx]]
 
 
 def _current_money_context_strong(norm_text: str) -> bool:
     """Gate housing/bill memory: only when this turn clearly involves money pressure."""
     d = score_dimensions(norm_text)
-    if d.get("money_pressure", 0) >= 1.0:
+    if d.get("money_pressure", 0) >= 1.15:
         return True
-    if d.get("money_pressure", 0) >= 0.85 and any(
-        x in norm_text for x in ("rent", "bill", "afford", "buy", "purchase", "pay", "debt", "salary")
+    if d.get("money_pressure", 0) >= 0.95 and any(
+        x in norm_text for x in ("rent", "bill", "afford", "buy", "purchase", "pay", "debt", "salary", "broke")
     ):
         return True
     hits = sum(
         1
-        for t in ("rent", "bill", "afford", "purchase", "salary", "budget", "loan", "spend", "$", "money")
+        for t in ("rent", "bill", "afford", "purchase", "salary", "budget", "loan", "spend", "$", "money", "broke")
         if t in norm_text
     )
-    return hits >= 2
+    return hits >= 3
+
+
+def _obligation_overlap_strong(norm_text: str, dims: Dict[str, float]) -> bool:
+    """Helping / overload / boundary signal strong enough to reuse obligation-style memory."""
+    combo = (
+        dims.get("obligation", 0)
+        + dims.get("overload", 0)
+        + dims.get("boundary_strain", 0) * 0.9
+    )
+    if combo >= 1.25:
+        return True
+    padded = f" {norm_text} "
+    cues = (
+        " exhausted",
+        " burnout",
+        " burnt out",
+        "burned out",
+        " shift",
+        " overtime",
+        " favor",
+        " cover for",
+        " cover a shift",
+        "needs me to cover",
+        " asked me",
+        " too much",
+        " extra shift",
+        " extra hours",
+        " owe ",
+        "help them",
+        "help her",
+        "help him",
+        "pick up a shift",
+        "say no",
+    )
+    return sum(1 for c in cues if c in padded or c.strip() in norm_text) >= 2
 
 
 def _tendency_lines(
@@ -700,37 +875,58 @@ def _tendency_lines(
     *,
     primary_family: str,
     initial_norm: str,
+    seed: str,
 ) -> List[str]:
     lines: List[str] = []
     dims0 = score_dimensions(initial_norm)
+    t_guilt = 0.42
+    t_regret = 0.42
+    t_energy = 0.42
 
-    if tmap.get("tendency_guilt_about_no", 0) >= 0.35:
-        if primary_family in (OBLIGATION_OVERLOAD, LOYALTY_BOUNDARY, GENERAL) or dims0.get(
-            "obligation", 0
-        ) > 0.4:
-            lines.append(
-                "You've often leaned toward worrying about saying no — check whether that's guilt or real harm."
+    if tmap.get("tendency_guilt_about_no", 0) >= t_guilt:
+        if _obligation_overlap_strong(initial_norm, dims0) and (
+            primary_family in (OBLIGATION_OVERLOAD, LOYALTY_BOUNDARY)
+            or (
+                primary_family == GENERAL
+                and dims0.get("obligation", 0) + dims0.get("overload", 0) >= 1.35
             )
-    if tmap.get("tendency_regret_if_yes", 0) >= 0.35:
-        if primary_family != CONFLICT_FAMILY or dims0.get("regret_risk", 0) > 0.3:
-            lines.append(
-                "You've flagged 'yes and resent it' before — if that shows up again, believe it."
-            )
-    if tmap.get("tendency_low_energy_guard", 0) >= 0.35:
-        if primary_family != CONFLICT_FAMILY and (
-            primary_family == OBLIGATION_OVERLOAD or dims0.get("overload", 0) > 0.45
         ):
             lines.append(
-                "You've said you're running on empty in similar moments — stacking another yes rarely ages well."
+                "You’ve worried a lot about saying no before — check if that’s guilt or real fallout."
             )
-    return lines[:2]
+    if tmap.get("tendency_regret_if_yes", 0) >= t_regret:
+        if primary_family in (OBLIGATION_OVERLOAD, LOYALTY_BOUNDARY):
+            lines.append(
+                "You’ve said yes before and felt bitter after — if that feeling’s back, take it seriously."
+            )
+        elif primary_family == CONFLICT_FAMILY and dims0.get("regret_risk", 0) >= 0.95:
+            lines.append(
+                "You’ve said yes before and felt bitter after — if that feeling’s back, take it seriously."
+            )
+        elif _obligation_overlap_strong(initial_norm, dims0) and dims0.get("regret_risk", 0) >= 0.55:
+            lines.append(
+                "You’ve said yes before and felt bitter after — if that feeling’s back, take it seriously."
+            )
+    if tmap.get("tendency_low_energy_guard", 0) >= t_energy:
+        if primary_family == CONFLICT_FAMILY and dims0.get("overload", 0) < 0.85:
+            pass
+        elif primary_family == OBLIGATION_OVERLOAD or dims0.get("overload", 0) >= 0.95:
+            lines.append(
+                "You’ve been wiped in similar spots — piling on another full yes usually doesn’t age well."
+            )
+    if len(lines) > 1:
+        pick = _stable_index(f"{seed}:tendency", len(lines))
+        return [lines[pick]]
+    return lines
 
 
-def _pattern_repeat_line(counts: Dict[str, int]) -> Optional[str]:
-    if counts.get("housing_bill_pressure=open", 0) >= 2:
+def _pattern_repeat_line(counts: Dict[str, int], primary_family: str) -> Optional[str]:
+    if primary_family != SPENDING:
+        return None
+    if counts.get("housing_bill_pressure=open", 0) >= 3:
         return (
-            "You've noted housing or bill pressure more than once in past clarifications — "
-            "treat that as a pattern, not a one-off mood."
+            "Rent or bill stress has shown up a few times in past clarifications — "
+            "worth treating that as a pattern, not a one-off bad week."
         )
     return None
 
@@ -749,6 +945,9 @@ def build_routed_decision_guidance(
     primary = domain_order[0] if domain_order else GENERAL
     tendency_map = tendency_map or {}
     counts = situation_repeat_counts or {}
+    phrase_seed = hashlib.sha256(
+        normalize_input(original_question).encode("utf-8")
+    ).hexdigest()[:24]
 
     bodies: List[str] = []
 
@@ -762,65 +961,67 @@ def build_routed_decision_guidance(
         )
         if unpaid and ("rent" in ctx or "bill" in ctx or "housing" in ctx):
             bodies.append(
-                "If rent or core bills are genuinely still open, a big purchase stacks pressure on the tightest spot. "
-                "That doesn't mean 'never' — it means sequence: stabilize basics first unless this purchase is how you keep income or pass something you can't postpone."
+                "If rent or core bills are still open, a big buy hits the sorest spot first. "
+                "That doesn’t mean never — it means get basics steadier first, unless this buy is how you keep income or pass something you can’t move."
             )
         elif " need " in ctx or "need for" in ctx or "mostly need" in ctx or ("school" in ctx and "want" not in ctx):
             bodies.append(
-                "If it's a real need for work or school, treat price like equipment: name the minimum spec that works, line up one cheaper alternative, then decide if the extra money buys enough."
+                "If it’s a real need for work or school, treat it like gear: what’s the cheapest setup that still works, what’s one step up, and is the extra cash worth it."
             )
         elif " want " in ctx or "mostly want" in ctx or "luxury" in ctx:
             bodies.append(
-                "If it's mostly a want while money is tight, waiting isn't weakness — it's buying room to choose without cornering yourself. Pick a date to revisit."
+                "If it’s mostly a want while cash is tight, waiting isn’t weak — it’s space to choose without boxing yourself in. Pick a date to check again."
             )
         else:
             bodies.append(
-                "Money calls go better when food, rent, and transit are honest first. If those wobble, shrink the spend or delay until one layer is calmer."
+                "Money stuff is easier when food, rent, and getting around are honest first. If those wobble, trim the spend or wait until one layer feels steadier."
             )
     elif primary == OBLIGATION_OVERLOAD:
         if "low" in ctx and ("energy" in ctx or "exhaust" in ctx):
             bodies.append(
-                "If you're out of gas, the kind answer to yourself is a smaller yes, a later yes, or a no with one sentence of honesty — not a hero yes you'll resent."
+                "If you’re out of gas, the kind move is a smaller yes, a later yes, or a short honest no — not a hero yes you’ll hate later."
             )
         else:
             bodies.append(
-                "Obligation decisions stick when you decide your real limit before you answer. A clear 'here's what I can do' beats a resentful full yes."
+                "Helping people works better when you know your real line before you answer. A plain ‘here’s what I can do’ beats a full yes you’ll resent."
             )
     elif primary == CONFLICT_FAMILY:
         if "peace" in ctx or "quiet" in ctx or "avoid" in ctx:
             bodies.append(
-                "If peace matters most, small steady boundaries usually beat one big blow-up. You can be kind and still name what you won't absorb."
+                "If calm matters most, small steady limits usually beat one huge blow-up. You can stay decent and still say what you won’t take."
             )
         elif "say" in ctx or "clear" in ctx or "honest" in ctx:
             bodies.append(
-                "If something needs saying, one concrete point plus one example beats a speech. Say what you want next time, not everything you ever felt."
+                "If something needs saying, one clear point and one example beats a long speech. Say what you want next time, not your whole life story."
             )
         else:
             bodies.append(
-                "Conflict choices are about what you can live with after. Pick whether you're aiming at repair, distance, or clarity — those need different moves."
+                "This is mostly about what you can live with afterward. Decide if you want things fixed, some distance, or just straight talk — those take different moves."
             )
     elif primary == RISK_TIMING:
         bodies.append(
-            "Separate real deadlines from adrenaline. If nothing breaks when you wait, use the pause to fetch one missing fact. If there's a real cutoff, work backward from it."
+            "Split real deadlines from nerves. If waiting doesn’t break anything, use the pause to grab one missing fact. If there’s a real cutoff, count backward from it."
         )
         if "low" in ctx and "revers" in ctx:
-            bodies.append("One-way choices deserve a slower yes; reversible ones can be smaller experiments.")
+            bodies.append(
+                "Hard-to-undo choices deserve a slower yes; easy-to-undo ones can be small tries."
+            )
     elif primary == LOYALTY_BOUNDARY:
         bodies.append(
-            "Loyalty shouldn't mean self-erasure. If saying yes costs sleep, money, or dignity every time, the pattern is the problem — not this single ask."
+            "Being loyal doesn’t have to mean wiping yourself out. If yes costs sleep, money, or self-respect every time, the habit is the issue — not only this one ask."
         )
     elif primary == CONVENIENCE_QUALITY:
         bodies.append(
-            "When speed fights quality, pick the smallest step that still tells you if the 'proper' path is worth it — don't let hurry lock you into sloppiness you'll pay for twice."
+            "When fast fights ‘do it right,’ try the smallest step that still shows if the careful path is worth it — don’t let rush lock you into fix-it-twice work."
         )
     else:
         bodies.append(
-            "Choose what you'd defend out loud to a friend who wants the best for you — not the version that only sounds good when you're tired. If both options hurt, protect what you can't fix cheaply later."
+            "Pick what you’d stand by with a friend who’s on your side — not the story that only sounds good when you’re tired. If both choices hurt, guard what’s costly to undo."
         )
 
     initial_norm = normalize_input(original_question)
     extra = (
-        _pattern_repeat_line(counts)
+        _pattern_repeat_line(counts, primary)
         if _current_money_context_strong(initial_norm)
         else None
     )
@@ -832,9 +1033,10 @@ def build_routed_decision_guidance(
             tendency_map,
             primary_family=primary,
             initial_norm=initial_norm,
+            seed=phrase_seed,
         )
     )
-    bodies.extend(_profile_lines(profile))
+    bodies.extend(_profile_lines(profile, phrase_seed))
     return "\n\n".join(bodies)
 
 
@@ -876,6 +1078,8 @@ def run_routed_decision_guidance(
     session_sit: List[Tuple[str, str]] = []
     session_tend: List[Tuple[str, float]] = []
 
+    session_seed = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:24]
+
     for _ in range(MAX_CLARIFICATION_ROUNDS):
         slot = pick_next_question(
             context_parts=context_parts,
@@ -885,7 +1089,8 @@ def run_routed_decision_guidance(
         )
         if slot is None:
             break
-        print(slot.question)
+        qtext = slot.wording(session_seed)
+        print(qtext)
         try:
             ans = (read_line("Your answer: ") or "").strip()
         except EOFError:
@@ -894,7 +1099,7 @@ def run_routed_decision_guidance(
         if not ans:
             break
         context_parts.append(ans)
-        qa_pairs.append((slot.question, ans))
+        qa_pairs.append((qtext, ans))
         an = normalize_input(ans)
         sit, tend = _extract_situation_and_tendency(slot, an)
         session_sit.extend(sit)

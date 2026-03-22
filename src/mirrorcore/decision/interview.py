@@ -1201,19 +1201,20 @@ def compute_confidence(main_choice: InterviewOption,
 # ---------------------------------------------------------------------------
 
 _CONFIRM_PHRASES = [
-    "Got it.",
-    "Noted.",
-    "Understood.",
-    "Thanks for sharing that.",
     "Alright.",
+    "Got you.",
+    "Makes sense.",
+    "Okay.",
+    "That helps.",
+    "Thanks for sharing that.",
 ]
 
 _TRANSITION_PHRASES = [
-    "Here's another one.",
+    "Here’s another one.",
     "Next scenario.",
     "Moving on.",
     "One more.",
-    "Let's keep going.",
+    "Let’s keep going.",
 ]
 
 _ACCURATE_PHRASES = [
@@ -1228,8 +1229,8 @@ _PARTIAL_PHRASES = [
     "Thanks for the correction.",
     "Good catch, updating that.",
     "Appreciate the adjustment.",
-    "Noted, that's helpful.",
-    "Thanks, refining the model.",
+    "Noted, that’s helpful.",
+    "Thanks — tightening that up.",
 ]
 
 _FULL_CORRECTION_PHRASES = [
@@ -1237,7 +1238,7 @@ _FULL_CORRECTION_PHRASES = [
     "Good to know, adjusting.",
     "Appreciate the honesty.",
     "Noted, that changes things.",
-    "Got it, will recalibrate.",
+    "Got it — adjusting.",
 ]
 
 
@@ -1280,7 +1281,7 @@ _TRAIT_LOW_REFLECTION_MAP: Dict[str, str] = {
     "thoroughness": "You don't get bogged down in details",
     "empathy": "You focus more on the practical side than feelings",
     "boundary_setting": "You tend to say yes even when it's hard",
-    "directness": "You tend to be more diplomatic than blunt",
+    "directness": "You tend to use careful wording instead of being blunt",
     "conflict_comfort": "You tend to avoid confrontation",
     "analytical_thinking": "When you're deciding, you may lean on what feels right instead of careful analysis",
     "adaptability": "Changes of plan tend to bother you",

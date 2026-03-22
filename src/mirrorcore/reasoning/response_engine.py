@@ -1393,16 +1393,16 @@ class ReasoningResponseEngine:
             response += "Let's consider:\n\n"
             response += "• What evidence supports this recommendation?\n"
             response += "• What are the potential downsides or risks?\n"
-            response += "• Does this align with your past experiences or goals?\n\n"
-            response += "This will help us evaluate whether it's the right choice for you."
+            response += "• Does this match what you’ve run into before or what you’re aiming for?\n\n"
+            response += "That should help tell if it’s the right call for you."
             
         else:
-            response += "Let me help you work through this decision systematically. "
-            response += "I'll ask some clarifying questions to understand the full context:\n\n"
-            response += "1. What's the main objective you're trying to achieve?\n"
-            response += "2. What are the available options or approaches?\n"
-            response += "3. What constraints or considerations are most important?\n\n"
-            response += "This framework will help us make a more informed choice."
+            response += "Let me help you walk through this decision in order. "
+            response += "I’ll ask a few plain questions to get the full picture:\n\n"
+            response += "1. What are you mainly trying to get done?\n"
+            response += "2. What are the real choices you’re picking between?\n"
+            response += "3. What limits or worries matter most?\n\n"
+            response += "Answering those usually makes the next step obvious."
         
         return self._apply_persona_style(response, context, "decision_support")
     

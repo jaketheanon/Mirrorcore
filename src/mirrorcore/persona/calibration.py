@@ -192,13 +192,15 @@ _TRANSITIONS = [
     "Next one.",
     "Moving on.",
     "One more.",
-    "Got it, next prompt.",
+    "Okay — next.",
 ]
 
 _CONFIRMS = [
-    "Noted.",
-    "Got it.",
+    "Alright.",
+    "Got you.",
     "Makes sense.",
+    "Okay.",
+    "That helps.",
     "Saved that choice.",
 ]
 
@@ -229,7 +231,7 @@ _NOT_REALLY_PHRASES = [
 _REFLECT_HIGH = {
     "bluntness": "You seem pretty direct",
     "verbosity": "You usually add more detail when you explain",
-    "diplomacy": "You usually soften things instead of going blunt",
+    "diplomacy": "You usually soften how you say it instead of going blunt",
     "sarcasm": "You seem to use sarcasm fairly often",
     "warmth": "You come across as warm and approachable",
     "seriousness": "You lean more serious than playful",
@@ -239,7 +241,7 @@ _REFLECT_HIGH = {
 _REFLECT_LOW = {
     "bluntness": "You do not come across as blunt",
     "verbosity": "You do not seem to over-explain much",
-    "diplomacy": "You tend to be more direct than diplomatic",
+    "diplomacy": "You tend to be more direct than careful with wording",
     "sarcasm": "You mostly keep it straight, not sarcastic",
     "warmth": "Your tone seems more matter-of-fact than warm",
     "seriousness": "You do not sound overly formal or serious",
