@@ -236,6 +236,24 @@ def initialize_database(conn: sqlite3.Connection):
         )
     """)
 
+    # 11) Routed decision clarification memory (Phase 31.2) — situation facts + tendencies
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS decision_router_situation_facts (
+            id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            slot_key TEXT NOT NULL,
+            slot_value TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS decision_router_tendencies (
+            slot_key TEXT PRIMARY KEY,
+            strength REAL NOT NULL DEFAULT 0.0,
+            sample_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
     # 10) style_memory table - Structured style/persona calibration memory (Phase 28)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS style_memory (
@@ -276,7 +294,9 @@ def initialize_database(conn: sqlite3.Connection):
         "CREATE INDEX IF NOT EXISTS idx_decision_memory_source ON decision_memory(source)",
         "CREATE INDEX IF NOT EXISTS idx_style_memory_timestamp ON style_memory(timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_style_memory_prompt_id ON style_memory(prompt_id)",
-        "CREATE INDEX IF NOT EXISTS idx_style_memory_source ON style_memory(source)"
+        "CREATE INDEX IF NOT EXISTS idx_style_memory_source ON style_memory(source)",
+        "CREATE INDEX IF NOT EXISTS idx_decision_router_situation_ts ON decision_router_situation_facts(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_decision_router_situation_key ON decision_router_situation_facts(slot_key)",
     ]
     
     for index_sql in indexes:

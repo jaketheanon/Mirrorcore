@@ -1,0 +1,228 @@
+"""
+Phase 31.1: routed decision clarification (deterministic, one question at a time).
+"""
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from mirrorcore.db.store import DatabaseStore
+from mirrorcore.decision.routed_clarification import (
+    CONFLICT_FAMILY,
+    LEGACY_GENERIC_PHRASES,
+    MONEY,
+    OBLIGATION_OVERLOAD,
+    RISK_TIMING,
+    build_routed_decision_guidance,
+    extract_clarification_evidence,
+    pick_next_question,
+    rank_families,
+    run_routed_decision_guidance,
+    score_decision_domains,
+    score_dimensions,
+)
+from mirrorcore.router import classify_intent, normalize_input
+
+
+class TestOntology(unittest.TestCase):
+    def test_bothered_social_conflict_wins(self):
+        ordered, _ = rank_families(
+            normalize_input(
+                "Someone said something that bothered me. What should I do?"
+            )
+        )
+        self.assertEqual(ordered[0][0], CONFLICT_FAMILY)
+
+    def test_wait_vs_act_risk_timing_top(self):
+        ordered, _ = rank_families(
+            normalize_input("I don't know whether to wait or act now.")
+        )
+        self.assertEqual(ordered[0][0], RISK_TIMING)
+
+    def test_money_pressure_dimension(self):
+        d = score_dimensions(normalize_input("rent is late and I'm broke"))
+        self.assertGreater(d.get("money_pressure", 0), 0)
+
+    def test_overload_family_top(self):
+        ordered, _ = rank_families(
+            normalize_input("Should I pick up another shift? I'm exhausted.")
+        )
+        self.assertEqual(ordered[0][0], OBLIGATION_OVERLOAD)
+
+    def test_conflict_family_top(self):
+        ordered, _ = rank_families(
+            normalize_input("Should I confront my boss about unfair treatment?")
+        )
+        self.assertEqual(ordered[0][0], CONFLICT_FAMILY)
+
+
+class TestEvidenceExtraction(unittest.TestCase):
+    def test_bills_situation_fact(self):
+        sit, tend = extract_clarification_evidence("bills_basics", "Rent is still not paid")
+        self.assertTrue(any(k == "housing_bill_pressure" for k, _ in sit))
+        self.assertEqual(tend, [])
+
+    def test_energy_marks_both(self):
+        sit, tend = extract_clarification_evidence(
+            "energy_capacity", "I'm completely exhausted, no energy left"
+        )
+        self.assertTrue(any("energy" in k for k, _ in sit))
+        self.assertTrue(any(t[0].startswith("tendency_") for t in tend))
+
+
+class TestRouterMemoryStore(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db_path = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.db_path.unlink(missing_ok=True)
+
+    def test_situation_and_tendency_persist(self):
+        store = DatabaseStore(self.db_path)
+        try:
+            store.initialize_database()
+            store.record_router_situation_fact("housing_bill_pressure", "open")
+            store.merge_router_tendency("tendency_guilt_about_no", 0.5)
+            tmap = store.get_router_tendency_map(min_strength=0.2)
+            self.assertGreaterEqual(tmap.get("tendency_guilt_about_no", 0), 0.2)
+            recent = store.get_recent_router_situation_facts(limit=5)
+            self.assertTrue(any(r["slot_key"] == "housing_bill_pressure" for r in recent))
+        finally:
+            store.close()
+
+
+class TestDomainScoring(unittest.TestCase):
+    def test_laptop_rent_money_primary(self):
+        t = normalize_input("Should I buy an $800 laptop if my rent is late?")
+        ranked = score_decision_domains(t)
+        self.assertEqual(ranked[0][0], MONEY)
+
+    def test_ask_still_decision_intent(self):
+        c = classify_intent("Should I buy an $800 laptop if my rent is late?")
+        self.assertEqual(c.ordered[0][0], "decision_help")
+
+
+class TestQuestionPicking(unittest.TestCase):
+    def test_bothered_opens_conflict_not_energy(self):
+        ordered, _ = rank_families(
+            normalize_input(
+                "Someone said something that bothered me. What should I do?"
+            )
+        )
+        fam_order = [f for f, sc in ordered if sc >= 0.4][:5]
+        if "general" not in fam_order:
+            fam_order.append("general")
+        q = pick_next_question(
+            context_parts=[
+                "Someone said something that bothered me. What should I do?"
+            ],
+            asked_ids=[],
+            domain_order=fam_order,
+        )
+        self.assertIsNotNone(q)
+        self.assertEqual(q.slot_id, "peace_vs_clarity")
+
+    def test_first_question_money_is_rent_not_dump(self):
+        q = pick_next_question(
+            context_parts=["Should I buy an $800 laptop if my rent is late?"],
+            asked_ids=[],
+            domain_order=[MONEY, "general"],
+        )
+        self.assertIsNotNone(q)
+        self.assertIn("rent", q.text.lower())
+        self.assertLessEqual(q.text.count("?"), 1)
+
+    def test_second_question_after_answer(self):
+        ctx = [
+            "Should I buy an $800 laptop if my rent is late?",
+            "Rent is still not paid.",
+        ]
+        q = pick_next_question(
+            context_parts=ctx,
+            asked_ids=["bills_basics"],
+            domain_order=[MONEY, "general"],
+        )
+        self.assertIsNotNone(q)
+        self.assertNotEqual(q.qid, "m_rent")
+
+
+class TestGuidanceWording(unittest.TestCase):
+    def test_housing_pattern_not_surfaced_without_money_context(self):
+        g = build_routed_decision_guidance(
+            original_question="Someone was rude to me at work",
+            qa_pairs=[],
+            domain_order=[CONFLICT_FAMILY],
+            profile=None,
+            tendency_map={},
+            situation_repeat_counts={"housing_bill_pressure=open": 5},
+        )
+        self.assertNotIn("housing or bill pressure", g.lower())
+
+    def test_no_legacy_generic_phrases(self):
+        g = build_routed_decision_guidance(
+            original_question="Should I buy an $800 laptop if my rent is late?",
+            qa_pairs=[
+                ("q1", "Rent is still not paid."),
+                ("q2", "It's mainly for school."),
+            ],
+            domain_order=[MONEY],
+            profile=None,
+        )
+        low = g.lower()
+        for phrase in LEGACY_GENERIC_PHRASES:
+            self.assertNotIn(phrase, low)
+
+    def test_unpaid_rent_concrete(self):
+        g = build_routed_decision_guidance(
+            original_question="Laptop purchase?",
+            qa_pairs=[("q", "Rent is not paid yet")],
+            domain_order=[MONEY],
+            profile=None,
+        )
+        self.assertIn("rent", g.lower())
+        self.assertNotIn("available options", g.lower())
+
+
+class TestInteractiveFlow(unittest.TestCase):
+    @patch("mirrorcore.decision.routed_clarification.build_personal_profile")
+    def test_two_rounds_incorporate_answers(self, mock_prof):
+        mock_prof.return_value = MagicMock(total_evidence_weight=0.0)
+
+        store = MagicMock()
+        store.get_recent_decision_memory.return_value = []
+        store.get_recent_style_memory.return_value = []
+        store.get_router_tendency_map.return_value = {}
+        store.get_recent_router_situation_facts.return_value = []
+
+        replies = iter(
+            [
+                "Still not paid.",
+                "Need it for school, old one died.",
+            ]
+        )
+
+        def read_line(_p: str) -> str:
+            return next(replies)
+
+        guidance = run_routed_decision_guidance(
+            initial_text="Should I buy an $800 laptop if my rent is late?",
+            read_line=read_line,
+            db_store=store,
+        )
+        low = guidance.lower()
+        for phrase in LEGACY_GENERIC_PHRASES:
+            self.assertNotIn(phrase, low)
+        self.assertTrue(
+            "school" in low or "need" in low or "rent" in low,
+            msg=guidance,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -48,6 +48,7 @@ class DatabaseStore:
         self.ensure_phase27_columns()
         self.ensure_phase28_style_memory()
         self.ensure_phase30_1_interview_rotation_state()
+        self.ensure_phase31_2_decision_router_memory()
 
     def initialize_database(self):
         """Initialize the database with all required tables.
@@ -156,6 +157,39 @@ class DatabaseStore:
                 updated_at TIMESTAMP NOT NULL
             )
             """
+        )
+        conn.commit()
+
+    def ensure_phase31_2_decision_router_memory(self):
+        """Ensure routed decision clarification tables exist (Phase 31.2)."""
+        conn = self.get_db_connection()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS decision_router_situation_facts (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                slot_key TEXT NOT NULL,
+                slot_value TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS decision_router_tendencies (
+                slot_key TEXT PRIMARY KEY,
+                strength REAL NOT NULL DEFAULT 0.0,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_decision_router_situation_ts "
+            "ON decision_router_situation_facts(timestamp)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_decision_router_situation_key "
+            "ON decision_router_situation_facts(slot_key)"
         )
         conn.commit()
 
@@ -1541,3 +1575,72 @@ class DatabaseStore:
         conn = self.get_db_connection()
         row = conn.execute("SELECT COUNT(*) AS count FROM style_memory").fetchone()
         return int(row["count"]) if row else 0
+
+    def record_router_situation_fact(self, slot_key: str, slot_value: str) -> str:
+        """Append a one-off situation fact from routed clarification (not a trait)."""
+        conn = self.get_db_connection()
+        eid = str(uuid4())
+        conn.execute(
+            """
+            INSERT INTO decision_router_situation_facts (id, timestamp, slot_key, slot_value)
+            VALUES (?, ?, ?, ?)
+            """,
+            (eid, datetime.utcnow().isoformat(), slot_key, slot_value),
+        )
+        conn.commit()
+        return eid
+
+    def merge_router_tendency(self, slot_key: str, signal: float) -> None:
+        """Update a long-run tendency from clarification (0..1 signal, capped, decayed)."""
+        conn = self.get_db_connection()
+        signal = max(0.0, min(1.0, float(signal)))
+        now = datetime.utcnow().isoformat()
+        row = conn.execute(
+            "SELECT strength, sample_count FROM decision_router_tendencies WHERE slot_key = ?",
+            (slot_key,),
+        ).fetchone()
+        if row:
+            old = float(row["strength"] or 0.0)
+            n = int(row["sample_count"] or 0) + 1
+            merged = min(1.0, old * 0.92 + signal * 0.22)
+            conn.execute(
+                """
+                UPDATE decision_router_tendencies
+                SET strength = ?, sample_count = ?, updated_at = ?
+                WHERE slot_key = ?
+                """,
+                (merged, n, now, slot_key),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO decision_router_tendencies (slot_key, strength, sample_count, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (slot_key, signal, 1, now),
+            )
+        conn.commit()
+
+    def get_router_tendency_map(self, min_strength: float = 0.22) -> Dict[str, float]:
+        """Return tendencies that have enough accumulated strength (honest threshold)."""
+        conn = self.get_db_connection()
+        rows = conn.execute(
+            """
+            SELECT slot_key, strength, sample_count FROM decision_router_tendencies
+            WHERE strength >= ? AND sample_count >= 1
+            """,
+            (min_strength,),
+        ).fetchall()
+        return {str(r["slot_key"]): float(r["strength"]) for r in rows}
+
+    def get_recent_router_situation_facts(self, limit: int = 40) -> List[Dict[str, Any]]:
+        """Recent situation facts only (newest first)."""
+        conn = self.get_db_connection()
+        rows = conn.execute(
+            """
+            SELECT slot_key, slot_value, timestamp FROM decision_router_situation_facts
+            ORDER BY timestamp DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]

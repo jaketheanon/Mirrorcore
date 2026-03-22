@@ -261,6 +261,7 @@ class TestCliIntegration(unittest.TestCase):
             ("interview", []),
             ("calibrate-style", []),
             ("respond-like-me", ["hello"]),
+            ("ask", ["hello"]),
             ("analyze-log", []),
             ("analyze-followup", []),
         ]:

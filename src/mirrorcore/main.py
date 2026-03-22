@@ -57,6 +57,7 @@ Examples:
   mirrorcore profile                            # View your profile
   mirrorcore interview                          # Run a decision interview
   mirrorcore respond-like-me                    # Likely-you answer from saved memory
+  mirrorcore ask "Should I buy this now?"       # Route plain-language to the right flow
         """
     )
     
@@ -220,6 +221,16 @@ Examples:
         help="Scenario or question (omit to type it when prompted)",
     )
 
+    ask_parser = subparsers.add_parser(
+        "ask",
+        help="Route one plain-language request into the right MirrorCore flow",
+    )
+    ask_parser.add_argument(
+        "query",
+        nargs="*",
+        help="What you want help with (omit to type when prompted)",
+    )
+
     # Status command
     status_parser = subparsers.add_parser(
         "status",
@@ -243,6 +254,89 @@ Examples:
     )
     
     return parser
+
+
+def handle_ask(args):
+    """Single-input router (Phase 31) — deterministic intent → existing handlers."""
+    from types import SimpleNamespace
+
+    from .router import (
+        PROFILE_STYLE,
+        resolve_full_route,
+        routing_feedback,
+    )
+
+    parts = getattr(args, "query", None) or []
+    text = " ".join(parts).strip()
+
+    if not text:
+        if PROMPT_TOOLKIT_AVAILABLE:
+            try:
+                text = prompt("What do you want help with? ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled.")
+                return
+        else:
+            try:
+                text = input("What do you want help with? ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled.")
+                return
+
+    if not text:
+        print("No input — nothing to route.")
+        return
+
+    db_path = Path("data") / "mirrorcore.db"
+    db_store = DatabaseStore(db_path)
+
+    def read_choice(prompt_text: str) -> str:
+        try:
+            return input(prompt_text)
+        except EOFError:
+            return ""
+
+    classification, route = resolve_full_route(text, read_choice)
+
+    if classification.weak_input:
+        print(
+            "That's a bit vague — I'm not sure which track fits. "
+            "Opening the main menu so you can choose."
+        )
+    else:
+        print(routing_feedback(route))
+    print()
+
+    if route.category == "onboarding_or_help":
+        handle_start(args)
+        return
+
+    if route.category == "decision_help":
+        from .decision.routed_clarification import run_routed_decision_guidance
+
+        guidance = run_routed_decision_guidance(
+            initial_text=text,
+            read_line=read_choice,
+            db_store=db_store,
+        )
+        print()
+        print(guidance)
+        return
+
+    if route.category == "personal_response":
+        handle_respond_like_me(SimpleNamespace(scenario=text))
+        return
+
+    if route.category == "debug_help":
+        handle_analyze_log(args)
+        return
+
+    if route.category == "profile_building":
+        if route.profile_target == PROFILE_STYLE:
+            handle_calibrate_style(args)
+        else:
+            handle_interview(args)
+        return
 
 
 def handle_start(args):
@@ -2052,6 +2146,7 @@ def main():
         "interview": handle_interview,
         "calibrate-style": handle_calibrate_style,
         "respond-like-me": handle_respond_like_me,
+        "ask": handle_ask,
     }
     
     handler = handlers.get(args.command)
