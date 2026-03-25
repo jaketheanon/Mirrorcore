@@ -1989,7 +1989,7 @@ def handle_respond_like_me(args):
         for line in pr.memory_basis[:5]:
             print(f"  • {line}")
     elif pr.profile_hint:
-        print(f"Grounded in: your saved tendencies ({pr.profile_hint})")
+        print(f"Grounded in: rough read from past answers ({pr.profile_hint})")
     else:
         print("Grounded in: little or no matching stored memory — see confidence above.")
     print()

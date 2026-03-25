@@ -27,6 +27,14 @@ from .profile import PersonalProfile, build_personal_profile_from_rows
 _TOKEN_RE = re.compile(r"[a-z0-9]+", re.I)
 
 
+def _stable_index(key: str, modulo: int) -> int:
+    """Deterministic index in ``0..modulo-1`` (no salted ``hash()``)."""
+    if modulo <= 1:
+        return 0
+    h = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return int(h[:12], 16) % modulo
+
+
 def tokenize_prompt(text: str) -> List[str]:
     if not text:
         return []
@@ -323,41 +331,69 @@ def generate_personal_response(
         profile_hint_parts.append(cs)
     profile_hint = "; ".join(profile_hint_parts) if profile_hint_parts else None
 
-    # Memory basis lines (short, user-facing) — only when retrieval is clearly relevant
-    for row, sc, _ in d_ranked[:2]:
+    # Memory basis (plain, one scenario + one style max when scores justify it)
+    seen_sid = set()
+    for row, sc, _ in d_ranked:
         if sc < 0.35:
             continue
-        mb_key = f"respond_mb_decision_{row.get('id') or row.get('scenario_id') or 'x'}"
+        sid = str(row.get("scenario_id") or "").strip() or "scenario"
+        if sid in seen_sid:
+            continue
+        mb_key = f"respond_mb_decision_{row.get('id') or sid or 'x'}"
         if hasattr(store, "should_surface_memory_line") and not store.should_surface_memory_line(
             mb_key
         ):
             continue
-        sid = row.get("scenario_id") or "scenario"
+        seen_sid.add(sid)
         snippet = (row.get("scenario_text") or "")[:52].strip()
         if snippet:
             ellip = "…" if len(row.get("scenario_text") or "") > 52 else ""
-            memory_basis.append(f'Decision memory (“{snippet}{ellip}”, scenario {sid})')
+            tmpl = (
+                'Past decision you saved (“{snippet}{ellip}”, id {sid})',
+                'Closest saved decision (“{snippet}{ellip}”, {sid})',
+                'Saved choice that lined up (“{snippet}{ellip}”, {sid})',
+            )
+            memory_basis.append(
+                tmpl[_stable_index(f"{phrase_seed}:mbd", len(tmpl))].format(
+                    snippet=snippet, ellip=ellip, sid=sid
+                )
+            )
         else:
-            memory_basis.append(f"Decision memory (scenario id {sid})")
+            memory_basis.append(
+                f"Saved decision entry ({sid})"
+            )
         if hasattr(store, "record_memory_line_surface"):
             try:
                 store.record_memory_line_surface(mb_key)
             except Exception:
                 pass
+        if len(memory_basis) >= 1:
+            break
 
-    for row, sc, _ in s_ranked[:2]:
+    seen_pid = set()
+    for row, sc, _ in s_ranked:
         if sc < 0.32:
             continue
-        sk = f"respond_mb_style_{row.get('id') or row.get('prompt_id') or 'x'}"
+        pid = str(row.get("prompt_id") or "").strip() or "style"
+        if pid in seen_pid:
+            continue
+        sk = f"respond_mb_style_{row.get('id') or pid or 'x'}"
         if hasattr(store, "should_surface_memory_line") and not store.should_surface_memory_line(sk):
             continue
-        pid = row.get("prompt_id") or "style"
-        memory_basis.append(f"Style memory ({pid})")
+        seen_pid.add(pid)
+        stmpl = (
+            "Saved style pick ({pid})",
+            "Earlier style answer ({pid})",
+        )
+        memory_basis.append(
+            stmpl[_stable_index(f"{phrase_seed}:mbs", len(stmpl))].format(pid=pid)
+        )
         if hasattr(store, "record_memory_line_surface"):
             try:
                 store.record_memory_line_surface(sk)
             except Exception:
                 pass
+        break
 
     # Compose answer
     if top_d and top_score >= 0.58 and top_d[0].get("correction_status") != "not_really":
@@ -376,13 +412,13 @@ def generate_personal_response(
                 answer_core += f". Mostly because {why_sent}"
         answer = _shorten_sentence(answer_core.rstrip("."), aggressive_short) + "."
         reasoning = (
-            "Pulled from your closest matching saved decision; "
-            "it lines up with how you answered similar interview questions."
+            "This leans on the saved decision that matched your words best, "
+            "plus how you answered the interview prompts."
         )
         if agreement_boost >= 0.3:
-            reasoning += " A few saved picks share the same value tags."
+            reasoning += " A few saves tagged the same values."
         if profile.has_trait_conflict:
-            reasoning += " Your saved signals don’t fully match, so treat this as a rough guess."
+            reasoning += " Your saves disagree a bit, so treat it as a rough guess."
     elif profile.total_evidence_weight >= 1.2 and profile_hint:
         surf_ok = not hasattr(store, "should_surface_memory_line") or store.should_surface_memory_line(
             "respond_profile_fallback"
@@ -390,22 +426,21 @@ def generate_personal_response(
         if surf_ok:
             variants = (
                 (
-                    "From what’s saved, I don’t have a tight match for this exact question. "
-                    f"If I had to talk like you usually do, I’d keep it {profile_hint} — "
-                    "but I’d want more detail before I’d commit."
+                    "Nothing saved fits this question tightly. If I’m winging it from your old answers, "
+                    f"I’d sound {profile_hint} — I’d still want a few more facts before I stuck to that."
                 ),
                 (
-                    "Nothing saved lines up one-to-one with this. If I’m guessing from your usual patterns, "
-                    f"you tend toward {profile_hint} — I’d still want more detail before I’d commit."
+                    "I can’t hook this to one past choice. The loose read from your saves is "
+                    f"{profile_hint} — I’d want more detail before I trusted it."
                 ),
                 (
-                    "I can’t pin this to a single past decision. The rough read from your saves is "
-                    f"{profile_hint} — but I’d want more context before I’d trust that."
+                    "No close save for this one. Guessing from patterns, you usually come across as "
+                    f"{profile_hint} — I’d slow down and fill in blanks before I called that solid."
                 ),
             )
             answer = variants[_stable_index(f"{phrase_seed}:pf", len(variants))]
             reasoning = (
-                "That read comes from your saved style and values, not one specific past decision."
+                "That’s from your saved style and values, not a single labeled decision."
             )
             conf = min(conf, 0.48)
             if hasattr(store, "record_memory_line_surface"):
@@ -415,29 +450,27 @@ def generate_personal_response(
                     pass
         else:
             answer = (
-                "From what’s saved, I don’t have a tight match for this exact question. "
-                "I’d still slow down and grab one or two more facts before I’d commit."
+                "No tight save for this question. I’d still grab one or two more facts before deciding."
             )
             reasoning = (
-                "That’s a cautious fallback — I’m not repeating the same profile read right now."
+                "Playing it quiet — I already surfaced a profile read recently."
             )
             conf = min(conf, 0.42)
     elif profile.total_evidence_weight >= 1.2 and not profile_hint:
         answer = (
-            "From what’s saved, I don’t have a tight match for this exact question. "
-            "I’d still slow down and grab one or two more facts before I’d commit."
+            "No tight save for this question. I’d still grab one or two more facts before deciding."
         )
         reasoning = (
-            "There’s some saved signal, but not enough to mirror this cleanly."
+            "Some signal on file, but not enough to mirror this cleanly."
         )
         conf = min(conf, 0.4)
     else:
         answer = (
-            "I don’t have enough saved decisions or style picks to say what you’d "
-            "probably do here. I’d sit with it, grab one or two more facts, then choose once the tradeoffs are clear."
+            "I don't have enough saved decisions or style picks to say what you'd probably do here. "
+            "I'd sit with it, grab a fact or two, then pick once the tradeoffs are clearer."
         )
         reasoning = (
-            "There’s little saved memory that fits this prompt; this is a careful generic take."
+            "Almost nothing on file matches this prompt; this is a careful generic take."
         )
         conf = min(conf, 0.28)
 

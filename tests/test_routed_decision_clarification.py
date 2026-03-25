@@ -306,6 +306,41 @@ class TestGuidanceWording(unittest.TestCase):
         )
         self.assertNotIn("call feels heavy", g.lower())
 
+    def test_phase35_merged_memory_tail_single_block(self):
+        """Tendency + profile candidates merge to one strongest line (Phase 35)."""
+        prof = MagicMock()
+        prof.total_evidence_weight = 1.4
+        prof.trait_estimates = [
+            MagicMock(name="risk_tolerance", confidence=0.55, weighted_mean=0.25),
+        ]
+        prof.decision_risk_summary.return_value = "leans cautious"
+        prof.value_tag_weights = []
+        g = build_routed_decision_guidance(
+            original_question=(
+                "Should I pick up another shift? I'm exhausted and saying no feels awful."
+            ),
+            qa_pairs=[],
+            domain_order=[OBLIGATION_OVERLOAD, "general"],
+            profile=prof,
+            tendency_map={"tendency_guilt_about_no": 0.95},
+            situation_repeat_counts={},
+        )
+        paras = [p.strip() for p in g.split("\n\n") if p.strip()]
+        habit_hits = sum(
+            1
+            for p in paras
+            if "from older saves" in p.lower()
+            or "past answers:" in p.lower()
+            or "patterns on file:" in p.lower()
+            or "saying no has nagged" in p.lower()
+            or "stressed over turning people down" in p.lower()
+        )
+        self.assertLessEqual(
+            habit_hits,
+            1,
+            msg="expected at most one habit/profile memory paragraph",
+        )
+
     def test_phase34_surface_suppression_respects_store(self):
         store = MagicMock()
         store.should_surface_memory_line.return_value = False
