@@ -15,6 +15,8 @@ from mirrorcore.db.store import DatabaseStore
 from mirrorcore.main import create_parser, handle_respond_like_me
 from types import SimpleNamespace
 from mirrorcore.persona.profile import build_personal_profile_from_rows
+from mirrorcore.decision.memory_relevance import personal_response_decision_families_aligned
+from mirrorcore.router import normalize_input
 from mirrorcore.persona.respond import (
     generate_personal_response,
     retrieve_relevant_decision_memories,
@@ -125,6 +127,112 @@ class TestRetrieval(unittest.TestCase):
         )
         self.assertEqual(ranked[0][0]["id"], "s1")
         self.assertLess(ranked[1][1], ranked[0][1])
+
+    def test_conflict_prompt_does_not_rank_overload_say_no_memory_first(self):
+        """Phase 36: gossip/conflict ask must not top-rank helping/overload saves."""
+        overload_row = {
+            "id": "o1",
+            "timestamp": "2025-01-01",
+            "scenario_id": "shift_v1",
+            "scenario_text": "Coworker wants you to cover another shift.",
+            "choice_label": "Say no, explain you can't right now",
+            "choice_value": "n",
+            "reasoning_label": "I was already overloaded",
+            "reasoning_value": "o",
+            "value_tags": ["boundaries"],
+            "trait_signals": {"boundary_strain": 0.8},
+            "correction_status": "accurate",
+            "confidence_score": 0.9,
+        }
+        conflict_row = {
+            "id": "c1",
+            "timestamp": "2025-01-02",
+            "scenario_id": "gossip_v1",
+            "scenario_text": "Someone keeps talking badly about you behind your back.",
+            "choice_label": "Address it calmly with the person",
+            "choice_value": "a",
+            "reasoning_label": "Stop the spiral",
+            "reasoning_value": "s",
+            "value_tags": ["directness"],
+            "trait_signals": {"diplomacy": 0.4},
+            "correction_status": "accurate",
+            "confidence_score": 0.88,
+        }
+        prompt = (
+            "what would i probably say if someone keeps talking shit behind my back"
+        )
+        ranked = retrieve_relevant_decision_memories(
+            [overload_row, conflict_row],
+            prompt,
+            top_k=2,
+            min_score=0.0,
+        )
+        self.assertEqual(ranked[0][0]["id"], "c1")
+        self.assertLess(ranked[1][1], ranked[0][1])
+
+    def test_obligation_prompt_does_not_rank_pure_conflict_memory_first(self):
+        """Helping/shift ask should not treat pure conflict memory as closest match."""
+        conflict_row = {
+            "id": "c2",
+            "timestamp": "2025-01-01",
+            "scenario_id": "rude_v1",
+            "scenario_text": "Coworker was rude in a meeting.",
+            "choice_label": "Say something directly",
+            "choice_value": "s",
+            "reasoning_label": "Clear the air",
+            "reasoning_value": "x",
+            "value_tags": ["directness"],
+            "trait_signals": {"directness": 0.8},
+            "correction_status": "accurate",
+            "confidence_score": 0.9,
+        }
+        obligation_row = {
+            "id": "o2",
+            "timestamp": "2025-01-02",
+            "scenario_id": "favor_v1",
+            "scenario_text": "You are exhausted and they asked for another favor.",
+            "choice_label": "Offer a smaller yes",
+            "choice_value": "y",
+            "reasoning_label": "Protect energy",
+            "reasoning_value": "e",
+            "value_tags": ["pragmatism"],
+            "trait_signals": {"overload": 0.85},
+            "correction_status": "accurate",
+            "confidence_score": 0.88,
+        }
+        prompt = (
+            "i'm burnt out but they want me to cover a shift what would i probably do"
+        )
+        ranked = retrieve_relevant_decision_memories(
+            [conflict_row, obligation_row],
+            prompt,
+            top_k=2,
+            min_score=0.0,
+        )
+        self.assertEqual(ranked[0][0]["id"], "o2")
+
+    def test_misaligned_top_memory_lowers_confidence_and_skips_quote(self):
+        """Weak cross-family match must not produce a confident direct quote."""
+        pr_mis = {
+            "id": "m1",
+            "timestamp": "2025-01-01",
+            "scenario_id": "shift_only",
+            "scenario_text": "Pick up extra shift when already tired.",
+            "choice_label": "Say no firmly",
+            "choice_value": "n",
+            "reasoning_label": "Too wiped",
+            "reasoning_value": "w",
+            "value_tags": ["boundaries"],
+            "trait_signals": {"overload": 0.9},
+            "correction_status": "accurate",
+            "confidence_score": 0.9,
+        }
+        self.assertFalse(
+            personal_response_decision_families_aligned(
+                normalize_input("someone trash talks me behind my back"),
+                pr_mis,
+            )
+        )
 
     def test_deterministic_ranking_tiebreak(self):
         rows = [
@@ -245,6 +353,27 @@ class TestRespondGeneration(unittest.TestCase):
         self.assertIsNotNone(eid)
         pr = generate_personal_response("ice cream flavor picking", self.db)
         self.assertNotIn("chocolate", pr.likely_answer.lower())
+
+    def test_cross_family_does_not_quote_shift_save_for_gossip_prompt(self):
+        self.db.record_decision_memory(
+            scenario_id="shift_v1",
+            scenario_text="Coworker wants you to cover another shift.",
+            choice_label="Say no, explain you can't right now",
+            choice_value="n",
+            reasoning_label="I was already overloaded",
+            reasoning_value="o",
+            value_tags=["boundaries"],
+            trait_signals={"boundary_strain": 0.8},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "what would i probably say if someone keeps talking shit behind my back",
+            self.db,
+        )
+        self.assertNotIn("overload", pr.likely_answer.lower())
+        self.assertNotIn("Say no, explain", pr.likely_answer)
+        self.assertLessEqual(pr.confidence, 0.42)
 
 
 class TestStyleRetrieval(unittest.TestCase):

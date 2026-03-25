@@ -49,11 +49,8 @@ def decision_memory_relevance_multiplier(
 ) -> float:
     """
     Down-rank stored decision rows when the prompt’s decision shape does not
-    match the saved scenario (Phase 32 + Phase 34 tightening).
+    match the saved scenario (Phase 32 + Phase 34 tightening + Phase 36 respond).
     """
-    if raw_score >= 2.35:
-        return 1.0
-
     row_norm = normalize_input(decision_row_text_blob(row))
     if not row_norm.strip():
         return 0.35
@@ -64,6 +61,10 @@ def decision_memory_relevance_multiplier(
     ordered_r, dr, _ = rank_families_full(row_norm)
     top_p = ordered_p[0][0]
     top_r = ordered_r[0][0]
+
+    # Lexical scores can spike on shared words (“say”, “no”) — never bypass family mismatch.
+    if raw_score >= 2.35 and top_p == top_r:
+        return 1.0
 
     keys = set(dp) & set(dr)
     overlap = sum(min(dp[k], dr[k]) for k in keys) if keys else 0.0
@@ -79,8 +80,40 @@ def decision_memory_relevance_multiplier(
     else:
         axis_factor = 0.42
 
+    prompt_conf = dp.get("interpersonal_hurt", 0) + dp.get("conflict_intensity", 0)
+    prompt_obl = dp.get("obligation", 0) + dp.get("overload", 0)
+    row_conf = dr.get("interpersonal_hurt", 0) + dr.get("conflict_intensity", 0)
+    row_obl = dr.get("obligation", 0) + dr.get("overload", 0)
+    dual_topic_prompt = prompt_obl >= 1.0 and prompt_conf >= 1.0
+
+    conf_prompt_strong = top_p == CONFLICT_FAMILY or prompt_conf >= 1.05
+    obl_prompt_strong = top_p == OBLIGATION_OVERLOAD or prompt_obl >= 1.05
+    conf_row_strong = top_r == CONFLICT_FAMILY or row_conf >= 1.05
+    obl_row_strong = top_r == OBLIGATION_OVERLOAD or row_obl >= 1.2
+    loy_row_primary = top_r == LOYALTY_BOUNDARY
+
     if top_p == top_r:
         base = 1.0
+    elif (
+        conf_prompt_strong
+        and (obl_row_strong or (loy_row_primary and row_conf < 0.95))
+        and not dual_topic_prompt
+    ):
+        base = 0.04
+    elif obl_prompt_strong and conf_row_strong and not dual_topic_prompt:
+        base = 0.04
+    elif (
+        top_p == CONFLICT_FAMILY
+        and top_r == SPENDING
+        and dp.get("money_pressure", 0) < 0.85
+    ):
+        base = 0.07
+    elif (
+        top_p == SPENDING
+        and top_r == CONFLICT_FAMILY
+        and dr.get("money_pressure", 0) < 0.85
+    ):
+        base = 0.07
     elif overlap >= 1.55:
         base = 0.92
     elif overlap >= 1.05:
@@ -131,6 +164,43 @@ def decision_memory_relevance_multiplier(
     return max(0.08, min(1.15, base * axis_factor))
 
 
+def personal_response_decision_families_aligned(
+    prompt_norm: str,
+    row: Mapping[str, Any],
+    *,
+    min_dim_overlap: float = 1.28,
+) -> bool:
+    """
+    True when the saved row is safe to treat as a “closest” same-family match
+    for respond-like-me (Phase 36).
+    """
+    row_norm = normalize_input(decision_row_text_blob(row))
+    if not row_norm.strip():
+        return False
+
+    from .ontology import rank_families_full
+
+    ordered_p, dp, _ = rank_families_full(prompt_norm)
+    ordered_r, dr, _ = rank_families_full(row_norm)
+    top_p = ordered_p[0][0]
+    top_r = ordered_r[0][0]
+    if top_p == top_r:
+        return True
+    keys = set(dp) & set(dr)
+    overlap = sum(min(dp[k], dr[k]) for k in keys) if keys else 0.0
+    if overlap >= min_dim_overlap:
+        return True
+    prompt_conf = dp.get("interpersonal_hurt", 0) + dp.get("conflict_intensity", 0)
+    prompt_obl = dp.get("obligation", 0) + dp.get("overload", 0)
+    row_conf = dr.get("interpersonal_hurt", 0) + dr.get("conflict_intensity", 0)
+    row_obl = dr.get("obligation", 0) + dr.get("overload", 0)
+    dual_p = prompt_obl >= 1.0 and prompt_conf >= 1.0
+    dual_r = row_obl >= 1.0 and row_conf >= 1.0
+    if dual_p and dual_r and overlap >= 0.95:
+        return True
+    return False
+
+
 def decision_row_text_blob(row: Mapping[str, Any]) -> str:
     return " ".join(
         [
@@ -140,6 +210,92 @@ def decision_row_text_blob(row: Mapping[str, Any]) -> str:
             " ".join(str(t) for t in (row.get("value_tags") or [])),
         ]
     )
+
+
+def style_row_text_blob(row: Mapping[str, Any]) -> str:
+    return " ".join(
+        [
+            str(row.get("prompt_text") or ""),
+            str(row.get("selected_label") or ""),
+            " ".join(str(t) for t in (row.get("style_tags") or [])),
+        ]
+    )
+
+
+def style_memory_relevance_multiplier(
+    prompt_norm: str,
+    row: Mapping[str, Any],
+    raw_score: float,
+) -> float:
+    """
+    Down-rank style calibration rows on clear cross-domain mismatch only.
+
+    Style prompts are often generic (“how you explain…”), so this uses softer
+    floors than ``decision_memory_relevance_multiplier`` and only hard-penalizes
+    obvious pulls (money vs non-money, conflict vs non-conflict, etc.).
+    """
+    if raw_score >= 2.2:
+        return 1.0
+
+    row_norm = normalize_input(style_row_text_blob(row))
+    if not row_norm.strip():
+        return 0.55
+
+    from .ontology import rank_families_full
+
+    ordered_p, dp, _ = rank_families_full(prompt_norm)
+    ordered_r, dr, _ = rank_families_full(row_norm)
+    top_p = ordered_p[0][0]
+    top_r = ordered_r[0][0]
+
+    keys = set(dp) & set(dr)
+    overlap = sum(min(dp[k], dr[k]) for k in keys) if keys else 0.0
+    axis_ov = ontology_axes_overlap(prompt_norm, row_norm)
+    axis_factor = 1.0
+    if axis_ov >= 1.4:
+        axis_factor = 1.04
+    elif axis_ov >= 0.75:
+        axis_factor = 1.0
+    elif axis_ov >= 0.35:
+        axis_factor = 0.9
+    else:
+        axis_factor = 0.78
+
+    if top_p == top_r or top_p == GENERAL or top_r == GENERAL:
+        base = 1.0
+    elif overlap >= 1.1:
+        base = 0.9
+    elif overlap >= 0.65:
+        base = 0.84
+    elif overlap >= 0.38:
+        base = 0.76
+    else:
+        base = 0.68
+
+    money_row = dr.get("money_pressure", 0) >= 1.05 or any(
+        x in row_norm for x in ("rent", "bill", "$", "afford", "pay", "salary", "broke")
+    )
+    money_prompt = dp.get("money_pressure", 0) >= 0.75 or any(
+        x in prompt_norm for x in ("rent", "bill", "$", "afford", "pay", "buy", "money")
+    )
+    if money_row and not money_prompt and dp.get("money_pressure", 0) < 0.45:
+        base = min(base, 0.32)
+
+    obl_row = dr.get("obligation", 0) + dr.get("overload", 0) >= 1.2
+    obl_prompt = dp.get("obligation", 0) + dp.get("overload", 0) >= 0.75
+    if obl_row and not obl_prompt and dp.get("obligation", 0) + dp.get("overload", 0) < 0.5:
+        base = min(base, 0.36)
+
+    conf_row = dr.get("interpersonal_hurt", 0) + dr.get("conflict_intensity", 0) >= 1.1
+    conf_prompt = dp.get("interpersonal_hurt", 0) + dp.get("conflict_intensity", 0) >= 0.75
+    if conf_row and not conf_prompt and dp.get("interpersonal_hurt", 0) < 0.45:
+        base = min(base, 0.34)
+
+    # Strong lexical retrieval already found a fit — do not collapse it.
+    if raw_score >= 0.45:
+        base = max(base, 0.82)
+
+    return max(0.38, min(1.1, base * axis_factor))
 
 
 # --- Fit between current question shape and trait-style profile blurbs ---

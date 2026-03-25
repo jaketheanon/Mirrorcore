@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tup
 
 from ..persona.profile import PersonalProfile, build_personal_profile
 from ..router import normalize_input
+from .cross_system_knowledge import build_ask_interview_memory_line_candidates
 from .memory_relevance import (
     profile_decision_speed_snippet_allowed,
     profile_memory_fit_score,
@@ -441,8 +442,13 @@ def _extract_situation_and_tendency(
 def _persist_evidence(store, situation: Sequence[Tuple[str, str]], tendencies: Sequence[Tuple[str, float]]) -> None:
     rec = getattr(store, "record_router_situation_fact", None)
     merge = getattr(store, "merge_router_tendency", None)
+    seen_sit: set = set()
     if callable(rec):
         for k, v in situation:
+            kv = (k, v)
+            if kv in seen_sit:
+                continue
+            seen_sit.add(kv)
             try:
                 rec(k, v)
             except Exception:
@@ -521,9 +527,11 @@ def _pick_merged_memory_lines(
     seed: str,
     min_tend: float,
     min_prof: float,
+    interview_cands: Sequence[Tuple[str, float, str]] = (),
+    min_interview: float = 0.52,
 ) -> List[Tuple[str, str]]:
     """
-    Single strongest habit/profile line (Phase 35): avoids stacking two similar closers.
+    Single strongest habit/profile/interview-memory line (Phase 35–36): one closers block.
     """
     pool: List[Tuple[str, float, str]] = []
     for k, s, t in tend_cands:
@@ -531,6 +539,9 @@ def _pick_merged_memory_lines(
             pool.append((k, s, t))
     for k, s, t in prof_cands:
         if s >= min_prof:
+            pool.append((k, s, t))
+    for k, s, t in interview_cands:
+        if s >= min_interview:
             pool.append((k, s, t))
     if not pool:
         return []
@@ -873,6 +884,7 @@ def build_routed_decision_guidance(
     tendency_map: Optional[Dict[str, float]] = None,
     situation_repeat_counts: Optional[Dict[str, int]] = None,
     surface_store: Optional[Any] = None,
+    interview_memory_candidates: Sequence[Tuple[str, float, str]] = (),
 ) -> str:
     parts_ctx = [original_question] + [a for _, a in qa_pairs]
     ctx = _padded_ctx(parts_ctx)
@@ -1117,6 +1129,8 @@ def build_routed_decision_guidance(
         seed=phrase_seed,
         min_tend=0.28,
         min_prof=0.55,
+        interview_cands=interview_memory_candidates,
+        min_interview=0.52,
     ):
         _append_surface_line(memory_tail, mk, mtxt, surface_store)
 
@@ -1202,6 +1216,25 @@ def run_routed_decision_guidance(
 
     repeat_counts = _situation_counts_recent(db_store)
 
+    parts_for_merge = [initial_text] + [a for _, a in qa_pairs]
+    merged_norm = normalize_input(" ".join(parts_for_merge))
+    phrase_seed = hashlib.sha256(
+        normalize_input(initial_text).encode("utf-8")
+    ).hexdigest()[:24]
+    interview_cands: List[Tuple[str, float, str]] = []
+    try:
+        drows = db_store.get_recent_decision_memory(limit=80)
+        primary_g = order[0] if order else GENERAL
+        interview_cands = build_ask_interview_memory_line_candidates(
+            drows,
+            merged_norm=merged_norm,
+            initial_norm=norm,
+            primary_family=primary_g,
+            seed=phrase_seed,
+        )
+    except Exception:
+        interview_cands = []
+
     return build_routed_decision_guidance(
         original_question=initial_text,
         qa_pairs=qa_pairs,
@@ -1210,6 +1243,7 @@ def run_routed_decision_guidance(
         tendency_map=tendency_map,
         situation_repeat_counts=repeat_counts,
         surface_store=db_store,
+        interview_memory_candidates=interview_cands,
     )
 
 

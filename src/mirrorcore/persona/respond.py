@@ -14,13 +14,16 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ..db.store import DatabaseStore
-from ..decision.memory_relevance import decision_memory_relevance_multiplier
-from ..decision.routed_clarification import (
-    CONFLICT_FAMILY,
-    SPENDING,
-    rank_families,
-    score_dimensions,
+from ..decision.cross_system_knowledge import (
+    clarification_cross_evidence_boost,
+    filter_relevant_situation_facts,
 )
+from ..decision.memory_relevance import (
+    decision_memory_relevance_multiplier,
+    personal_response_decision_families_aligned,
+    style_memory_relevance_multiplier,
+)
+from ..decision.routed_clarification import rank_families
 from ..router import normalize_input
 from .profile import PersonalProfile, build_personal_profile_from_rows
 
@@ -198,8 +201,10 @@ def retrieve_relevant_style_memories(
     keywords = tokenize_prompt(prompt)
     prompt_counts = _count_occurrences([str(r.get("prompt_id") or "") for r in rows])
     scored: List[Tuple[Dict[str, Any], float, List[str], str, str]] = []
+    prompt_norm = normalize_input(prompt)
     for row in rows:
         s, reasons = score_style_memory_row(row, keywords, prompt_counts)
+        s *= style_memory_relevance_multiplier(prompt_norm, row, s)
         scored.append(
             (
                 row,
@@ -242,6 +247,8 @@ def _compute_response_confidence(
     top_decision_score: float,
     top_decision: Optional[Dict[str, Any]],
     agreement_boost: float,
+    *,
+    decision_family_aligned: bool = True,
 ) -> float:
     base = 0.32
     ev = min(1.0, profile.total_evidence_weight / 8.0)
@@ -259,6 +266,8 @@ def _compute_response_confidence(
             base -= 0.22
         elif st == "partially_true":
             base -= 0.06
+    if not decision_family_aligned:
+        base -= 0.2
     if profile.total_evidence_weight < 0.85:
         base -= 0.14
     if profile.decision_entries_used == 0 and profile.style_entries_used == 0:
@@ -296,11 +305,17 @@ def generate_personal_response(
     s_rows = store.get_recent_style_memory(limit=style_fetch_limit)
     profile = build_personal_profile_from_rows(d_rows, s_rows)
 
-    d_ranked = retrieve_relevant_decision_memories(d_rows, text, top_k=6, min_score=0.35)
+    prompt_norm = normalize_input(text)
+
+    d_ranked = retrieve_relevant_decision_memories(d_rows, text, top_k=6, min_score=0.38)
     s_ranked = retrieve_relevant_style_memories(s_rows, text, top_k=4)
 
     top_d = d_ranked[0] if d_ranked else None
     top_score = top_d[1] if top_d else 0.0
+    top_family_aligned = (
+        top_d is not None
+        and personal_response_decision_families_aligned(prompt_norm, top_d[0])
+    )
     phrase_seed = hashlib.sha256(normalize_input(text).encode("utf-8")).hexdigest()[:24]
 
     agreement_boost = 0.0
@@ -310,12 +325,37 @@ def generate_personal_response(
         agree = sum(
             1
             for r, sc, _ in d_ranked[1:4]
-            if sc > 0.4 and top_tags & set(r.get("value_tags") or [])
+            if sc > 0.4
+            and top_tags & set(r.get("value_tags") or [])
+            and personal_response_decision_families_aligned(prompt_norm, r)
         )
         agreement_boost = min(1.0, agree * 0.34)
 
+    ordered_pf, _ = rank_families(prompt_norm)
+    primary_pf = ordered_pf[0][0] if ordered_pf else "general"
+    try:
+        raw_facts = store.get_recent_router_situation_facts(limit=28)
+    except Exception:
+        raw_facts = []
+    try:
+        tmap = store.get_router_tendency_map()
+    except Exception:
+        tmap = {}
+    rel_facts = filter_relevant_situation_facts(
+        raw_facts, primary_family=primary_pf, prompt_norm=prompt_norm
+    )
+    cross_boost = clarification_cross_evidence_boost(
+        prompt_norm, primary_pf, rel_facts, tmap
+    )
+    if cross_boost > 0:
+        agreement_boost = min(1.0, agreement_boost + cross_boost)
+
     conf = _compute_response_confidence(
-        profile, top_score, top_d[0] if top_d else None, agreement_boost
+        profile,
+        top_score,
+        top_d[0] if top_d else None,
+        agreement_boost,
+        decision_family_aligned=top_family_aligned,
     )
 
     verb = _verbosity_from_profile(profile)
@@ -335,6 +375,8 @@ def generate_personal_response(
     seen_sid = set()
     for row, sc, _ in d_ranked:
         if sc < 0.35:
+            continue
+        if not personal_response_decision_families_aligned(prompt_norm, row):
             continue
         sid = str(row.get("scenario_id") or "").strip() or "scenario"
         if sid in seen_sid:
@@ -395,8 +437,34 @@ def generate_personal_response(
                 pass
         break
 
+    if (
+        rel_facts
+        and cross_boost >= 0.07
+        and len(memory_basis) < 3
+    ):
+        slot_k = str(rel_facts[0].get("slot_key") or "x")
+        mb_cross = f"respond_mb_clarif_{slot_k}"
+        if not hasattr(store, "should_surface_memory_line") or store.should_surface_memory_line(
+            mb_cross
+        ):
+            xvar = (
+                "A recent clarification you gave on a similar kind of question lines up with this one.",
+                "Notes from a past decision check-in match the shape of what you’re asking now.",
+            )
+            memory_basis.append(xvar[_stable_index(f"{phrase_seed}:mbx", len(xvar))])
+            if hasattr(store, "record_memory_line_surface"):
+                try:
+                    store.record_memory_line_surface(mb_cross)
+                except Exception:
+                    pass
+
     # Compose answer
-    if top_d and top_score >= 0.58 and top_d[0].get("correction_status") != "not_really":
+    if (
+        top_d
+        and top_score >= 0.62
+        and top_family_aligned
+        and top_d[0].get("correction_status") != "not_really"
+    ):
         row = top_d[0]
         choice = str(row.get("choice_label") or "").strip()
         why = str(row.get("reasoning_label") or "").strip()
@@ -415,10 +483,33 @@ def generate_personal_response(
             "This leans on the saved decision that matched your words best, "
             "plus how you answered the interview prompts."
         )
+        if cross_boost >= 0.09:
+            reasoning += " Recent same-theme check-ins on file back that up a little."
         if agreement_boost >= 0.3:
             reasoning += " A few saves tagged the same values."
         if profile.has_trait_conflict:
             reasoning += " Your saves disagree a bit, so treat it as a rough guess."
+    elif (
+        top_d
+        and top_score >= 0.38
+        and not top_family_aligned
+        and top_d[0].get("correction_status") != "not_really"
+    ):
+        v = (
+            (
+                "The labeled saves on file aren’t really the same kind of situation as this one, "
+                "so I wouldn’t treat any single past choice as your answer here."
+            ),
+            (
+                "Nothing in your saved decisions matches this shape cleanly — I’d ignore the closest-looking save "
+                "for now and think from this moment instead."
+            ),
+        )
+        answer = v[_stable_index(phrase_seed + ":misalign", len(v))]
+        reasoning = (
+            "Closest entries are for a different problem family than this prompt, so I’m not mirroring them."
+        )
+        conf = min(conf, 0.36)
     elif profile.total_evidence_weight >= 1.2 and profile_hint:
         surf_ok = not hasattr(store, "should_surface_memory_line") or store.should_surface_memory_line(
             "respond_profile_fallback"
