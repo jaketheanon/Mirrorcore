@@ -23,6 +23,7 @@ from mirrorcore.decision.routed_clarification import (
     pick_next_question,
     rank_families,
     run_routed_decision_guidance,
+    sanitize_domain_order_for_obligation,
     score_decision_domains,
     score_dimensions,
 )
@@ -99,6 +100,35 @@ class TestOntology(unittest.TestCase):
         )
         self.assertEqual(ordered[0][0], OBLIGATION_OVERLOAD)
 
+    def test_mom_favor_drained_is_obligation_top(self):
+        ordered, _ = rank_families(
+            normalize_input(
+                "my mom wants a favor but im already drained what should i do"
+            )
+        )
+        self.assertEqual(ordered[0][0], OBLIGATION_OVERLOAD)
+
+    def test_malicious_domain_order_defers_conflict_for_shift_cover(self):
+        """Even if conflict was first, sanitize shifts it after obligation (Phase 34+)."""
+        text = normalize_input(
+            "a coworker needs me to cover a shift but im burnt out. what do i do?"
+        )
+        ordered, dims = rank_families(text)
+        bad_order = [CONFLICT_FAMILY, OBLIGATION_OVERLOAD, "general"]
+        fixed = sanitize_domain_order_for_obligation(text, dims, bad_order)
+        self.assertEqual(fixed[0], OBLIGATION_OVERLOAD)
+        self.assertEqual(fixed[-1], CONFLICT_FAMILY)
+        q = pick_next_question(
+            context_parts=[
+                "a coworker needs me to cover a shift but im burnt out. what do i do?"
+            ],
+            asked_ids=[],
+            domain_order=fixed,
+            dimensions=dims,
+        )
+        self.assertIsNotNone(q)
+        self.assertNotEqual(q.slot_id, "peace_vs_clarity")
+
 
 class TestEvidenceExtraction(unittest.TestCase):
     def test_bills_situation_fact(self):
@@ -149,6 +179,17 @@ class TestRouterMemoryStore(unittest.TestCase):
             ).fetchone()
             self.assertIsNotNone(row)
             self.assertLess(float(row["strength"]), 0.72)
+        finally:
+            store.close()
+
+    def test_profile_trait_surface_bucket_allows_once_then_blocks(self):
+        """Phase 34+: trait blurbs share one bucket — one show per window."""
+        store = DatabaseStore(self.db_path)
+        try:
+            store.initialize_database()
+            self.assertTrue(store.should_surface_memory_line("surface_profile_trait_snippet"))
+            store.record_memory_line_surface("surface_profile_trait_snippet")
+            self.assertFalse(store.should_surface_memory_line("surface_profile_trait_snippet"))
         finally:
             store.close()
 
@@ -244,6 +285,49 @@ class TestSlotWordingVariation(unittest.TestCase):
 
 
 class TestGuidanceWording(unittest.TestCase):
+    def test_phase34_no_generic_cautious_phrase(self):
+        """Overused cautious fallback line must not appear (Phase 34)."""
+        from unittest.mock import MagicMock
+
+        prof = MagicMock()
+        prof.total_evidence_weight = 1.4
+        prof.trait_estimates = [
+            MagicMock(name="risk_tolerance", confidence=0.55, weighted_mean=0.25),
+        ]
+        prof.decision_risk_summary.return_value = "leans cautious"
+        prof.value_tag_weights = []
+        g = build_routed_decision_guidance(
+            original_question="Should I buy this if rent is late?",
+            qa_pairs=[],
+            domain_order=[SPENDING],
+            profile=prof,
+            tendency_map={},
+            situation_repeat_counts={},
+        )
+        self.assertNotIn("call feels heavy", g.lower())
+
+    def test_phase34_surface_suppression_respects_store(self):
+        store = MagicMock()
+        store.should_surface_memory_line.return_value = False
+        prof = MagicMock()
+        prof.total_evidence_weight = 1.4
+        prof.trait_estimates = [
+            MagicMock(name="risk_tolerance", confidence=0.55, weighted_mean=0.25),
+        ]
+        prof.decision_risk_summary.return_value = "leans cautious"
+        prof.value_tag_weights = []
+        g = build_routed_decision_guidance(
+            original_question="Should I buy this if rent is late?",
+            qa_pairs=[],
+            domain_order=[SPENDING],
+            profile=prof,
+            tendency_map={},
+            situation_repeat_counts={},
+            surface_store=store,
+        )
+        self.assertNotIn("from older saves", g.lower())
+        store.record_memory_line_surface.assert_not_called()
+
     def test_housing_pattern_not_surfaced_without_money_context(self):
         g = build_routed_decision_guidance(
             original_question="Someone was rude to me at work",

@@ -10,10 +10,16 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 from ..persona.profile import PersonalProfile, build_personal_profile
 from ..router import normalize_input
+from .memory_relevance import (
+    profile_decision_speed_snippet_allowed,
+    profile_memory_fit_score,
+    profile_risk_snippet_allowed,
+    profile_value_tag_snippet_allowed,
+)
 from .ontology import (
     CONFLICT_FAMILY,
     CONVENIENCE_QUALITY,
@@ -22,16 +28,22 @@ from .ontology import (
     OBLIGATION_OVERLOAD,
     RISK_TIMING,
     SPENDING,
+    interpersonal_conflict_markers_present,
     rank_families_full,
     score_decision_domains as _ontology_score_decision_domains,
     score_dimensions,
+    score_ontology_axes,
     slot_ids_covered_by_context,
+    work_obligation_peer_shape,
 )
 
 # Phase 31 API alias (same as ontology.MONEY)
 MONEY = SPENDING
 
 MAX_CLARIFICATION_ROUNDS = 2
+
+# Buckets all “saved trait” profile blurbs for aggressive repetition control (Phase 34+).
+_PROFILE_SURFACE_BUCKET = "surface_profile_trait_snippet"
 
 
 def _stable_index(key: str, modulo: int) -> int:
@@ -157,7 +169,7 @@ def _all_slots() -> Tuple[ClarificationSlot, ...]:
             boost_dims=("overload",),
             question_variants=(
                 "Do you have enough gas left for this without wiping yourself out?",
-                "Realistically — do you have the bandwidth for this right now?",
+                "Realistically — do you have the room for this right now?",
             ),
         ),
         ClarificationSlot(
@@ -460,44 +472,151 @@ def _situation_counts_recent(store, limit: int = 30) -> Dict[str, int]:
 
 # --- Guidance (data-driven checks on merged context + memory) ---
 
-def _profile_lines(profile: Optional[PersonalProfile], seed: str) -> List[str]:
-    """At most one rotated line; higher evidence bar (Phase 32)."""
-    if not profile or profile.total_evidence_weight < 1.15:
+def sanitize_domain_order_for_obligation(
+    norm_text: str,
+    dimensions: Dict[str, float],
+    order: Sequence[str],
+) -> List[str]:
+    """Defer conflict slots when the ask is workplace/favor overload without conflict cues."""
+    if interpersonal_conflict_markers_present(norm_text):
+        return list(order)
+    if not work_obligation_peer_shape(norm_text, dimensions):
+        return list(order)
+    out: List[str] = []
+    deferred: List[str] = []
+    for fam in order:
+        if fam == CONFLICT_FAMILY:
+            deferred.append(fam)
+        else:
+            out.append(fam)
+    return out + deferred
+
+
+def _canonical_memory_surface_key(line_key: str) -> str:
+    if line_key.startswith("profile_"):
+        return _PROFILE_SURFACE_BUCKET
+    return line_key
+
+
+def _pick_best_keyed_line(
+    candidates: Sequence[Tuple[str, float, str]],
+    seed: str,
+    min_score: float,
+) -> Optional[Tuple[str, str]]:
+    """Highest relevance wins; deterministic tie-break. Returns (key, text) or None."""
+    strong = [(k, s, t) for k, s, t in candidates if s >= min_score]
+    if not strong:
+        return None
+    strong.sort(key=lambda x: (-x[1], x[0]))
+    top_s = strong[0][1]
+    tied = [x for x in strong if abs(x[1] - top_s) < 1e-9]
+    pick = tied[_stable_index(f"{seed}:tie", len(tied))]
+    return pick[0], pick[2]
+
+
+def _profile_line_candidates(
+    profile: Optional[PersonalProfile],
+    *,
+    primary_family: str,
+    initial_norm: str,
+    seed: str,
+) -> List[Tuple[str, float, str]]:
+    """Phase 34: keyed snippets with relevance scores (traits only when family/dims fit)."""
+    if not profile or profile.total_evidence_weight < 1.28:
         return []
-    candidates: List[str] = []
+    dims = score_dimensions(initial_norm)
+    axes = score_ontology_axes(initial_norm)
+    fit = profile_memory_fit_score(primary_family, initial_norm, dims, axes)
+    if fit < 0.58:
+        return []
+
+    out: List[Tuple[str, float, str]] = []
+
     risk = profile.decision_risk_summary()
     risk_ok = any(
-        t.name == "risk_tolerance" and t.confidence >= 0.48
+        t.name == "risk_tolerance" and t.confidence >= 0.52
         for t in profile.trait_estimates
     )
-    if risk and risk_ok:
+    if risk and risk_ok and profile_risk_snippet_allowed(primary_family, initial_norm, dims, axes):
+        rel = fit * 0.96
         if risk == "leans cautious":
-            risk_phrase = "often slow down when a call feels heavy"
+            phrases = (
+                (
+                    "profile_risk_cautious_a",
+                    "you usually take a breath before you lock in a big call",
+                ),
+                (
+                    "profile_risk_cautious_b",
+                    "you usually want a clear read on risk before you move",
+                ),
+                (
+                    "profile_risk_cautious_c",
+                    "you’ve often wanted a pause to think before you commit",
+                ),
+            )
+            kid, phrase = phrases[_stable_index(f"{seed}:risk_c", len(phrases))]
+            out.append(
+                (
+                    kid,
+                    rel,
+                    f"From older saves, {phrase} — only you know if this fits today.",
+                )
+            )
         elif risk == "leans risk-tolerant":
-            risk_phrase = "been okay taking bigger swings before"
+            out.append(
+                (
+                    "profile_risk_tolerant_a",
+                    rel * 0.98,
+                    "From older saves, you’ve been okay taking bigger swings before — "
+                    "only you know if this fits today.",
+                )
+            )
         else:
-            risk_phrase = risk
-        candidates.append(
-            f"From older saves, you {risk_phrase} — only you know if this fits today."
-        )
+            if fit >= 0.68:
+                out.append(
+                    (
+                        "profile_risk_plain",
+                        rel * 0.88,
+                        f"From older saves, you {risk} — only you know if this fits today.",
+                    )
+                )
+
     ds = next((t for t in profile.trait_estimates if t.name == "decision_speed"), None)
-    if ds and ds.confidence >= 0.48 and ds.weighted_mean <= 0.38:
-        candidates.append(
-            "Older answers suggest you like a beat before big calls — "
-            "that’s fine if nothing is actually on fire."
-        )
+    if ds and ds.confidence >= 0.52 and ds.weighted_mean <= 0.38:
+        if profile_decision_speed_snippet_allowed(primary_family, initial_norm, dims):
+            speed_variants = (
+                (
+                    "profile_decision_speed_a",
+                    fit * 0.9,
+                    "Older answers suggest you like a pause before big calls — "
+                    "that’s fine if nothing is actually on fire.",
+                ),
+                (
+                    "profile_decision_speed_b",
+                    fit * 0.9,
+                    "Older answers point toward stepping back before you lock something in — "
+                    "fine unless something’s truly urgent.",
+                ),
+            )
+            k, sc, tx = speed_variants[_stable_index(f"{seed}:ds", len(speed_variants))]
+            out.append((k, sc, tx))
+
     vt = profile.value_tag_weights[:6]
     if any(
-        ("regret" in x[0].lower() or "security" in x[0].lower()) and x[1] >= 1.15
+        ("regret" in x[0].lower() or "security" in x[0].lower()) and x[1] >= 1.22
         for x in vt
     ):
-        candidates.append(
-            "You’ve leaned toward playing it safe before — weigh that against what you’d give up here."
-        )
-    if not candidates:
-        return []
-    idx = _stable_index(f"{seed}:profile_line", len(candidates))
-    return [candidates[idx]]
+        if profile_value_tag_snippet_allowed(primary_family) and fit >= 0.52:
+            out.append(
+                (
+                    "profile_value_safe",
+                    fit * 0.84,
+                    "You’ve leaned toward playing it safe before — "
+                    "weigh that against what you’d give up here.",
+                )
+            )
+
+    return out
 
 
 def _current_money_context_strong(norm_text: str) -> bool:
@@ -552,20 +671,22 @@ def _obligation_overlap_strong(norm_text: str, dims: Dict[str, float]) -> bool:
     return sum(1 for c in cues if c in padded or c.strip() in norm_text) >= 2
 
 
-def _tendency_lines(
+def _tendency_line_candidates(
     tmap: Dict[str, float],
     *,
     primary_family: str,
     initial_norm: str,
     seed: str,
-) -> List[str]:
-    lines: List[str] = []
+) -> List[Tuple[str, float, str]]:
+    """Phase 34: scored tendency snippets — only when family + strength fit."""
     dims0 = score_dimensions(initial_norm)
-    t_guilt = 0.42
-    t_regret = 0.42
-    t_energy = 0.42
+    axes0 = score_ontology_axes(initial_norm)
+    fit = profile_memory_fit_score(primary_family, initial_norm, dims0, axes0)
+    out: List[Tuple[str, float, str]] = []
 
-    if tmap.get("tendency_guilt_about_no", 0) >= t_guilt:
+    g = float(tmap.get("tendency_guilt_about_no", 0.0))
+    t_guilt = 0.5
+    if g >= t_guilt:
         if _obligation_overlap_strong(initial_norm, dims0) and (
             primary_family in (OBLIGATION_OVERLOAD, LOYALTY_BOUNDARY)
             or (
@@ -573,44 +694,95 @@ def _tendency_lines(
                 and dims0.get("obligation", 0) + dims0.get("overload", 0) >= 1.35
             )
         ):
-            lines.append(
-                "You’ve worried a lot about saying no before — check if that’s guilt or real fallout."
+            out.append(
+                (
+                    "tendency_guilt_no",
+                    g * fit * 1.05,
+                    "You’ve worried a lot about saying no before — check if that’s guilt or real fallout.",
+                )
             )
-    if tmap.get("tendency_regret_if_yes", 0) >= t_regret:
+
+    r = float(tmap.get("tendency_regret_if_yes", 0.0))
+    t_regret = 0.5
+    if r >= t_regret:
         if primary_family in (OBLIGATION_OVERLOAD, LOYALTY_BOUNDARY):
-            lines.append(
-                "You’ve said yes before and felt bitter after — if that feeling’s back, take it seriously."
+            out.append(
+                (
+                    "tendency_regret_yes",
+                    r * fit * 1.05,
+                    "You’ve said yes before and felt bitter after — if that feeling’s back, take it seriously.",
+                )
             )
         elif primary_family == CONFLICT_FAMILY and dims0.get("regret_risk", 0) >= 0.95:
-            lines.append(
-                "You’ve said yes before and felt bitter after — if that feeling’s back, take it seriously."
+            out.append(
+                (
+                    "tendency_regret_yes_cf",
+                    r * fit * 1.02,
+                    "You’ve said yes before and felt bitter after — if that feeling’s back, take it seriously.",
+                )
             )
-        elif _obligation_overlap_strong(initial_norm, dims0) and dims0.get("regret_risk", 0) >= 0.55:
-            lines.append(
-                "You’ve said yes before and felt bitter after — if that feeling’s back, take it seriously."
+        elif _obligation_overlap_strong(initial_norm, dims0) and dims0.get("regret_risk", 0) >= 0.62:
+            out.append(
+                (
+                    "tendency_regret_yes_ob",
+                    r * fit * 0.95,
+                    "You’ve said yes before and felt bitter after — if that feeling’s back, take it seriously.",
+                )
             )
-    if tmap.get("tendency_low_energy_guard", 0) >= t_energy:
+
+    e = float(tmap.get("tendency_low_energy_guard", 0.0))
+    t_energy = 0.5
+    if e >= t_energy:
         if primary_family == CONFLICT_FAMILY and dims0.get("overload", 0) < 0.85:
             pass
         elif primary_family == OBLIGATION_OVERLOAD or dims0.get("overload", 0) >= 0.95:
-            lines.append(
-                "You’ve been wiped in similar spots — piling on another full yes usually doesn’t age well."
+            out.append(
+                (
+                    "tendency_low_energy",
+                    e * fit * 1.02,
+                    "You’ve been wiped in similar spots — piling on another full yes usually doesn’t age well.",
+                )
             )
-    if len(lines) > 1:
-        pick = _stable_index(f"{seed}:tendency", len(lines))
-        return [lines[pick]]
-    return lines
+
+    return out
 
 
-def _pattern_repeat_line(counts: Dict[str, int], primary_family: str) -> Optional[str]:
+def _pattern_repeat_line_keyed(
+    counts: Dict[str, int], primary_family: str
+) -> Optional[Tuple[str, str]]:
     if primary_family != SPENDING:
         return None
     if counts.get("housing_bill_pressure=open", 0) >= 3:
         return (
+            "pattern_rent_stress",
             "Rent or bill stress has shown up a few times in past clarifications — "
-            "worth treating that as a pattern, not a one-off bad week."
+            "worth treating that as a pattern, not a one-off bad week.",
         )
     return None
+
+
+def _append_surface_line(
+    bodies: List[str],
+    line_key: str,
+    text: str,
+    surface_store,
+) -> None:
+    if not text.strip():
+        return
+    canon = _canonical_memory_surface_key(line_key)
+    if surface_store is None:
+        bodies.append(text)
+        return
+    should_fn = getattr(surface_store, "should_surface_memory_line", None)
+    if callable(should_fn) and not should_fn(canon):
+        return
+    bodies.append(text)
+    rec = getattr(surface_store, "record_memory_line_surface", None)
+    if callable(rec):
+        try:
+            rec(canon)
+        except Exception:
+            pass
 
 
 def build_routed_decision_guidance(
@@ -621,10 +793,16 @@ def build_routed_decision_guidance(
     profile: Optional[PersonalProfile],
     tendency_map: Optional[Dict[str, float]] = None,
     situation_repeat_counts: Optional[Dict[str, int]] = None,
+    surface_store: Optional[Any] = None,
 ) -> str:
     parts_ctx = [original_question] + [a for _, a in qa_pairs]
     ctx = _padded_ctx(parts_ctx)
-    primary = domain_order[0] if domain_order else GENERAL
+    merged_norm = normalize_input(" ".join(parts_ctx))
+    dims_order = score_dimensions(merged_norm)
+    order_list = sanitize_domain_order_for_obligation(
+        merged_norm, dims_order, list(domain_order)
+    )
+    primary = order_list[0] if order_list else GENERAL
     tendency_map = tendency_map or {}
     counts = situation_repeat_counts or {}
     phrase_seed = hashlib.sha256(
@@ -642,84 +820,185 @@ def build_routed_decision_guidance(
             )
         )
         if unpaid and ("rent" in ctx or "bill" in ctx or "housing" in ctx):
-            bodies.append(
-                "If rent or core bills are still open, a big buy hits the sorest spot first. "
-                "That doesn’t mean never — it means get basics steadier first, unless this buy is how you keep income or pass something you can’t move."
+            v = (
+                (
+                    "If rent or core bills are still open, a big buy hits the sorest spot first. "
+                    "That doesn’t mean never — it means get basics steadier first, unless this buy is how you keep income or pass something you can’t move."
+                ),
+                (
+                    "When rent or core bills are still open, a big purchase lands on the tenderest spot. "
+                    "Steady the basics first unless this buy protects income or clears a hard blocker you can’t route around."
+                ),
             )
+            bodies.append(v[_stable_index(f"{phrase_seed}:sp_unpaid", len(v))])
         elif " need " in ctx or "need for" in ctx or "mostly need" in ctx or ("school" in ctx and "want" not in ctx):
-            bodies.append(
-                "If it’s a real need for work or school, treat it like gear: what’s the cheapest setup that still works, what’s one step up, and is the extra cash worth it."
+            v = (
+                (
+                    "If it’s a real need for work or school, treat it like gear: what’s the cheapest setup that still works, what’s one step up, and is the extra cash worth it."
+                ),
+                (
+                    "If it’s a real need for work or school, think like tools: what’s the minimum that works, what’s one upgrade, and is the extra money worth it."
+                ),
             )
+            bodies.append(v[_stable_index(f"{phrase_seed}:sp_need", len(v))])
         elif " want " in ctx or "mostly want" in ctx or "luxury" in ctx:
-            bodies.append(
-                "If it’s mostly a want while cash is tight, waiting isn’t weak — it’s space to choose without boxing yourself in. Pick a date to check again."
+            v = (
+                (
+                    "If it’s mostly a want while cash is tight, waiting isn’t weak — it’s space to choose without boxing yourself in. Pick a date to check again."
+                ),
+                (
+                    "If it’s mostly a want while money is tight, waiting buys room to choose without trapping yourself. Set a date to revisit it."
+                ),
             )
+            bodies.append(v[_stable_index(f"{phrase_seed}:sp_want", len(v))])
         else:
-            bodies.append(
-                "Money stuff is easier when food, rent, and getting around are honest first. If those wobble, trim the spend or wait until one layer feels steadier."
+            v = (
+                (
+                    "Money stuff is easier when food, rent, and getting around are honest first. If those wobble, trim the spend or wait until one layer feels steadier."
+                ),
+                (
+                    "Money feels clearer when food, rent, and transport are sorted first. If those wobble, trim the spend or wait until one layer feels steadier."
+                ),
             )
+            bodies.append(v[_stable_index(f"{phrase_seed}:sp_def", len(v))])
     elif primary == OBLIGATION_OVERLOAD:
         if "low" in ctx and ("energy" in ctx or "exhaust" in ctx):
-            bodies.append(
-                "If you’re out of gas, the kind move is a smaller yes, a later yes, or a short honest no — not a hero yes you’ll hate later."
+            v = (
+                (
+                    "If you’re out of gas, the kind move is a smaller yes, a later yes, or a short honest no — not a hero yes you’ll hate later."
+                ),
+                (
+                    "If you’re out of gas, the kind move is a smaller yes, a later yes, or a straight no — not a hero yes you’ll resent."
+                ),
             )
+            bodies.append(v[_stable_index(f"{phrase_seed}:ob_low", len(v))])
         else:
-            bodies.append(
-                "Helping people works better when you know your real line before you answer. A plain ‘here’s what I can do’ beats a full yes you’ll resent."
+            v = (
+                (
+                    "Helping people works better when you know your real line before you answer. A plain ‘here’s what I can do’ beats a full yes you’ll resent."
+                ),
+                (
+                    "Helping lands cleaner when you know your line before you answer. A simple ‘here’s what I can do’ beats a full yes you’ll resent."
+                ),
             )
+            bodies.append(v[_stable_index(f"{phrase_seed}:ob_def", len(v))])
     elif primary == CONFLICT_FAMILY:
         if "peace" in ctx or "quiet" in ctx or "avoid" in ctx:
-            bodies.append(
-                "If calm matters most, small steady limits usually beat one huge blow-up. You can stay decent and still say what you won’t take."
+            v = (
+                (
+                    "If calm matters most, small steady limits usually beat one huge blow-up. You can stay decent and still say what you won’t take."
+                ),
+                (
+                    "If keeping the peace matters most, small steady limits usually beat one huge blow-up. You can stay decent and still say what you won’t take."
+                ),
             )
+            bodies.append(v[_stable_index(f"{phrase_seed}:cf_peace", len(v))])
         elif "say" in ctx or "clear" in ctx or "honest" in ctx:
-            bodies.append(
-                "If something needs saying, one clear point and one example beats a long speech. Say what you want next time, not your whole life story."
+            v = (
+                (
+                    "If something needs saying, one clear point and one example beats a long speech. Say what you want next time, not your whole life story."
+                ),
+                (
+                    "If something needs saying, one clear point and one example beats a long speech. Name what you want next time, not your whole history."
+                ),
             )
+            bodies.append(v[_stable_index(f"{phrase_seed}:cf_say", len(v))])
         else:
-            bodies.append(
-                "This is mostly about what you can live with afterward. Decide if you want things fixed, some distance, or just straight talk — those take different moves."
+            v = (
+                (
+                    "This is mostly about what you can live with afterward. Decide if you want things fixed, some distance, or just straight talk — those take different moves."
+                ),
+                (
+                    "This is mostly about what you can live with afterward. Decide if you want repair, distance, or straight talk — those take different moves."
+                ),
             )
+            bodies.append(v[_stable_index(f"{phrase_seed}:cf_def", len(v))])
     elif primary == RISK_TIMING:
-        bodies.append(
-            "Split real deadlines from nerves. If waiting doesn’t break anything, use the pause to grab one missing fact. If there’s a real cutoff, count backward from it."
+        v = (
+            (
+                "Split real deadlines from nerves. If waiting doesn’t break anything, use the pause to grab one missing fact. If there’s a real cutoff, count backward from it."
+            ),
+            (
+                "Split real deadlines from nerves. If waiting won’t break anything, use the pause to grab one missing fact. If there’s a real cutoff, count backward from it."
+            ),
         )
+        bodies.append(v[_stable_index(f"{phrase_seed}:rt_main", len(v))])
         if "low" in ctx and "revers" in ctx:
-            bodies.append(
-                "Hard-to-undo choices deserve a slower yes; easy-to-undo ones can be small tries."
+            v2 = (
+                (
+                    "Hard-to-undo choices deserve a slower yes; easy-to-undo ones can be small tries."
+                ),
+                (
+                    "Hard-to-undo choices deserve a slower yes; easy-to-undo ones can be small experiments."
+                ),
             )
+            bodies.append(v2[_stable_index(f"{phrase_seed}:rt_rev", len(v2))])
     elif primary == LOYALTY_BOUNDARY:
-        bodies.append(
-            "Being loyal doesn’t have to mean wiping yourself out. If yes costs sleep, money, or self-respect every time, the habit is the issue — not only this one ask."
+        v = (
+            (
+                "Being loyal doesn’t have to mean wiping yourself out. If yes costs sleep, money, or self-respect every time, the habit is the issue — not only this one ask."
+            ),
+            (
+                "Being loyal doesn’t have to mean wiping yourself out. If yes costs sleep, money, or self-respect every time, the pattern is the issue — not only this one ask."
+            ),
         )
+        bodies.append(v[_stable_index(f"{phrase_seed}:lb", len(v))])
     elif primary == CONVENIENCE_QUALITY:
-        bodies.append(
-            "When fast fights ‘do it right,’ try the smallest step that still shows if the careful path is worth it — don’t let rush lock you into fix-it-twice work."
+        v = (
+            (
+                "When fast fights ‘do it right,’ try the smallest step that still shows if the careful path is worth it — don’t let rush lock you into fix-it-twice work."
+            ),
+            (
+                "When fast fights ‘do it right,’ try the smallest step that still shows if the careful path is worth it — don’t let hurry lock you into doing it twice."
+            ),
         )
+        bodies.append(v[_stable_index(f"{phrase_seed}:cq", len(v))])
     else:
-        bodies.append(
-            "Pick what you’d stand by with a friend who’s on your side — not the story that only sounds good when you’re tired. If both choices hurt, guard what’s costly to undo."
+        v = (
+            (
+                "Pick what you’d stand by with a friend who’s on your side — not the story that only sounds good when you’re tired. If both choices hurt, guard what’s costly to undo."
+            ),
+            (
+                "Pick what you’d stand by with a friend who’s on your side — not the story that only sounds good when you’re tired. If both choices hurt, protect what’s hard to take back."
+            ),
         )
+        bodies.append(v[_stable_index(f"{phrase_seed}:gen", len(v))])
 
     initial_norm = normalize_input(original_question)
-    extra = (
-        _pattern_repeat_line(counts, primary)
+    pattern_prefix: List[str] = []
+    pattern_keyed = (
+        _pattern_repeat_line_keyed(counts, primary)
         if _current_money_context_strong(initial_norm)
         else None
     )
-    if extra:
-        bodies.insert(0, extra)
-
-    bodies.extend(
-        _tendency_lines(
-            tendency_map,
-            primary_family=primary,
-            initial_norm=initial_norm,
-            seed=phrase_seed,
+    if pattern_keyed:
+        _append_surface_line(
+            pattern_prefix, pattern_keyed[0], pattern_keyed[1], surface_store
         )
+
+    tend_cands = _tendency_line_candidates(
+        tendency_map,
+        primary_family=primary,
+        initial_norm=initial_norm,
+        seed=phrase_seed,
     )
-    bodies.extend(_profile_lines(profile, phrase_seed))
-    return "\n\n".join(bodies)
+    picked_t = _pick_best_keyed_line(tend_cands, f"{phrase_seed}:tend", min_score=0.28)
+    memory_tail: List[str] = []
+    if picked_t:
+        _append_surface_line(memory_tail, picked_t[0], picked_t[1], surface_store)
+
+    prof_cands = _profile_line_candidates(
+        profile,
+        primary_family=primary,
+        initial_norm=initial_norm,
+        seed=phrase_seed,
+    )
+    picked_p = _pick_best_keyed_line(prof_cands, f"{phrase_seed}:prof", min_score=0.55)
+    if picked_p:
+        _append_surface_line(memory_tail, picked_p[0], picked_p[1], surface_store)
+
+    merged = pattern_prefix + bodies + memory_tail
+    return "\n\n".join(merged)
 
 
 def run_routed_decision_guidance(
@@ -741,6 +1020,8 @@ def run_routed_decision_guidance(
             order.append(fam)
     if GENERAL not in order:
         order.append(GENERAL)
+
+    order = sanitize_domain_order_for_obligation(norm, dimensions, order)
 
     try:
         profile = build_personal_profile(db_store)
@@ -805,6 +1086,7 @@ def run_routed_decision_guidance(
         profile=profile,
         tendency_map=tendency_map,
         situation_repeat_counts=repeat_counts,
+        surface_store=db_store,
     )
 
 

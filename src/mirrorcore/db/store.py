@@ -49,6 +49,7 @@ class DatabaseStore:
         self.ensure_phase28_style_memory()
         self.ensure_phase30_1_interview_rotation_state()
         self.ensure_phase31_2_decision_router_memory()
+        self.ensure_phase34_memory_line_surface()
 
     def initialize_database(self):
         """Initialize the database with all required tables.
@@ -192,6 +193,76 @@ class DatabaseStore:
             "ON decision_router_situation_facts(slot_key)"
         )
         conn.commit()
+
+    def ensure_phase34_memory_line_surface(self):
+        """Phase 34: log surfaced memory-line keys for repetition control."""
+        conn = self.get_db_connection()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_line_surface_events (
+                id TEXT PRIMARY KEY,
+                line_key TEXT NOT NULL,
+                shown_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_line_surface_time "
+            "ON memory_line_surface_events(shown_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_line_surface_key "
+            "ON memory_line_surface_events(line_key)"
+        )
+        conn.commit()
+
+    def count_recent_memory_line_surfaces(self, line_key: str, window: int = 24) -> int:
+        """How often ``line_key`` appears among the last ``window`` surfaces (all keys)."""
+        conn = self.get_db_connection()
+        rows = conn.execute(
+            """
+            SELECT line_key FROM memory_line_surface_events
+            ORDER BY shown_at DESC LIMIT ?
+            """,
+            (window,),
+        ).fetchall()
+        return sum(1 for r in rows if r["line_key"] == line_key)
+
+    def should_surface_memory_line(
+        self, line_key: str, *, max_in_window: int = 1, window: int = 40
+    ) -> bool:
+        """True if this line has not been overused in the recent global window."""
+        return self.count_recent_memory_line_surfaces(line_key, window) < max_in_window
+
+    def record_memory_line_surface(self, line_key: str) -> None:
+        """Append one surface event and prune old rows."""
+        conn = self.get_db_connection()
+        conn.execute(
+            """
+            INSERT INTO memory_line_surface_events (id, line_key, shown_at)
+            VALUES (?, ?, ?)
+            """,
+            (str(uuid4()), line_key, datetime.utcnow().isoformat()),
+        )
+        self._prune_memory_line_surface_events(conn)
+        conn.commit()
+
+    def _prune_memory_line_surface_events(self, conn: sqlite3.Connection, keep_last: int = 2000) -> None:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM memory_line_surface_events"
+        ).fetchone()
+        if not row or int(row["n"]) <= keep_last + 400:
+            return
+        excess = int(row["n"]) - keep_last
+        conn.execute(
+            """
+            DELETE FROM memory_line_surface_events WHERE id IN (
+                SELECT id FROM memory_line_surface_events
+                ORDER BY shown_at ASC LIMIT ?
+            )
+            """,
+            (excess,),
+        )
 
     def get_next_decision_interview_rotation_index(self) -> int:
         """Return the next persisted rotation index for interview scenarios.

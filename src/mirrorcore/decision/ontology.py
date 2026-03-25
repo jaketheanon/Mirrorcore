@@ -668,6 +668,144 @@ def evaluate_decision_signals(norm_text: str) -> DecisionSignals:
 
 # --- Post-rules (kept callable from routed_clarification) ---
 
+# Only treat as interpersonal *conflict* when these show up — not mere "coworker" / peer reference.
+_INTERPERSONAL_CONFLICT_MARKERS: Tuple[str, ...] = (
+    " rude ",
+    " rudely ",
+    " disrespect",
+    " unfair",
+    " argument",
+    " fight",
+    " bothered",
+    " bother me",
+    " talk shit",
+    " gossip",
+    " let it go",
+    " say something",
+    " cross the line",
+    " crossed the line",
+    " hurt my feelings",
+    " insult",
+    "two faced",
+    "two-faced",
+    " trash talk",
+    " badmouth",
+)
+
+
+def interpersonal_conflict_markers_present(norm_text: str) -> bool:
+    """Explicit upset / confrontation wording — not workplace obligation alone."""
+    padded = f" {norm_text} "
+    for m in _INTERPERSONAL_CONFLICT_MARKERS:
+        if m in padded or m.strip() in norm_text:
+            return True
+    return False
+
+
+def work_obligation_peer_shape(norm_text: str, dimensions: Dict[str, float]) -> bool:
+    """
+    Peer/family + cover/shift/favor ask + fatigue — should stay in obligation/overload
+    routing, not conflict, unless interpersonal conflict markers are present.
+    """
+    padded = f" {norm_text} "
+    strain = (
+        dimensions.get("overload", 0) >= 0.55
+        or dimensions.get("obligation", 0) >= 0.45
+        or any(
+            x in padded
+            for x in (
+                " exhausted",
+                " burnt out",
+                " burned out",
+                " drained",
+                " overwhelmed",
+                " no energy",
+                " too tired",
+                " burnout",
+            )
+        )
+    )
+    if not strain:
+        return False
+
+    peer = any(
+        x in padded
+        for x in (
+            " coworker ",
+            " colleague ",
+            " boss ",
+            " teammate ",
+            " manager ",
+        )
+    ) or norm_text.startswith(("coworker ", "colleague "))
+    work_ask = any(
+        x in padded or x in norm_text
+        for x in (
+            " shift ",
+            " cover ",
+            " covering ",
+            " overtime ",
+            " extra hours ",
+            "pick up a shift",
+            "cover a shift",
+            "cover for",
+            "covering for",
+            " asked me ",
+            " asking me ",
+            " needs me ",
+            " want me to ",
+            " wants me ",
+            " favor ",
+            " favour ",
+        )
+    )
+    path_peer = bool(peer and work_ask)
+
+    family_favor = any(
+        x in padded
+        for x in (
+            " my mom ",
+            " my mother ",
+            " my dad ",
+            " my father ",
+            " mom wants",
+            " mother wants",
+            " dad wants",
+            " parent ",
+        )
+    )
+    favor_verb = any(
+        x in padded
+        for x in (
+            " favor ",
+            " favour ",
+            " asking me ",
+            " needs me to ",
+            " want me to ",
+            " wants me ",
+            " ask me to ",
+        )
+    )
+    path_family = bool(family_favor and favor_verb)
+
+    return path_peer or path_family
+
+
+def apply_work_obligation_demotion_to_conflict(
+    norm_text: str, dimensions: Dict[str, float], scores: MutableMapping[str, float],
+) -> None:
+    """Strip conflict mass from coworker + shift/favor + fatigue without conflict cues."""
+    if interpersonal_conflict_markers_present(norm_text):
+        return
+    if not work_obligation_peer_shape(norm_text, dimensions):
+        return
+    c = scores.get(CONFLICT_FAMILY, 0.0)
+    if c <= 0:
+        return
+    scores[CONFLICT_FAMILY] = c * 0.08
+    scores[OBLIGATION_OVERLOAD] = scores.get(OBLIGATION_OVERLOAD, 0) + 1.85
+
+
 _OBLIGATION_OVERLOAD_CUES: Tuple[str, ...] = (
     " exhausted",
     " burnout",
@@ -700,6 +838,7 @@ _OBLIGATION_OVERLOAD_CUES: Tuple[str, ...] = (
 def boost_obligation_for_cover_shift_fatigue(
     norm_text: str,
     dimensions: Dict[str, float],
+    axes: Dict[str, float],
     scores: MutableMapping[str, float],
 ) -> None:
     """Workplace cover/shift + fatigue → obligation-overload, not raw conflict."""
@@ -732,12 +871,17 @@ def boost_obligation_for_cover_shift_fatigue(
             "covering for",
         )
     )
-    strain = dimensions.get("overload", 0) >= 0.95 or dimensions.get("obligation", 0) >= 0.55
+    strain = (
+        dimensions.get("overload", 0) >= 0.85
+        or dimensions.get("obligation", 0) >= 0.45
+        or axes.get(AXIS_OVERLOAD_BURNOUT, 0) >= 0.95
+        or axes.get(AXIS_WORK_OBLIGATION, 0) >= 0.85
+    )
     if not (peer and shift_like and strain):
         return
-    scores[OBLIGATION_OVERLOAD] = scores.get(OBLIGATION_OVERLOAD, 0) + 2.75
+    scores[OBLIGATION_OVERLOAD] = scores.get(OBLIGATION_OVERLOAD, 0) + 3.35
     if dimensions.get("interpersonal_hurt", 0) < 0.55:
-        scores[CONFLICT_FAMILY] = scores.get(CONFLICT_FAMILY, 0) * 0.62
+        scores[CONFLICT_FAMILY] = scores.get(CONFLICT_FAMILY, 0) * 0.55
 
 
 def social_conflict_without_obligation(norm_text: str, dimensions: Dict[str, float]) -> bool:
@@ -798,10 +942,11 @@ def rank_families_full(
     """
     sig = evaluate_decision_signals(norm_text)
     raw = dict(sig.family_scores)
-    boost_obligation_for_cover_shift_fatigue(norm_text, sig.dimensions, raw)
+    boost_obligation_for_cover_shift_fatigue(norm_text, sig.dimensions, sig.axes, raw)
     adjust_family_scores_for_social_conflict(norm_text, sig.dimensions, raw)
     mom_favor_drained_boost(norm_text, raw)
     risk_wait_tension_boost(norm_text, raw)
+    apply_work_obligation_demotion_to_conflict(norm_text, sig.dimensions, raw)
     ordered = order_family_scores(raw)
     return ordered, sig.dimensions, sig.axes
 

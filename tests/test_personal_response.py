@@ -121,6 +121,7 @@ class TestRetrieval(unittest.TestCase):
             [rent_row, social_row],
             "Someone was rude to me at work what should I do",
             top_k=2,
+            min_score=0.0,
         )
         self.assertEqual(ranked[0][0]["id"], "s1")
         self.assertLess(ranked[1][1], ranked[0][1])
@@ -156,8 +157,12 @@ class TestRetrieval(unittest.TestCase):
                 "confidence_score": 0.8,
             },
         ]
-        a = retrieve_relevant_decision_memories(rows, "expensive purchase want", top_k=2)
-        b = retrieve_relevant_decision_memories(rows, "expensive purchase want", top_k=2)
+        a = retrieve_relevant_decision_memories(
+            rows, "expensive purchase want", top_k=2, min_score=0.0
+        )
+        b = retrieve_relevant_decision_memories(
+            rows, "expensive purchase want", top_k=2, min_score=0.0
+        )
         self.assertEqual([x[0]["id"] for x in a], [x[0]["id"] for x in b])
 
     def test_accurate_boosts_rank(self):

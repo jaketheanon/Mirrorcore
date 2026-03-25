@@ -273,6 +273,15 @@ def initialize_database(conn: sqlite3.Connection):
         )
     """)
 
+    # Phase 34 — repetition control for memory / profile lines in guidance + respond
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_line_surface_events (
+            id TEXT PRIMARY KEY,
+            line_key TEXT NOT NULL,
+            shown_at TEXT NOT NULL
+        )
+    """)
+
     # Create indexes for performance
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_persona_profile_trait_name ON persona_profile(trait_name)",
@@ -297,6 +306,8 @@ def initialize_database(conn: sqlite3.Connection):
         "CREATE INDEX IF NOT EXISTS idx_style_memory_source ON style_memory(source)",
         "CREATE INDEX IF NOT EXISTS idx_decision_router_situation_ts ON decision_router_situation_facts(timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_decision_router_situation_key ON decision_router_situation_facts(slot_key)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_line_surface_time ON memory_line_surface_events(shown_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_line_surface_key ON memory_line_surface_events(line_key)",
     ]
     
     for index_sql in indexes:
