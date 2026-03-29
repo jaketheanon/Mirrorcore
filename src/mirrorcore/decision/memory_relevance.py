@@ -8,11 +8,13 @@ from __future__ import annotations
 from typing import Any, Dict, Mapping, Optional
 
 from .ontology import (
+    AXIS_BACKCHANNEL_HURT,
     AXIS_BILLS_FINANCIAL_PRESSURE,
     AXIS_CONFLICT_CONFRONTATION,
     AXIS_HELPING_FAVOR,
     AXIS_LOYALTY_VS_SELF,
     AXIS_MONEY_SPENDING,
+    AXIS_NEED_VS_WANT,
     AXIS_OVERLOAD_BURNOUT,
     AXIS_TIMING_WAIT_VS_ACT,
     AXIS_UNCERTAINTY_RISK,
@@ -28,6 +30,149 @@ from .ontology import (
     score_ontology_axes,
 )
 from ..router import normalize_input
+
+# --- Respond-like-me subshape (same family is not always same situation) ---
+
+
+def gossip_or_backchannel_user_prompt(norm_text: str) -> bool:
+    """Trash-talk / behind-the-back phrasing (normalized text)."""
+    padded = f" {norm_text} "
+    return any(
+        m in padded or m.strip() in norm_text
+        for m in (
+            " behind ",
+            " gossip",
+            " trash ",
+            " trash talk",
+            " talk shit",
+            " talking shit",
+            " shit ",
+            " badmouth",
+            " rumor",
+            " rumour",
+            " two faced",
+            " two-faced",
+        )
+    )
+
+
+def _gossip_or_backchannel_prompt(norm_text: str) -> bool:
+    return gossip_or_backchannel_user_prompt(norm_text)
+
+
+def _row_supports_backchannel_conflict(
+    row_norm: str, ar: Mapping[str, float]
+) -> bool:
+    if float(ar.get(AXIS_BACKCHANNEL_HURT, 0) or 0) >= 1.02:
+        return True
+    padded = f" {row_norm} "
+    return any(
+        m in padded or m.strip() in row_norm
+        for m in (
+            " behind ",
+            " behind your back",
+            " gossip",
+            " trash ",
+            " badmouth",
+            " rumor",
+            " rumour",
+            " two faced",
+            "two-faced",
+            "talk directly",
+            "address it",
+            " confront",
+            "say something",
+            "clear the air",
+        )
+    )
+
+
+def _spending_pressure_prompt(
+    dp: Mapping[str, float], prompt_norm: str
+) -> bool:
+    if float(dp.get("money_pressure", 0) or 0) >= 0.72:
+        return True
+    return any(
+        x in prompt_norm
+        for x in (
+            "rent",
+            "bill",
+            "$",
+            "afford",
+            "broke",
+            "debt",
+            "salary",
+            "pay ",
+            " late",
+            "laptop",
+        )
+    )
+
+
+def _row_has_money_decision_shape(
+    ar: Mapping[str, float], dr: Mapping[str, float], row_norm: str
+) -> bool:
+    ax = (
+        float(ar.get(AXIS_BILLS_FINANCIAL_PRESSURE, 0) or 0) * 1.05
+        + float(ar.get(AXIS_MONEY_SPENDING, 0) or 0)
+        + float(ar.get(AXIS_NEED_VS_WANT, 0) or 0) * 0.9
+    )
+    if ax >= 1.18:
+        return True
+    dims = float(dr.get("money_pressure", 0) or 0) + float(
+        dr.get("need_vs_want_signal", 0) or 0
+    )
+    if dims >= 1.22:
+        return True
+    if any(
+        x in row_norm
+        for x in (
+            "rent",
+            "bill",
+            "$",
+            "afford",
+            "pay",
+            "debt",
+            "broke",
+            "salary",
+            "save money",
+            "spend",
+            "need the money",
+            "need vs want",
+        )
+    ):
+        return ax >= 0.52
+    return False
+
+
+def _apply_respond_subshape_penalties(
+    prompt_norm: str,
+    row_norm: str,
+    top_p: str,
+    top_r: str,
+    dp: Mapping[str, float],
+    dr: Mapping[str, float],
+    ar: Mapping[str, float],
+    base: float,
+) -> float:
+    b = float(base)
+    if top_p == CONFLICT_FAMILY and _gossip_or_backchannel_prompt(prompt_norm):
+        if not _row_supports_backchannel_conflict(row_norm, ar):
+            b = min(b, 0.18)
+    if top_p == SPENDING and _spending_pressure_prompt(dp, prompt_norm):
+        has_money = _row_has_money_decision_shape(ar, dr, row_norm)
+        if top_r == RISK_TIMING and not has_money:
+            b = min(b, 0.1)
+        elif (
+            top_r == GENERAL
+            and float(ar.get(AXIS_TIMING_WAIT_VS_ACT, 0) or 0) >= 1.15
+            and not has_money
+        ):
+            b = min(b, 0.12)
+        if top_r == CONFLICT_FAMILY and float(dp.get("money_pressure", 0) or 0) >= 0.55:
+            b = min(b, 0.09)
+    return b
+
 
 # --- Ontology axis overlap (prompt vs stored text) ---
 
@@ -57,14 +202,10 @@ def decision_memory_relevance_multiplier(
 
     from .ontology import rank_families_full
 
-    ordered_p, dp, _ = rank_families_full(prompt_norm)
-    ordered_r, dr, _ = rank_families_full(row_norm)
+    ordered_p, dp, ap = rank_families_full(prompt_norm)
+    ordered_r, dr, ar = rank_families_full(row_norm)
     top_p = ordered_p[0][0]
     top_r = ordered_r[0][0]
-
-    # Lexical scores can spike on shared words (“say”, “no”) — never bypass family mismatch.
-    if raw_score >= 2.35 and top_p == top_r:
-        return 1.0
 
     keys = set(dp) & set(dr)
     overlap = sum(min(dp[k], dr[k]) for k in keys) if keys else 0.0
@@ -161,6 +302,9 @@ def decision_memory_relevance_multiplier(
                 else:
                     base = 0.14
 
+    base = _apply_respond_subshape_penalties(
+        prompt_norm, row_norm, top_p, top_r, dp, dr, ar, base
+    )
     return max(0.08, min(1.15, base * axis_factor))
 
 
@@ -201,6 +345,112 @@ def personal_response_decision_families_aligned(
     return False
 
 
+def respond_main_decision_passes_shape_gate(
+    prompt_norm: str,
+    row: Mapping[str, Any],
+    *,
+    effective_primary: str,
+) -> bool:
+    """
+    Stricter than ``personal_response_decision_families_aligned``: the row must
+    match the prompt’s effective decision *shape* (Phase 37.1 respond-like-me).
+    """
+    from .ontology import interpersonal_conflict_markers_present, rank_families_full
+
+    row_norm = normalize_input(decision_row_text_blob(row))
+    if not row_norm.strip():
+        return False
+
+    _, dp, _ = rank_families_full(prompt_norm)
+    ordered_r, dr, ar = rank_families_full(row_norm)
+    top_r = ordered_r[0][0]
+    row_c = float(dr.get("interpersonal_hurt", 0) or 0) + float(
+        dr.get("conflict_intensity", 0) or 0
+    )
+
+    if effective_primary == OBLIGATION_OVERLOAD:
+        if top_r in (OBLIGATION_OVERLOAD, LOYALTY_BOUNDARY):
+            return True
+        if top_r == CONFLICT_FAMILY:
+            return (
+                float(dr.get("obligation", 0) or 0)
+                + float(dr.get("overload", 0) or 0)
+                >= 0.95
+            )
+        if top_r == GENERAL:
+            return (
+                float(dr.get("obligation", 0) or 0)
+                + float(dr.get("overload", 0) or 0)
+                >= 1.02
+            )
+        return False
+
+    if effective_primary == CONFLICT_FAMILY:
+        if top_r in (OBLIGATION_OVERLOAD, SPENDING, RISK_TIMING):
+            return False
+        if top_r not in (CONFLICT_FAMILY, GENERAL, LOYALTY_BOUNDARY):
+            return False
+        if top_r != CONFLICT_FAMILY:
+            if row_c < 1.02:
+                return False
+            ax_c = float(ar.get(AXIS_CONFLICT_CONFRONTATION, 0) or 0) + float(
+                ar.get(AXIS_BACKCHANNEL_HURT, 0) or 0
+            )
+            if ax_c < 1.0:
+                return False
+        if _gossip_or_backchannel_prompt(prompt_norm):
+            return _row_supports_backchannel_conflict(row_norm, ar)
+        if interpersonal_conflict_markers_present(prompt_norm) and top_r == GENERAL:
+            return row_c >= 0.9
+        return True
+
+    if effective_primary == SPENDING:
+        money_press = _spending_pressure_prompt(dp, prompt_norm)
+        has_money_row = _row_has_money_decision_shape(ar, dr, row_norm)
+        if money_press:
+            if top_r == RISK_TIMING and not has_money_row:
+                return False
+            if top_r == CONFLICT_FAMILY:
+                return False
+            return top_r == SPENDING or has_money_row
+        if top_r == SPENDING or has_money_row:
+            return personal_response_decision_families_aligned(
+                prompt_norm, row, min_dim_overlap=1.05
+            )
+        return personal_response_decision_families_aligned(
+            prompt_norm, row, min_dim_overlap=1.15
+        )
+
+    if effective_primary == RISK_TIMING:
+        if top_r == RISK_TIMING:
+            return True
+        if top_r == GENERAL:
+            return (
+                float(dr.get("wait_vs_act", 0) or 0)
+                + float(dr.get("uncertainty", 0) or 0)
+                >= 1.02
+            )
+        return personal_response_decision_families_aligned(
+            prompt_norm, row, min_dim_overlap=1.18
+        )
+
+    if effective_primary == LOYALTY_BOUNDARY:
+        if top_r in (LOYALTY_BOUNDARY, OBLIGATION_OVERLOAD):
+            return True
+        return personal_response_decision_families_aligned(
+            prompt_norm, row, min_dim_overlap=1.2
+        )
+
+    if effective_primary == CONVENIENCE_QUALITY:
+        return personal_response_decision_families_aligned(
+            prompt_norm, row, min_dim_overlap=1.12
+        )
+
+    return personal_response_decision_families_aligned(
+        prompt_norm, row, min_dim_overlap=1.22
+    )
+
+
 def decision_row_text_blob(row: Mapping[str, Any]) -> str:
     return " ".join(
         [
@@ -220,6 +470,71 @@ def style_row_text_blob(row: Mapping[str, Any]) -> str:
             " ".join(str(t) for t in (row.get("style_tags") or [])),
         ]
     )
+
+
+def style_memory_passes_respond_conflict_shape(
+    prompt_norm: str,
+    row: Mapping[str, Any],
+) -> bool:
+    """
+    Phase 37.2: for strict conflict / gossip prompts, style rows must show
+    backchannel or confrontation shape — never generic avoidance / “let it go”.
+    """
+    from .ontology import interpersonal_conflict_markers_present, rank_families_full
+
+    style_norm = normalize_input(style_row_text_blob(row))
+    if not style_norm.strip():
+        return False
+
+    label_l = (str(row.get("selected_label") or "")).lower()
+    tags_l = " ".join(str(t).lower() for t in (row.get("style_tags") or []))
+    blob_l = style_norm.lower()
+    if _gossip_or_backchannel_prompt(prompt_norm):
+        avoid_phrases = (
+            "let it go",
+            "let it slide",
+            "let it roll",
+            "just ignore",
+            "ignore it",
+            "not worth",
+            "don't engage",
+            "dont engage",
+            "walk away",
+            "rise above",
+        )
+        if any(p in label_l or p in tags_l for p in avoid_phrases):
+            return False
+        _, _, ar = rank_families_full(style_norm)
+        if not _row_supports_backchannel_conflict(style_norm, ar):
+            return False
+        return True
+
+    if interpersonal_conflict_markers_present(prompt_norm):
+        _, dr, ar = rank_families_full(style_norm)
+        row_c = float(dr.get("interpersonal_hurt", 0) or 0) + float(
+            dr.get("conflict_intensity", 0) or 0
+        )
+        ax_c = float(ar.get(AXIS_CONFLICT_CONFRONTATION, 0) or 0) + float(
+            ar.get(AXIS_BACKCHANNEL_HURT, 0) or 0
+        )
+        if row_c >= 0.92 or ax_c >= 1.0:
+            return True
+        if any(
+            w in blob_l
+            for w in (
+                "say something",
+                "speak up",
+                "address",
+                "direct",
+                "clear the air",
+                "talk it out",
+                "boundary",
+            )
+        ):
+            return ax_c >= 0.55
+        return False
+
+    return True
 
 
 def style_memory_relevance_multiplier(

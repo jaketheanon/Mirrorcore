@@ -17,6 +17,9 @@ from types import SimpleNamespace
 from mirrorcore.persona.profile import build_personal_profile_from_rows
 from mirrorcore.decision.memory_relevance import personal_response_decision_families_aligned
 from mirrorcore.router import normalize_input
+from mirrorcore.decision.cross_system_knowledge import effective_primary_for_cross_filter
+from mirrorcore.decision.memory_relevance import respond_main_decision_passes_shape_gate
+from mirrorcore.decision.routed_clarification import rank_families
 from mirrorcore.persona.respond import (
     generate_personal_response,
     retrieve_relevant_decision_memories,
@@ -332,8 +335,9 @@ class TestRespondGeneration(unittest.TestCase):
         pr = generate_personal_response(
             "side project limited free time what would I do", self.db
         )
-        self.assertIn("choose", pr.likely_answer.lower())
         self.assertIn("Cut scope", pr.likely_answer)
+        self.assertNotIn("i’d probably choose", pr.likely_answer.lower())
+        self.assertNotIn("this leans on the saved decision", pr.reasoning_brief.lower())
         self.assertGreater(pr.confidence, 0.35)
         self.assertTrue(pr.memory_basis)
 
@@ -353,6 +357,85 @@ class TestRespondGeneration(unittest.TestCase):
         self.assertIsNotNone(eid)
         pr = generate_personal_response("ice cream flavor picking", self.db)
         self.assertNotIn("chocolate", pr.likely_answer.lower())
+
+    def test_conflict_profile_fallback_tone_clause_is_clean_english(self):
+        """Phase 37.3: strict conflict profile path must not stack 'skew' on 'leans cautious; …'."""
+        self.db.record_decision_memory(
+            scenario_id="shift_v1",
+            scenario_text="Coworker wants you to cover another shift.",
+            choice_label="Say no",
+            choice_value="n",
+            reasoning_label="Overload",
+            reasoning_value="o",
+            value_tags=["boundaries"],
+            trait_signals={
+                "risk_tolerance": 0.2,
+                "bluntness": 0.75,
+                "diplomacy": 0.35,
+            },
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "what would i say if someone keeps talking shit behind my back",
+            self.db,
+        )
+        low = pr.likely_answer.lower()
+        self.assertNotIn("skews leans", low)
+        self.assertNotIn("leans cautious;", low)
+        self.assertNotIn("usually skews leans", low)
+        self.assertTrue("cautious" in low or "blunt" in low or "direct" in low)
+
+    def test_conflict_gossip_fallback_stays_useful_without_same_shape_save(self):
+        """Phase 37.2: strict gossip gating with no conflict row still gives a direct-address read."""
+        self.db.record_decision_memory(
+            scenario_id="shift_v1",
+            scenario_text="Coworker wants you to cover another shift.",
+            choice_label="Say no, explain you can't right now",
+            choice_value="n",
+            reasoning_label="I was already overloaded",
+            reasoning_value="o",
+            value_tags=["boundaries"],
+            trait_signals={"boundary_strain": 0.8},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "what would i say if someone keeps talking shit behind my back",
+            self.db,
+        )
+        low = pr.likely_answer.lower()
+        self.assertTrue(
+            any(w in low for w in ("address", "say", "heard", "behind", "plain", "stop"))
+        )
+        self.assertNotIn("overload", low)
+        self.assertLessEqual(pr.confidence, 0.42)
+
+    def test_money_rent_laptop_fallback_mentions_hold_or_triage_not_proper_way(self):
+        """Phase 37.2: spending strict miss uses bills-first / pause-want shape."""
+        self.db.record_decision_memory(
+            scenario_id="speed_vs_safety_v1",
+            scenario_text=(
+                "You need to get something done and there's a quick way that cuts some corners."
+            ),
+            choice_label="Do it the proper way even if it takes longer",
+            choice_value="right",
+            reasoning_label="Avoid regret from sloppy work",
+            reasoning_value="r",
+            value_tags=["quality", "caution"],
+            trait_signals={"thoroughness": 0.9, "risk_tolerance": 0.2},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "what would i probably do if i wanted an $800 laptop but my rent was late",
+            self.db,
+        )
+        low = pr.likely_answer.lower()
+        self.assertNotIn("proper way", low)
+        self.assertTrue(
+            any(w in low for w in ("hold", "pause", "triage", "rent", "optional", "stable"))
+        )
 
     def test_cross_family_does_not_quote_shift_save_for_gossip_prompt(self):
         self.db.record_decision_memory(
@@ -374,6 +457,196 @@ class TestRespondGeneration(unittest.TestCase):
         self.assertNotIn("overload", pr.likely_answer.lower())
         self.assertNotIn("Say no, explain", pr.likely_answer)
         self.assertLessEqual(pr.confidence, 0.42)
+
+    def test_conflict_prompt_sounds_like_likely_speech_not_menu_label(self):
+        self.db.record_decision_memory(
+            scenario_id="gossip_v2",
+            scenario_text="Someone is talking badly about you behind your back at work.",
+            choice_label="Let's talk directly. I want this to stop.",
+            choice_value="a",
+            reasoning_label="Clear it early",
+            reasoning_value="c",
+            value_tags=["directness"],
+            trait_signals={"diplomacy": 0.5},
+            confidence_score=0.91,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "what would i probably say if someone keeps talking shit behind my back",
+            self.db,
+        )
+        low = pr.likely_answer.lower()
+        self.assertTrue(("say" in low) or ("talk" in low))
+        self.assertNotIn("i’d probably choose", low)
+
+    def test_overload_prompt_sounds_like_boundary_setting(self):
+        self.db.record_decision_memory(
+            scenario_id="shift_v3",
+            scenario_text="You're exhausted and asked to cover another shift.",
+            choice_label="I can't take this one. I need to recover tonight.",
+            choice_value="n",
+            reasoning_label="Protect energy",
+            reasoning_value="p",
+            value_tags=["boundaries"],
+            trait_signals={"boundary_strain": 0.82},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "i am burnt out and they asked me to help again what would i do",
+            self.db,
+        )
+        low = pr.likely_answer.lower()
+        self.assertTrue(("energy" in low) or ("limit" in low) or ("can't" in low))
+        self.assertNotIn("choose:", low)
+
+    def test_uncertainty_timing_prompt_sounds_like_real_behavior(self):
+        self.db.record_decision_memory(
+            scenario_id="timing_v1",
+            scenario_text="You are unsure and timing matters.",
+            choice_label="Wait one day and gather one more signal",
+            choice_value="w",
+            reasoning_label="Lower regret risk",
+            reasoning_value="l",
+            value_tags=["caution"],
+            trait_signals={"risk_tolerance": 0.3},
+            confidence_score=0.88,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "i'm not sure if i should act now or wait what would i probably do",
+            self.db,
+        )
+        low = pr.likely_answer.lower()
+        self.assertTrue(("wait" in low) or ("signal" in low) or ("pause" in low))
+        self.assertNotIn("saved scenarios", low)
+
+    def test_conflict_gossip_does_not_substitute_style_for_missing_shape_match(self):
+        """Phase 37.1: gossip/backchannel asks need same-shape conflict saves, not style-only."""
+        self.db.record_style_memory(
+            prompt_id="let_it_go_style_v1",
+            prompt_text="When someone upsets you at work",
+            selected_label="Let it go",
+            selected_value="let_go",
+            style_tags=["patience", "avoid conflict"],
+            tone_signals={"diplomacy": 0.75},
+            confidence_score=0.88,
+            correction_status="accurate",
+        )
+        self.db.record_decision_memory(
+            scenario_id="generic_rude_meeting",
+            scenario_text="Coworker was rude in a meeting about your work.",
+            choice_label="Let it go and move on",
+            choice_value="l",
+            reasoning_label="Not worth the fight today",
+            reasoning_value="n",
+            value_tags=["patience"],
+            trait_signals={"diplomacy": 0.72},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "what would i say if someone keeps talking shit behind my back",
+            self.db,
+        )
+        self.assertNotIn("let it go", pr.likely_answer.lower())
+        self.assertLessEqual(pr.confidence, 0.38)
+        if pr.memory_basis:
+            only_style = all("style" in m.lower() for m in pr.memory_basis)
+            self.assertFalse(only_style)
+
+    def test_money_rent_laptop_does_not_quote_speed_vs_safety_decision(self):
+        """Phase 37.1: bills/rent + purchase asks must not top-rank timing/corners saves."""
+        self.db.record_decision_memory(
+            scenario_id="speed_vs_safety_v1",
+            scenario_text=(
+                "You need to get something done and there's a quick way that cuts some corners."
+            ),
+            choice_label="Do it the proper way even if it takes longer",
+            choice_value="right",
+            reasoning_label="Avoid regret from sloppy work",
+            reasoning_value="r",
+            value_tags=["quality", "caution"],
+            trait_signals={"thoroughness": 0.9, "risk_tolerance": 0.2},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "what would i probably do if i wanted an $800 laptop but my rent is late",
+            self.db,
+        )
+        low = pr.likely_answer.lower()
+        self.assertNotIn("proper way", low)
+        self.assertNotIn("cuts some corners", low)
+        self.assertLessEqual(pr.confidence, 0.4)
+
+    def test_weak_gated_decision_is_cautious_not_definite(self):
+        """Borderline gated match should use soft-read path and cap confidence."""
+        self.db.record_decision_memory(
+            scenario_id="bc_mid",
+            scenario_text="Behind your back they talk smack.",
+            choice_label="Tell them to cut it out",
+            choice_value="t",
+            reasoning_label="End the sideways talk",
+            reasoning_value="e",
+            value_tags=["directness"],
+            trait_signals={},
+            confidence_score=0.5,
+            correction_status="uncorrected",
+        )
+        pr = generate_personal_response(
+            "what would i say if someone keeps talking shit behind my back",
+            self.db,
+        )
+        self.assertIn("soft read", pr.reasoning_brief.lower())
+        self.assertLessEqual(pr.confidence, 0.52)
+
+
+class TestRespondShapeGate(unittest.TestCase):
+    def test_gate_rejects_speed_vs_safety_for_rent_laptop_prompt(self):
+        pn = normalize_input(
+            "what would i probably do if i wanted an $800 laptop but my rent is late"
+        )
+        ordered, _ = rank_families(pn)
+        eff = effective_primary_for_cross_filter(ordered[0][0], pn)
+        row = {
+            "scenario_text": (
+                "You need to get something done and there's a quick way that cuts some corners."
+            ),
+            "choice_label": "Do it the proper way even if it takes longer",
+            "reasoning_label": "Quality matters",
+            "value_tags": ["quality", "caution"],
+        }
+        self.assertFalse(
+            respond_main_decision_passes_shape_gate(pn, row, effective_primary=eff)
+        )
+
+    def test_gate_requires_backchannel_row_for_gossip_prompt(self):
+        pn = normalize_input(
+            "what would i say if someone keeps talking shit behind my back"
+        )
+        ordered, _ = rank_families(pn)
+        eff = effective_primary_for_cross_filter(ordered[0][0], pn)
+        generic = {
+            "scenario_text": "Coworker was rude in a meeting about your work.",
+            "choice_label": "Let it go and move on",
+            "reasoning_label": "Pick your battles",
+            "value_tags": ["patience"],
+        }
+        self.assertFalse(
+            respond_main_decision_passes_shape_gate(pn, generic, effective_primary=eff)
+        )
+        backchannel = {
+            "scenario_text": "Someone keeps talking badly about you behind your back at work.",
+            "choice_label": "Address it calmly with the person",
+            "reasoning_label": "Stop the spiral",
+            "value_tags": ["directness"],
+        }
+        self.assertTrue(
+            respond_main_decision_passes_shape_gate(
+                pn, backchannel, effective_primary=eff
+            )
+        )
 
 
 class TestStyleRetrieval(unittest.TestCase):
