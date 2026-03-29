@@ -1,0 +1,13 @@
+---
+alwaysApply: false
+---
+description: Workflow for substantial feature phases
+---
+
+Workflow: 
+- prefer minimal prompt bloat
+- preserve stable subsystems
+- refactor in place
+- do not leave stale logic active besides new logic
+- after major changes, ensure tests and behavior both still make sense
+- optimize for maintainability and observability, not just passing tests

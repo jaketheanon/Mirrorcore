@@ -1,0 +1,21 @@
+---
+description: Regression and behavior-test expectations
+globs: tests/*.py,tests/**/*.py
+alwaysApply: false
+---
+
+Testing rules:
+- add regression tests for every real bug fixed
+- include forbidden-match tests, not just expected-match tests
+- preserve these canonical scenarios:
+  - laptop + rent late
+  - coworker cover + burnt out
+  - mom favor + drained
+  - talking shit behind back
+  - wait vs act now
+- test:
+  - winning family
+  - forbidden families
+  - first follow-up slot
+  - confidence behavior
+  - memory suppression when irrelevant

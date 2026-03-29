@@ -1,0 +1,20 @@
+---
+globs: src/mirrorcore/router.py,src/mirrorcore/decision/*.py
+alwaysApply: false
+---
+description: Routing, ontology, slot-engine, and clarification rules
+---
+
+Routing rules:
+- prefer decision-shape reasoning over scenario-shaped hacks
+- support multi-label family scoring
+- choose one missing high-signal slot at a time
+- forbid obvious family leaks:
+  - overload/helping prompts must not drift into conflict
+  - conflict prompts must not drift into helping/overload
+  - money-pressure prompts must not drift into generic speed/properness
+- preserve current good handling for:
+  - money/rent
+  - overload/helping
+  - conflict
+  - timing/uncertainty

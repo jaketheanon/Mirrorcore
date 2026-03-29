@@ -1,0 +1,15 @@
+---
+alwaysApply: true
+---
+
+MirrorCore guardrails:
+- deterministic only
+- no LLM dependency unless explicitly requested
+- preserve existing commands and workflows
+- refactor in place instead of layering duplicate systems
+- remove stale/superseded logic when replacing it
+- keep one-question-at-a-time clarification
+- keep user-facing wording plain and human
+- do not add router narration back in by default
+- do not fake certainty
+- if behavior and tests disagree, prioritize fixing behavior

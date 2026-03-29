@@ -1,0 +1,13 @@
+---
+description: Plain-language response and likely-you wording rules
+globs: src/mirrorcore/persona/respond.py,src/mirrorcore/decision/routed_clarification.py,src/mirrorcore/main.py
+alwaysApply: false
+---
+
+Output rules:
+- plain language only
+- avoid polished/app-y/professional words when simple wording works
+- no awkward hedge stacking like "Probably, you'd likely..."
+- likely-you answers should sound like natural action/speech, not retrieval summaries
+- keep evidence details separate from the main answer
+- confidence must match evidence strength

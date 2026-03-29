@@ -1,0 +1,13 @@
+---
+description: Memory relevance, tendency gating, and repetition control
+globs: src/mirrorcore/db/*.py,src/mirrorcore/persona/*.py,src/mirrorcore/decision/memory_relevance.py
+alwaysApply: false
+---
+
+Memory rules:
+- separate current situation facts from longer-term tendencies
+- do not turn one-off facts into durable traits too quickly
+- only surface old memory when family/demension overlap is strong
+- if relevance is weak, skip the memory line
+- suppress overused generic pattern lines aggressively
+- do not let style memory substitute for missing same-family decision evidence
