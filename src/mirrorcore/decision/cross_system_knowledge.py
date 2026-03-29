@@ -131,11 +131,17 @@ def cross_system_relevance_score_decision_row(
     prompt_norm: str,
     keywords: Sequence[str],
     scenario_counts: Mapping[str, int],
+    evidence_mult_map: Optional[Mapping[str, float]] = None,
 ) -> float:
     """Single score combining raw retrieval fit and ontology-aware multiplier."""
     from ..persona.respond import score_decision_memory_row
 
-    raw, _ = score_decision_memory_row(row, keywords, scenario_counts)
+    mmap = evidence_mult_map or {}
+    rid = str(row.get("id") or "")
+    em = float(mmap.get(f"decision:{rid}", 1.0))
+    raw, _ = score_decision_memory_row(
+        row, keywords, scenario_counts, evidence_row_mult=em
+    )
     return float(raw) * decision_memory_relevance_multiplier(prompt_norm, row, raw)
 
 
@@ -146,6 +152,7 @@ def build_ask_interview_memory_line_candidates(
     initial_norm: str,
     primary_family: str,
     seed: str,
+    evidence_mult_map: Optional[Mapping[str, float]] = None,
 ) -> List[Tuple[str, float, str]]:
     """
     Plain-language lines from decision_memory for the ask / guidance tail.
@@ -175,6 +182,7 @@ def build_ask_interview_memory_line_candidates(
             prompt_norm=prompt_norm,
             keywords=keywords,
             scenario_counts=scenario_counts,
+            evidence_mult_map=evidence_mult_map,
         )
         comb *= 0.82 + 0.18 * fit
         if comb < 0.62:

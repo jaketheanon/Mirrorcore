@@ -282,6 +282,32 @@ def initialize_database(conn: sqlite3.Connection):
         )
     """)
 
+    # Phase 38 — respond-like-me active learning (feedback + per-evidence weights)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS personal_response_feedback (
+            id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            scenario_snippet TEXT NOT NULL,
+            prompt_norm_hash TEXT NOT NULL,
+            rating TEXT NOT NULL,
+            partial_aspect TEXT,
+            replacement_text TEXT,
+            confidence_shown REAL NOT NULL,
+            effective_family TEXT NOT NULL,
+            evidence_path_json TEXT NOT NULL,
+            likely_answer_snippet TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS respond_evidence_weights (
+            evidence_key TEXT PRIMARY KEY,
+            balance REAL NOT NULL DEFAULT 0.0,
+            wrong_count INTEGER NOT NULL DEFAULT 0,
+            right_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
     # Create indexes for performance
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_persona_profile_trait_name ON persona_profile(trait_name)",
@@ -308,6 +334,8 @@ def initialize_database(conn: sqlite3.Connection):
         "CREATE INDEX IF NOT EXISTS idx_decision_router_situation_key ON decision_router_situation_facts(slot_key)",
         "CREATE INDEX IF NOT EXISTS idx_memory_line_surface_time ON memory_line_surface_events(shown_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_memory_line_surface_key ON memory_line_surface_events(line_key)",
+        "CREATE INDEX IF NOT EXISTS idx_personal_response_feedback_ts ON personal_response_feedback(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_personal_response_feedback_hash ON personal_response_feedback(prompt_norm_hash)",
     ]
     
     for index_sql in indexes:

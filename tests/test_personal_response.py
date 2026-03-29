@@ -21,9 +21,11 @@ from mirrorcore.decision.cross_system_knowledge import effective_primary_for_cro
 from mirrorcore.decision.memory_relevance import respond_main_decision_passes_shape_gate
 from mirrorcore.decision.routed_clarification import rank_families
 from mirrorcore.persona.respond import (
+    RespondEvidencePath,
     generate_personal_response,
     retrieve_relevant_decision_memories,
     retrieve_relevant_style_memories,
+    score_decision_memory_row,
     tokenize_prompt,
 )
 
@@ -686,9 +688,12 @@ class TestRespondLikeMeCLI(unittest.TestCase):
         self.assertEqual(args.command, "respond-like-me")
         self.assertEqual(args.scenario, "should I upgrade today")
 
+    @patch("mirrorcore.persona.respond_feedback.maybe_prompt_respond_feedback")
     @patch("mirrorcore.persona.respond.generate_personal_response")
     @patch("mirrorcore.db.store.DatabaseStore")
-    def test_handler_invokes_generator_with_scenario(self, mock_db_class, mock_gen):
+    def test_handler_invokes_generator_with_scenario(
+        self, mock_db_class, mock_gen, _mock_fb
+    ):
         mock_gen.return_value = SimpleNamespace(
             likely_answer="Out",
             reasoning_brief="Because",
@@ -696,13 +701,112 @@ class TestRespondLikeMeCLI(unittest.TestCase):
             confidence_label="fair",
             memory_basis=["Decision memory (x)"],
             profile_hint=None,
+            evidence_path=RespondEvidencePath(route_keys=("strong_decision",)),
+            prompt_norm_hash="abc",
+            effective_family="general",
         )
-        args = SimpleNamespace(scenario="  pick a paint color  ")
+        args = SimpleNamespace(scenario="  pick a paint color  ", no_feedback=False)
         handle_respond_like_me(args)
         mock_gen.assert_called_once()
         called_store = mock_gen.call_args[0][1]
         self.assertIs(called_store, mock_db_class.return_value)
         self.assertEqual(mock_gen.call_args[0][0], "pick a paint color")
+
+    def test_parser_no_feedback_flag(self):
+        p = create_parser()
+        args = p.parse_args(["respond-like-me", "--no-feedback", "hi"])
+        self.assertTrue(args.no_feedback)
+
+    def test_parser_respond_feedback(self):
+        p = create_parser()
+        args = p.parse_args(["respond-feedback", "--recent", "5"])
+        self.assertEqual(args.command, "respond-feedback")
+        self.assertEqual(args.recent, 5)
+
+
+class TestPhase38RespondFeedback(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = DatabaseStore(Path(self.tmp.name))
+        self.db.initialize_database()
+
+    def tearDown(self):
+        self.db.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_score_respects_evidence_row_multiplier(self):
+        row = {
+            "id": "z1",
+            "timestamp": "2025-01-01",
+            "scenario_id": "s",
+            "scenario_text": "coffee shop long line wait",
+            "choice_label": "Stay",
+            "choice_value": "s",
+            "reasoning_label": "Patience",
+            "reasoning_value": "p",
+            "value_tags": ["patience"],
+            "trait_signals": {},
+            "correction_status": "uncorrected",
+            "confidence_score": 0.8,
+        }
+        kws = tokenize_prompt("coffee shop line")
+        s_hi, _ = score_decision_memory_row(
+            row, kws, {"s": 1}, evidence_row_mult=1.0
+        )
+        s_lo, _ = score_decision_memory_row(
+            row, kws, {"s": 1}, evidence_row_mult=0.35
+        )
+        self.assertLess(s_lo, s_hi)
+
+    def test_wrong_feedback_reduces_multiplier_for_decision_key(self):
+        self.db.merge_respond_evidence_delta("decision:x1", -0.46, mark_wrong=True)
+        self.db.merge_respond_evidence_delta("decision:x1", -0.46, mark_wrong=True)
+        mmap = self.db.get_respond_evidence_multiplier_map()
+        self.assertLess(mmap.get("decision:x1", 1.0), 0.88)
+
+    def test_record_personal_response_feedback_persists_row(self):
+        self.db.record_personal_response_feedback(
+            scenario_snippet="should I text them",
+            prompt_norm_hash="deadbeef",
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text=None,
+            confidence_shown=0.55,
+            effective_family="interpersonal_conflict",
+            evidence_path={
+                "decision_ids": ["d1"],
+                "style_ids": [],
+                "route_keys": ["medium_decision"],
+                "clarif_slot_keys": [],
+            },
+            likely_answer_snippet="You'd probably say…",
+        )
+        rows = self.db.list_recent_personal_response_feedback(limit=3)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["rating"], "partly")
+        self.assertEqual(rows[0]["partial_aspect"], "action_ok_word_bad")
+        self.assertEqual(rows[0]["evidence_path"]["decision_ids"], ["d1"])
+
+    def test_generate_includes_evidence_path_and_hash(self):
+        eid = self.db.record_decision_memory(
+            scenario_id="t1",
+            scenario_text="friend asked to borrow money rent is tight",
+            choice_label="Say no gently",
+            choice_value="n",
+            reasoning_label="Protect rent",
+            reasoning_value="r",
+            value_tags=["caution"],
+            trait_signals={},
+            confidence_score=0.85,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "friend wants to borrow money and rent is tight", self.db
+        )
+        self.assertTrue(pr.prompt_norm_hash)
+        self.assertTrue(pr.evidence_path.route_keys)
+        self.assertIn(eid, pr.evidence_path.decision_ids)
 
 
 if __name__ == "__main__":

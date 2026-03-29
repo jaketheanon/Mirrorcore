@@ -44,6 +44,22 @@ from .profile import PersonalProfile, build_personal_profile_from_rows
 _TOKEN_RE = re.compile(r"[a-z0-9]+", re.I)
 
 
+def _respond_path_multipliers(
+    path: "RespondEvidencePath", mmap: Mapping[str, float]
+) -> List[float]:
+    """Collect multipliers for evidence keys on this answer path (Phase 38)."""
+    out: List[float] = []
+    for did in path.decision_ids:
+        out.append(float(mmap.get(f"decision:{did}", 1.0)))
+    for sid in path.style_ids:
+        out.append(float(mmap.get(f"style:{sid}", 1.0)))
+    for rk in path.route_keys:
+        out.append(float(mmap.get(f"route:{rk}", 1.0)))
+    for ck in path.clarif_slot_keys:
+        out.append(float(mmap.get(f"clarif_slot:{ck}", 1.0)))
+    return out
+
+
 def _stable_index(key: str, modulo: int) -> int:
     """Deterministic index in ``0..modulo-1`` (no salted ``hash()``)."""
     if modulo <= 1:
@@ -87,6 +103,8 @@ def score_decision_memory_row(
     row: Dict[str, Any],
     keywords: Sequence[str],
     scenario_counts: Mapping[str, int],
+    *,
+    evidence_row_mult: float = 1.0,
 ) -> Tuple[float, List[str]]:
     reasons: List[str] = []
     if not keywords:
@@ -130,6 +148,9 @@ def score_decision_memory_row(
     if st == "accurate":
         reasons.append("you confirmed this batch as accurate")
 
+    em = float(evidence_row_mult or 1.0)
+    score *= max(0.15, min(1.25, em))
+
     return score, reasons
 
 
@@ -137,6 +158,8 @@ def score_style_memory_row(
     row: Dict[str, Any],
     keywords: Sequence[str],
     prompt_counts: Mapping[str, int],
+    *,
+    evidence_row_mult: float = 1.0,
 ) -> Tuple[float, List[str]]:
     reasons: List[str] = []
     if not keywords:
@@ -177,6 +200,9 @@ def score_style_memory_row(
     if st == "accurate":
         reasons.append("confirmed style calibration")
 
+    em = float(evidence_row_mult or 1.0)
+    score *= max(0.15, min(1.25, em))
+
     return score, reasons
 
 
@@ -185,13 +211,19 @@ def retrieve_relevant_decision_memories(
     prompt: str,
     top_k: int = 5,
     min_score: float = 0.28,
+    evidence_mult_map: Optional[Mapping[str, float]] = None,
 ) -> List[Tuple[Dict[str, Any], float, List[str]]]:
     keywords = tokenize_prompt(prompt)
     prompt_norm = normalize_input(prompt)
     scenario_counts = _count_occurrences([str(r.get("scenario_id") or "") for r in rows])
+    mmap = evidence_mult_map or {}
     scored: List[Tuple[Dict[str, Any], float, List[str], str, str]] = []
     for row in rows:
-        s, reasons = score_decision_memory_row(row, keywords, scenario_counts)
+        rid = str(row.get("id") or "")
+        em = float(mmap.get(f"decision:{rid}", 1.0))
+        s, reasons = score_decision_memory_row(
+            row, keywords, scenario_counts, evidence_row_mult=em
+        )
         s *= decision_memory_relevance_multiplier(prompt_norm, row, s)
         scored.append(
             (
@@ -211,13 +243,19 @@ def retrieve_relevant_style_memories(
     rows: Sequence[Dict[str, Any]],
     prompt: str,
     top_k: int = 4,
+    evidence_mult_map: Optional[Mapping[str, float]] = None,
 ) -> List[Tuple[Dict[str, Any], float, List[str]]]:
     keywords = tokenize_prompt(prompt)
     prompt_counts = _count_occurrences([str(r.get("prompt_id") or "") for r in rows])
     scored: List[Tuple[Dict[str, Any], float, List[str], str, str]] = []
     prompt_norm = normalize_input(prompt)
+    mmap = evidence_mult_map or {}
     for row in rows:
-        s, reasons = score_style_memory_row(row, keywords, prompt_counts)
+        sid = str(row.get("id") or "")
+        em = float(mmap.get(f"style:{sid}", 1.0))
+        s, reasons = score_style_memory_row(
+            row, keywords, prompt_counts, evidence_row_mult=em
+        )
         s *= style_memory_relevance_multiplier(prompt_norm, row, s)
         scored.append(
             (
@@ -263,6 +301,7 @@ def _compute_response_confidence(
     agreement_boost: float,
     *,
     decision_family_aligned: bool = True,
+    path_multipliers: Optional[Sequence[float]] = None,
 ) -> float:
     base = 0.32
     ev = min(1.0, profile.total_evidence_weight / 8.0)
@@ -286,6 +325,9 @@ def _compute_response_confidence(
         base -= 0.14
     if profile.decision_entries_used == 0 and profile.style_entries_used == 0:
         base -= 0.2
+    if path_multipliers:
+        deficit = sum(max(0.0, 1.0 - float(m)) for m in path_multipliers if m < 1.0)
+        base -= min(0.24, 0.058 * deficit)
     return max(0.12, min(0.9, base))
 
 
@@ -426,8 +468,11 @@ def _strict_conflict_shape_evidence_fallback(
     blunt: float,
     aggressive_short: bool,
     store: DatabaseStore,
-) -> Tuple[str, str, float, List[str]]:
-    """Cautious likely-you line when strict conflict gating finds no decision row."""
+) -> Tuple[str, str, float, List[str], Tuple[str, ...]]:
+    """Cautious likely-you line when strict conflict gating finds no decision row.
+
+    The last tuple is style memory row ids that anchored wording (may be empty).
+    """
     extra_basis: List[str] = []
     gossip = gossip_or_backchannel_user_prompt(prompt_norm)
 
@@ -474,7 +519,9 @@ def _strict_conflict_shape_evidence_fallback(
                     store.record_memory_line_surface(sk)
                 except Exception:
                     pass
-        return answer, reasoning, conf_cap, extra_basis
+        sid = str(row.get("id") or "").strip()
+        stuple = (sid,) if sid else ()
+        return answer, reasoning, conf_cap, extra_basis, stuple
 
     peace = float(tmap.get("tendency_peace_over_confrontation", 0) or 0)
     clar = float(tmap.get("tendency_clarity_priority", 0) or 0)
@@ -495,7 +542,7 @@ def _strict_conflict_shape_evidence_fallback(
             "No same-shape conflict save; check-in tendencies on file nudge toward how you'd phrase this. "
             "Thin evidence — I am not treating this as certain."
         )
-        return answer, reasoning, 0.37, extra_basis
+        return answer, reasoning, 0.37, extra_basis, ()
 
     fit = profile_memory_fit_score(CONFLICT_FAMILY, prompt_norm)
     clause = _conflict_profile_tone_clause(profile_risk, communication_style)
@@ -509,7 +556,7 @@ def _strict_conflict_shape_evidence_fallback(
             "No tight gossip-or-conflict save; this leans on your overall communication pattern from past answers, "
             "not one labeled situation. Indirect only — confidence stays moderate or low."
         )
-        return answer, reasoning, 0.35, extra_basis
+        return answer, reasoning, 0.35, extra_basis, ()
 
     if gossip:
         opts = (
@@ -525,7 +572,7 @@ def _strict_conflict_shape_evidence_fallback(
     reasoning = (
         "No same-shape conflict decision on file; this is a cautious pattern read for this kind of situation, not a quote from your saves."
     )
-    return answer, reasoning, 0.34, extra_basis
+    return answer, reasoning, 0.34, extra_basis, ()
 
 
 def _strict_spending_pressure_evidence_fallback(
@@ -536,8 +583,11 @@ def _strict_spending_pressure_evidence_fallback(
     cross_boost: float,
     profile_risk: Optional[str],
     store: DatabaseStore,
-) -> Tuple[str, str, float, List[str]]:
-    """Bills-first / pause-want / trim-spend read when strict spending gate has no row."""
+) -> Tuple[str, str, float, List[str], Tuple[str, ...]]:
+    """Bills-first / pause-want / trim-spend read when strict spending gate has no row.
+
+    Last tuple: clarification slot keys that were cited in the basis (if any).
+    """
     extra_basis: List[str] = []
     nv = float(dims.get("need_vs_want_signal", 0) or 0)
 
@@ -588,8 +638,11 @@ def _strict_spending_pressure_evidence_fallback(
                 store.record_memory_line_surface(f"respond_mb_clarif_{slot_k}_sf")
             except Exception:
                 pass
+        clarif_slots = (slot_k,) if slot_k and slot_k != "x" else ()
+    else:
+        clarif_slots = ()
 
-    return answer, reasoning, conf_cap, extra_basis
+    return answer, reasoning, conf_cap, extra_basis, clarif_slots
 
 
 def _natural_likely_line(
@@ -669,6 +722,24 @@ def _natural_likely_line(
     return _shorten_sentence(answer, aggressive_short)
 
 
+@dataclass(frozen=True)
+class RespondEvidencePath:
+    """Which stored rows / routes shaped this likely-you line (Phase 38)."""
+
+    decision_ids: Tuple[str, ...] = ()
+    style_ids: Tuple[str, ...] = ()
+    route_keys: Tuple[str, ...] = ()
+    clarif_slot_keys: Tuple[str, ...] = ()
+
+    def to_storage_dict(self) -> Dict[str, Any]:
+        return {
+            "decision_ids": list(self.decision_ids),
+            "style_ids": list(self.style_ids),
+            "route_keys": list(self.route_keys),
+            "clarif_slot_keys": list(self.clarif_slot_keys),
+        }
+
+
 @dataclass
 class PersonalResponse:
     likely_answer: str
@@ -677,6 +748,9 @@ class PersonalResponse:
     confidence_label: str
     memory_basis: List[str] = field(default_factory=list)
     profile_hint: Optional[str] = None
+    evidence_path: RespondEvidencePath = field(default_factory=RespondEvidencePath)
+    prompt_norm_hash: str = ""
+    effective_family: str = "general"
 
 
 def generate_personal_response(
@@ -700,8 +774,17 @@ def generate_personal_response(
     dims_for_prompt = score_dimensions(prompt_norm)
     money_pressure_prompt = _spending_pressure_prompt(dims_for_prompt, prompt_norm)
 
-    d_ranked = retrieve_relevant_decision_memories(d_rows, text, top_k=8, min_score=0.38)
-    s_ranked = retrieve_relevant_style_memories(s_rows, text, top_k=4)
+    try:
+        mmap: Mapping[str, float] = store.get_respond_evidence_multiplier_map()
+    except Exception:
+        mmap = {}
+
+    d_ranked = retrieve_relevant_decision_memories(
+        d_rows, text, top_k=8, min_score=0.38, evidence_mult_map=mmap
+    )
+    s_ranked = retrieve_relevant_style_memories(
+        s_rows, text, top_k=4, evidence_mult_map=mmap
+    )
 
     d_gated = [
         (r, s, rs)
@@ -726,6 +809,7 @@ def generate_personal_response(
         )
     )
     phrase_seed = hashlib.sha256(normalize_input(text).encode("utf-8")).hexdigest()[:24]
+    prompt_norm_hash = hashlib.sha256(prompt_norm.encode("utf-8")).hexdigest()
 
     agreement_boost = 0.0
     memory_basis: List[str] = []
@@ -758,12 +842,13 @@ def generate_personal_response(
     if cross_boost > 0:
         agreement_boost = min(1.0, agreement_boost + cross_boost)
 
-    conf = _compute_response_confidence(
+    conf_pre = _compute_response_confidence(
         profile,
         top_score,
         top_d[0] if top_d else None,
         agreement_boost,
         decision_family_aligned=top_family_aligned,
+        path_multipliers=None,
     )
 
     verb = _verbosity_from_profile(profile)
@@ -831,6 +916,7 @@ def generate_personal_response(
 
     style_ok_for_basis = (not strict_shape) or (top_d is not None)
     seen_pid = set()
+    memory_basis_style_id: Optional[str] = None
     for row, sc, _ in s_ranked:
         if sc < 0.32:
             continue
@@ -855,6 +941,7 @@ def generate_personal_response(
                 store.record_memory_line_surface(sk)
             except Exception:
                 pass
+        memory_basis_style_id = str(row.get("id") or "").strip() or None
         break
 
     if (
@@ -883,24 +970,33 @@ def generate_personal_response(
     weak_or_cross = (
         (not top_family_aligned)
         or top_score < (2.85 if strict_shape else 2.35)
-        or conf < 0.52
+        or conf_pre < 0.52
         or (strict_shape and top_score < 2.35)
     )
 
+    evidence_path = RespondEvidencePath()
+    conf_caps: List[float] = []
+
     # Compose answer
     if spending_quote_is_speed_trap:
-        ans, reas, ccap, extra_mb = _strict_spending_pressure_evidence_fallback(
-            phrase_seed=phrase_seed,
-            dims=dims_for_prompt,
-            rel_facts=rel_facts,
-            cross_boost=cross_boost,
-            profile_risk=dr,
-            store=store,
+        ans, reas, ccap, extra_mb, clar_slots = (
+            _strict_spending_pressure_evidence_fallback(
+                phrase_seed=phrase_seed,
+                dims=dims_for_prompt,
+                rel_facts=rel_facts,
+                cross_boost=cross_boost,
+                profile_risk=dr,
+                store=store,
+            )
         )
         answer = ans
         reasoning = reas
-        conf = min(conf, ccap)
+        conf_caps.append(ccap)
         memory_basis.extend(extra_mb)
+        evidence_path = RespondEvidencePath(
+            route_keys=("spending_speed_trap_fallback",),
+            clarif_slot_keys=clar_slots,
+        )
     elif (
         top_d
         and top_score >= strong_threshold
@@ -928,9 +1024,26 @@ def generate_personal_response(
             reasoning += " A few entries repeat the same values."
         if profile.has_trait_conflict:
             reasoning += " Your past answers also pull in different directions, so this is only a rough read."
-            conf = min(conf, 0.62)
+            conf_caps.append(0.62)
         if strict_shape:
-            conf = min(conf, 0.82)
+            conf_caps.append(0.82)
+        did = str(row.get("id") or "").strip()
+        clar_slots2: Tuple[str, ...] = ()
+        if cross_boost >= 0.09 and rel_facts:
+            sk0 = str(rel_facts[0].get("slot_key") or "").strip()
+            if sk0:
+                clar_slots2 = (sk0,)
+        sid_t = (
+            (memory_basis_style_id,)
+            if memory_basis_style_id
+            else ()
+        )
+        evidence_path = RespondEvidencePath(
+            decision_ids=(did,) if did else (),
+            style_ids=sid_t,
+            route_keys=("strong_decision",),
+            clarif_slot_keys=clar_slots2,
+        )
     elif (
         top_d
         and top_score >= 0.45
@@ -955,9 +1068,26 @@ def generate_personal_response(
         )
         if cross_boost >= 0.09:
             reasoning += " Check-ins on file nudge the same direction a little."
-        conf = min(conf, 0.48 if strict_shape else 0.55)
+        conf_caps.append(0.48 if strict_shape else 0.55)
         if profile.has_trait_conflict:
-            conf = min(conf, 0.4)
+            conf_caps.append(0.4)
+        did = str(row.get("id") or "").strip()
+        clar_slots2 = ()
+        if cross_boost >= 0.09 and rel_facts:
+            sk0 = str(rel_facts[0].get("slot_key") or "").strip()
+            if sk0:
+                clar_slots2 = (sk0,)
+        sid_t = (
+            (memory_basis_style_id,)
+            if memory_basis_style_id
+            else ()
+        )
+        evidence_path = RespondEvidencePath(
+            decision_ids=(did,) if did else (),
+            style_ids=sid_t,
+            route_keys=("medium_decision",),
+            clarif_slot_keys=clar_slots2,
+        )
     elif (
         not strict_shape
         and not top_d
@@ -980,9 +1110,14 @@ def generate_personal_response(
         reasoning = (
             "Closest entries are for a different problem family than this prompt, so I’m not mirroring them."
         )
-        conf = min(conf, 0.36)
+        conf_caps.append(0.36)
+        cid = str(d_ranked[0][0].get("id") or "").strip()
+        evidence_path = RespondEvidencePath(
+            decision_ids=(cid,) if cid else (),
+            route_keys=("family_misalign_ungated",),
+        )
     elif strict_shape and not top_d and eff_pf == CONFLICT_FAMILY:
-        ans, reas, ccap, extra_mb = _strict_conflict_shape_evidence_fallback(
+        ans, reas, ccap, extra_mb, style_ids_fb = _strict_conflict_shape_evidence_fallback(
             prompt_norm=prompt_norm,
             phrase_seed=phrase_seed,
             s_ranked=s_ranked,
@@ -995,21 +1130,31 @@ def generate_personal_response(
         )
         answer = ans
         reasoning = reas
-        conf = min(conf, ccap)
+        conf_caps.append(ccap)
         memory_basis.extend(extra_mb)
+        evidence_path = RespondEvidencePath(
+            style_ids=style_ids_fb,
+            route_keys=("strict_conflict_fallback",),
+        )
     elif strict_shape and not top_d and eff_pf == SPENDING:
-        ans, reas, ccap, extra_mb = _strict_spending_pressure_evidence_fallback(
-            phrase_seed=phrase_seed,
-            dims=dims_for_prompt,
-            rel_facts=rel_facts,
-            cross_boost=cross_boost,
-            profile_risk=dr,
-            store=store,
+        ans, reas, ccap, extra_mb, clar_slots_sp = (
+            _strict_spending_pressure_evidence_fallback(
+                phrase_seed=phrase_seed,
+                dims=dims_for_prompt,
+                rel_facts=rel_facts,
+                cross_boost=cross_boost,
+                profile_risk=dr,
+                store=store,
+            )
         )
         answer = ans
         reasoning = reas
-        conf = min(conf, ccap)
+        conf_caps.append(ccap)
         memory_basis.extend(extra_mb)
+        evidence_path = RespondEvidencePath(
+            route_keys=("strict_spending_fallback",),
+            clarif_slot_keys=clar_slots_sp,
+        )
     elif strict_shape and not top_d:
         v = (
             (
@@ -1025,7 +1170,8 @@ def generate_personal_response(
         reasoning = (
             "Strict same-shape gating: no close enough decision entry, so this stays generic on purpose."
         )
-        conf = min(conf, 0.32)
+        conf_caps.append(0.32)
+        evidence_path = RespondEvidencePath(route_keys=("strict_shape_miss",))
     elif (
         top_d
         and top_score >= 0.38
@@ -1046,7 +1192,12 @@ def generate_personal_response(
         reasoning = (
             "Closest entries are for a different problem family than this prompt, so I’m not mirroring them."
         )
-        conf = min(conf, 0.36)
+        conf_caps.append(0.36)
+        cid = str(top_d[0].get("id") or "").strip()
+        evidence_path = RespondEvidencePath(
+            decision_ids=(cid,) if cid else (),
+            route_keys=("family_misalign",),
+        )
     elif (
         not strict_shape
         and profile.total_evidence_weight >= 1.2
@@ -1074,12 +1225,13 @@ def generate_personal_response(
             reasoning = (
                 "That’s from your saved style and values, not a single labeled decision."
             )
-            conf = min(conf, 0.48)
+            conf_caps.append(0.48)
             if hasattr(store, "record_memory_line_surface"):
                 try:
                     store.record_memory_line_surface("respond_profile_fallback")
                 except Exception:
                     pass
+            evidence_path = RespondEvidencePath(route_keys=("profile_pattern_fallback",))
         else:
             answer = (
                 "No tight save for this question. I’d still grab one or two more facts before deciding."
@@ -1087,7 +1239,10 @@ def generate_personal_response(
             reasoning = (
                 "Playing it quiet — I already surfaced a profile read recently."
             )
-            conf = min(conf, 0.42)
+            conf_caps.append(0.42)
+            evidence_path = RespondEvidencePath(
+                route_keys=("profile_pattern_fallback_suppressed",)
+            )
     elif (
         not strict_shape
         and profile.total_evidence_weight >= 1.2
@@ -1099,7 +1254,8 @@ def generate_personal_response(
         reasoning = (
             "Some signal on file, but not enough to mirror this cleanly."
         )
-        conf = min(conf, 0.4)
+        conf_caps.append(0.4)
+        evidence_path = RespondEvidencePath(route_keys=("weak_profile_signal",))
     else:
         answer = (
             "I don't have enough saved decisions or style picks to say what you'd probably do here. "
@@ -1108,7 +1264,20 @@ def generate_personal_response(
         reasoning = (
             "Almost nothing on file matches this prompt; this is a careful generic take."
         )
-        conf = min(conf, 0.28)
+        conf_caps.append(0.28)
+        evidence_path = RespondEvidencePath(route_keys=("insufficient_evidence",))
+
+    path_m = _respond_path_multipliers(evidence_path, mmap)
+    conf = _compute_response_confidence(
+        profile,
+        top_score,
+        top_d[0] if top_d else None,
+        agreement_boost,
+        decision_family_aligned=top_family_aligned,
+        path_multipliers=path_m or None,
+    )
+    for cap in conf_caps:
+        conf = min(conf, cap)
 
     label = _confidence_bucket(conf)
     return PersonalResponse(
@@ -1118,5 +1287,8 @@ def generate_personal_response(
         confidence_label=label,
         memory_basis=memory_basis,
         profile_hint=profile_hint,
+        evidence_path=evidence_path,
+        prompt_norm_hash=prompt_norm_hash,
+        effective_family=str(eff_pf or "general"),
     )
 

@@ -50,6 +50,7 @@ class DatabaseStore:
         self.ensure_phase30_1_interview_rotation_state()
         self.ensure_phase31_2_decision_router_memory()
         self.ensure_phase34_memory_line_surface()
+        self.ensure_phase38_respond_active_learning()
 
     def initialize_database(self):
         """Initialize the database with all required tables.
@@ -215,6 +216,276 @@ class DatabaseStore:
             "ON memory_line_surface_events(line_key)"
         )
         conn.commit()
+
+    def ensure_phase38_respond_active_learning(self):
+        """Phase 38: structured feedback for respond-like-me and evidence weights."""
+        conn = self.get_db_connection()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS personal_response_feedback (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                scenario_snippet TEXT NOT NULL,
+                prompt_norm_hash TEXT NOT NULL,
+                rating TEXT NOT NULL,
+                partial_aspect TEXT,
+                replacement_text TEXT,
+                confidence_shown REAL NOT NULL,
+                effective_family TEXT NOT NULL,
+                evidence_path_json TEXT NOT NULL,
+                likely_answer_snippet TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS respond_evidence_weights (
+                evidence_key TEXT PRIMARY KEY,
+                balance REAL NOT NULL DEFAULT 0.0,
+                wrong_count INTEGER NOT NULL DEFAULT 0,
+                right_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_personal_response_feedback_ts "
+            "ON personal_response_feedback(timestamp)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_personal_response_feedback_hash "
+            "ON personal_response_feedback(prompt_norm_hash)"
+        )
+        conn.commit()
+
+    @staticmethod
+    def respond_evidence_multiplier(balance: float, wrong_count: int) -> float:
+        """Map stored weight row to a retrieval multiplier (deterministic, bounded)."""
+        b = float(balance or 0.0)
+        w = int(wrong_count or 0)
+        base = 1.0 + b * 0.062
+        streak = min(9, w) * 0.034
+        m = base - streak
+        return max(0.26, min(1.13, m))
+
+    def get_respond_evidence_multiplier_map(self) -> Dict[str, float]:
+        """All evidence keys → multiplier for respond / ask memory ranking."""
+        conn = self.get_db_connection()
+        rows = conn.execute(
+            "SELECT evidence_key, balance, wrong_count FROM respond_evidence_weights"
+        ).fetchall()
+        return {
+            str(r["evidence_key"]): self.respond_evidence_multiplier(
+                float(r["balance"] or 0.0), int(r["wrong_count"] or 0)
+            )
+            for r in rows
+        }
+
+    def merge_respond_evidence_delta(
+        self,
+        evidence_key: str,
+        delta_balance: float,
+        *,
+        mark_wrong: bool = False,
+        mark_right: bool = False,
+    ) -> None:
+        """Incrementally adjust one respond evidence key (idempotent merge)."""
+        conn = self.get_db_connection()
+        key = (evidence_key or "").strip()
+        if not key:
+            return
+        now = datetime.utcnow().isoformat()
+        row = conn.execute(
+            "SELECT balance, wrong_count, right_count FROM respond_evidence_weights "
+            "WHERE evidence_key = ?",
+            (key,),
+        ).fetchone()
+        delta = float(delta_balance)
+        if not row:
+            wc = 1 if mark_wrong else 0
+            rc = 1 if mark_right else 0
+            bal = max(-10.0, min(10.0, delta))
+            conn.execute(
+                """
+                INSERT INTO respond_evidence_weights
+                (evidence_key, balance, wrong_count, right_count, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (key, bal, wc, rc, now),
+            )
+            conn.commit()
+            return
+
+        bal = max(-10.0, min(10.0, float(row["balance"] or 0.0) + delta))
+        wc = int(row["wrong_count"] or 0) + (1 if mark_wrong else 0)
+        rc = int(row["right_count"] or 0) + (1 if mark_right else 0)
+        if mark_right:
+            wc = max(0, wc - 2)
+        conn.execute(
+            """
+            UPDATE respond_evidence_weights
+            SET balance = ?, wrong_count = ?, right_count = ?, updated_at = ?
+            WHERE evidence_key = ?
+            """,
+            (bal, wc, rc, now, key),
+        )
+        conn.commit()
+
+    def _apply_phase38_feedback_to_weights(
+        self,
+        rating: str,
+        partial_aspect: Optional[str],
+        evidence_path: Dict[str, Any],
+    ) -> None:
+        """Adjust respond_evidence_weights from one feedback (deterministic)."""
+        r = (rating or "").strip().lower()
+        pa = (partial_aspect or "").strip().lower() or None
+
+        def dkey(prefix: str, x: str) -> str:
+            xs = (x or "").strip()
+            return f"{prefix}:{xs}" if xs else ""
+
+        decisions = [dkey("decision", x) for x in evidence_path.get("decision_ids") or []]
+        decisions = [k for k in decisions if k]
+        styles = [dkey("style", x) for x in evidence_path.get("style_ids") or []]
+        styles = [k for k in styles if k]
+        routes = [dkey("route", x) for x in evidence_path.get("route_keys") or []]
+        routes = [k for k in routes if k]
+        clarifs = [
+            dkey("clarif_slot", x) for x in evidence_path.get("clarif_slot_keys") or []
+        ]
+        clarifs = [k for k in clarifs if k]
+
+        if r == "wrong":
+            for k in decisions:
+                self.merge_respond_evidence_delta(k, -0.46, mark_wrong=True)
+            for k in styles:
+                self.merge_respond_evidence_delta(k, -0.42, mark_wrong=True)
+            for k in routes:
+                self.merge_respond_evidence_delta(k, -0.28, mark_wrong=True)
+            for k in clarifs:
+                self.merge_respond_evidence_delta(k, -0.24, mark_wrong=True)
+            return
+
+        if r == "right":
+            for k in decisions:
+                self.merge_respond_evidence_delta(k, 0.13, mark_right=True)
+            for k in styles:
+                self.merge_respond_evidence_delta(k, 0.08, mark_right=True)
+            for k in routes:
+                self.merge_respond_evidence_delta(k, 0.05, mark_right=True)
+            for k in clarifs:
+                self.merge_respond_evidence_delta(k, 0.04, mark_right=True)
+            return
+
+        if r != "partly":
+            return
+
+        # Partly right — split by aspect; unknown aspect = light touch everywhere.
+        if pa == "action_ok_word_bad":
+            for k in decisions:
+                self.merge_respond_evidence_delta(k, 0.06, mark_right=True)
+            for k in styles:
+                self.merge_respond_evidence_delta(k, -0.36, mark_wrong=True)
+            for k in routes:
+                self.merge_respond_evidence_delta(k, -0.12, mark_wrong=True)
+            for k in clarifs:
+                self.merge_respond_evidence_delta(k, -0.10, mark_wrong=True)
+        elif pa == "word_ok_action_bad":
+            for k in decisions:
+                self.merge_respond_evidence_delta(k, -0.34, mark_wrong=True)
+            for k in styles:
+                self.merge_respond_evidence_delta(k, 0.05, mark_right=True)
+            for k in routes:
+                self.merge_respond_evidence_delta(k, -0.12, mark_wrong=True)
+            for k in clarifs:
+                self.merge_respond_evidence_delta(k, -0.10, mark_wrong=True)
+        elif pa == "same_direction_phrase":
+            for k in decisions:
+                self.merge_respond_evidence_delta(k, 0.03, mark_right=True)
+            for k in styles:
+                self.merge_respond_evidence_delta(k, -0.18, mark_wrong=True)
+            for k in routes:
+                self.merge_respond_evidence_delta(k, -0.16, mark_wrong=True)
+            for k in clarifs:
+                self.merge_respond_evidence_delta(k, -0.08, mark_wrong=True)
+        else:
+            for k in decisions:
+                self.merge_respond_evidence_delta(k, -0.10, mark_wrong=True)
+            for k in styles:
+                self.merge_respond_evidence_delta(k, -0.10, mark_wrong=True)
+            for k in routes:
+                self.merge_respond_evidence_delta(k, -0.18, mark_wrong=True)
+            for k in clarifs:
+                self.merge_respond_evidence_delta(k, -0.08, mark_wrong=True)
+
+    def record_personal_response_feedback(
+        self,
+        *,
+        scenario_snippet: str,
+        prompt_norm_hash: str,
+        rating: str,
+        partial_aspect: Optional[str],
+        replacement_text: Optional[str],
+        confidence_shown: float,
+        effective_family: str,
+        evidence_path: Dict[str, Any],
+        likely_answer_snippet: str,
+    ) -> str:
+        """Persist one feedback row and apply evidence weight deltas (Phase 38)."""
+        conn = self.get_db_connection()
+        eid = str(uuid4())
+        now = datetime.utcnow().isoformat()
+        conn.execute(
+            """
+            INSERT INTO personal_response_feedback
+            (id, timestamp, scenario_snippet, prompt_norm_hash, rating, partial_aspect,
+             replacement_text, confidence_shown, effective_family, evidence_path_json,
+             likely_answer_snippet)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                eid,
+                now,
+                scenario_snippet[:220],
+                prompt_norm_hash,
+                rating,
+                partial_aspect,
+                replacement_text[:400] if replacement_text else None,
+                float(confidence_shown),
+                effective_family,
+                json.dumps(evidence_path, sort_keys=True),
+                likely_answer_snippet[:200],
+            ),
+        )
+        conn.commit()
+        self._apply_phase38_feedback_to_weights(rating, partial_aspect, evidence_path)
+        return eid
+
+    def list_recent_personal_response_feedback(self, limit: int = 15) -> List[Dict[str, Any]]:
+        """Newest-first feedback rows for review."""
+        conn = self.get_db_connection()
+        lim = max(1, min(100, int(limit)))
+        rows = conn.execute(
+            """
+            SELECT id, timestamp, scenario_snippet, rating, partial_aspect,
+                   replacement_text, confidence_shown, effective_family,
+                   evidence_path_json, likely_answer_snippet
+            FROM personal_response_feedback
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (lim,),
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["evidence_path"] = json.loads(d.pop("evidence_path_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                d["evidence_path"] = {}
+            out.append(d)
+        return out
 
     def count_recent_memory_line_surfaces(self, line_key: str, window: int = 24) -> int:
         """How often ``line_key`` appears among the last ``window`` surfaces (all keys)."""

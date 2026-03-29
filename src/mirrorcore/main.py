@@ -220,6 +220,23 @@ Examples:
         default=None,
         help="Scenario or question (omit to type it when prompted)",
     )
+    respond_like_me_parser.add_argument(
+        "--no-feedback",
+        action="store_true",
+        help="Skip the short after-response rating prompt",
+    )
+
+    respond_feedback_parser = subparsers.add_parser(
+        "respond-feedback",
+        help="Review recent respond-like-me ratings you saved",
+    )
+    respond_feedback_parser.add_argument(
+        "--recent",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Show the last N entries (default 10, max 50)",
+    )
 
     ask_parser = subparsers.add_parser(
         "ask",
@@ -1994,6 +2011,64 @@ def handle_respond_like_me(args):
         print("Grounded in: little or no matching stored memory — see confidence above.")
     print()
 
+    from .persona.respond_feedback import maybe_prompt_respond_feedback, stdin_is_interactive
+
+    def _read_feedback_line(prompt_text: str) -> str:
+        if PROMPT_TOOLKIT_AVAILABLE:
+            try:
+                return prompt(prompt_text).strip()
+            except (EOFError, KeyboardInterrupt):
+                return ""
+        try:
+            return input(prompt_text)
+        except (EOFError, KeyboardInterrupt):
+            return ""
+
+    use_feedback = stdin_is_interactive() and not getattr(args, "no_feedback", False)
+    maybe_prompt_respond_feedback(
+        scenario_text=scenario,
+        pr=pr,
+        store=db_store,
+        read_line=_read_feedback_line,
+        is_interactive=use_feedback,
+    )
+
+
+def handle_respond_feedback(args):
+    """List recent structured feedback from respond-like-me (Phase 38)."""
+    from pathlib import Path
+
+    from .db.store import DatabaseStore
+
+    n = int(getattr(args, "recent", 10) or 10)
+    n = max(1, min(50, n))
+    db_store = DatabaseStore(Path("data") / "mirrorcore.db")
+    rows = db_store.list_recent_personal_response_feedback(limit=n)
+    if not rows:
+        print("No saved respond feedback yet.")
+        db_store.close()
+        return
+    print("Recent respond-like-me feedback")
+    print("-" * 44)
+    for r in rows:
+        ts = r.get("timestamp") or ""
+        rating = r.get("rating") or ""
+        pa = r.get("partial_aspect") or ""
+        fam = r.get("effective_family") or ""
+        snip = (r.get("scenario_snippet") or "").replace("\n", " ")[:72]
+        ans = (r.get("likely_answer_snippet") or "").replace("\n", " ")[:72]
+        rep = r.get("replacement_text")
+        line = f"{ts[:19]}  {rating:6}"
+        if pa:
+            line += f"  ({pa})"
+        print(line + f"  [{fam}]")
+        print(f"  Q: {snip}")
+        print(f"  Said: {ans}")
+        if rep:
+            print(f"  You suggested: {str(rep)[:120]}")
+        print()
+    db_store.close()
+
 
 def handle_calibrate_style(args):
     """Handle calibrate-style command — run style calibration session."""
@@ -2149,6 +2224,7 @@ def main():
         "interview": handle_interview,
         "calibrate-style": handle_calibrate_style,
         "respond-like-me": handle_respond_like_me,
+        "respond-feedback": handle_respond_feedback,
         "ask": handle_ask,
     }
     

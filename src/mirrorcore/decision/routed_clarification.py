@@ -1225,12 +1225,17 @@ def run_routed_decision_guidance(
     try:
         drows = db_store.get_recent_decision_memory(limit=80)
         primary_g = order[0] if order else GENERAL
+        try:
+            mmap = db_store.get_respond_evidence_multiplier_map()
+        except Exception:
+            mmap = {}
         interview_cands = build_ask_interview_memory_line_candidates(
             drows,
             merged_norm=merged_norm,
             initial_norm=norm,
             primary_family=primary_g,
             seed=phrase_seed,
+            evidence_mult_map=mmap,
         )
     except Exception:
         interview_cands = []
