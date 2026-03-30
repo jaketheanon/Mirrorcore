@@ -22,6 +22,7 @@ from mirrorcore.decision.memory_relevance import respond_main_decision_passes_sh
 from mirrorcore.decision.routed_clarification import rank_families
 from mirrorcore.persona.respond import (
     RespondEvidencePath,
+    classify_answer_focus,
     generate_personal_response,
     retrieve_relevant_decision_memories,
     retrieve_relevant_style_memories,
@@ -337,7 +338,7 @@ class TestRespondGeneration(unittest.TestCase):
         pr = generate_personal_response(
             "side project limited free time what would I do", self.db
         )
-        self.assertIn("Cut scope", pr.likely_answer)
+        self.assertIn("cut scope", pr.likely_answer.lower())
         self.assertNotIn("i’d probably choose", pr.likely_answer.lower())
         self.assertNotIn("this leans on the saved decision", pr.reasoning_brief.lower())
         self.assertGreater(pr.confidence, 0.35)
@@ -681,6 +682,133 @@ class TestTokenize(unittest.TestCase):
         )
 
 
+class TestPhase39AnswerFocus(unittest.TestCase):
+    def test_classify_do_and_say_prompt_is_both(self):
+        pn = normalize_input(
+            "what would i do and say if my mom wants a favor but im already drained"
+        )
+        self.assertEqual(classify_answer_focus(pn), "both")
+
+    def test_classify_wording_vs_action(self):
+        pn_say = normalize_input(
+            "what would i say if someone keeps talking shit behind my back"
+        )
+        self.assertEqual(classify_answer_focus(pn_say), "wording")
+        pn_do = normalize_input(
+            "i am burnt out and they asked me to help again what would i do"
+        )
+        self.assertEqual(classify_answer_focus(pn_do), "action")
+
+    def test_action_prompt_avoids_quote_wrapped_choice_for_overload(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        db = DatabaseStore(Path(tmp.name))
+        db.initialize_database()
+        try:
+            db.record_decision_memory(
+                scenario_id="shift_v3",
+                scenario_text="You're exhausted and asked to cover another shift.",
+                choice_label="I can't take this one. I need to recover tonight.",
+                choice_value="n",
+                reasoning_label="Protect energy",
+                reasoning_value="p",
+                value_tags=["boundaries"],
+                trait_signals={"boundary_strain": 0.82},
+                confidence_score=0.9,
+                correction_status="accurate",
+            )
+            pr = generate_personal_response(
+                "i am burnt out and they asked me to help again what would i do",
+                db,
+            )
+            self.assertEqual(pr.answer_focus, "action")
+            self.assertNotIn('say: "', pr.likely_answer)
+            self.assertNotIn('go with: "', pr.likely_answer.lower())
+            low = pr.likely_answer.lower()
+            self.assertTrue(
+                ("energy" in low) or ("boundary" in low) or ("can't" in low)
+            )
+        finally:
+            db.close()
+            Path(tmp.name).unlink(missing_ok=True)
+
+    def test_wording_prompt_keeps_speech_shape_for_conflict_save(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        db = DatabaseStore(Path(tmp.name))
+        db.initialize_database()
+        try:
+            db.record_decision_memory(
+                scenario_id="gossip_v2",
+                scenario_text=(
+                    "Someone is talking badly about you behind your back at work."
+                ),
+                choice_label="Let's talk directly. I want this to stop.",
+                choice_value="a",
+                reasoning_label="Clear it early",
+                reasoning_value="c",
+                value_tags=["directness"],
+                trait_signals={"diplomacy": 0.5},
+                confidence_score=0.91,
+                correction_status="accurate",
+            )
+            pr = generate_personal_response(
+                "what would i probably say if someone keeps talking shit behind my back",
+                db,
+            )
+            self.assertEqual(pr.answer_focus, "wording")
+            low = pr.likely_answer.lower()
+            self.assertTrue(("say" in low) or ('"' in pr.likely_answer))
+            self.assertIn("let's talk directly", low)
+        finally:
+            db.close()
+            Path(tmp.name).unlink(missing_ok=True)
+
+    def test_do_and_say_prompt_splits_likely_action_and_wording(self):
+        """Both-mode answers must visibly separate move vs script, not one quote-only blob."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        db = DatabaseStore(Path(tmp.name))
+        db.initialize_database()
+        try:
+            db.record_decision_memory(
+                scenario_id="mom_favor_v1",
+                scenario_text="Your mom asks for a favor when you are already drained.",
+                choice_label="I can't help with that tonight. I need to recharge.",
+                choice_value="n",
+                reasoning_label="Protect bandwidth",
+                reasoning_value="b",
+                value_tags=["boundaries"],
+                trait_signals={"boundary_strain": 0.75},
+                confidence_score=0.9,
+                correction_status="accurate",
+            )
+            q = (
+                "what would i do and say if my mom wants a favor but im already drained"
+            )
+            pr = generate_personal_response(q, db)
+            self.assertEqual(pr.answer_focus, "both")
+            ans = pr.likely_answer
+            self.assertGreaterEqual(ans.count("\n"), 2)
+            bridges = (
+                "if you said it out loud",
+                "in plain words",
+            )
+            low = ans.lower()
+            self.assertTrue(any(b in low for b in bridges))
+            self.assertIn('"', ans)
+            # Not a single paragraph that is only a quoted line / phrasing teaser.
+            one_line = " ".join(ans.split())
+            self.assertGreater(len(one_line), 120)
+            self.assertFalse(
+                one_line.lower().startswith('you\'d probably say something like: "')
+                and one_line.count('"') <= 2
+            )
+        finally:
+            db.close()
+            Path(tmp.name).unlink(missing_ok=True)
+
+
 class TestRespondLikeMeCLI(unittest.TestCase):
     def test_subcommand_parses(self):
         p = create_parser()
@@ -704,6 +832,7 @@ class TestRespondLikeMeCLI(unittest.TestCase):
             evidence_path=RespondEvidencePath(route_keys=("strong_decision",)),
             prompt_norm_hash="abc",
             effective_family="general",
+            answer_focus="action",
         )
         args = SimpleNamespace(scenario="  pick a paint color  ", no_feedback=False)
         handle_respond_like_me(args)
@@ -787,6 +916,7 @@ class TestPhase38RespondFeedback(unittest.TestCase):
         self.assertEqual(rows[0]["rating"], "partly")
         self.assertEqual(rows[0]["partial_aspect"], "action_ok_word_bad")
         self.assertEqual(rows[0]["evidence_path"]["decision_ids"], ["d1"])
+        self.assertEqual(rows[0].get("feedback_target"), "wording")
 
     def test_generate_includes_evidence_path_and_hash(self):
         eid = self.db.record_decision_memory(
@@ -807,6 +937,10 @@ class TestPhase38RespondFeedback(unittest.TestCase):
         self.assertTrue(pr.prompt_norm_hash)
         self.assertTrue(pr.evidence_path.route_keys)
         self.assertIn(eid, pr.evidence_path.decision_ids)
+        self.assertIn(
+            pr.evidence_path.to_storage_dict().get("answer_focus", ""),
+            ("action", "wording", "both"),
+        )
 
 
 if __name__ == "__main__":

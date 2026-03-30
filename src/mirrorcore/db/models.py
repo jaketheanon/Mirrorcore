@@ -295,7 +295,8 @@ def initialize_database(conn: sqlite3.Connection):
             confidence_shown REAL NOT NULL,
             effective_family TEXT NOT NULL,
             evidence_path_json TEXT NOT NULL,
-            likely_answer_snippet TEXT NOT NULL
+            likely_answer_snippet TEXT NOT NULL,
+            feedback_target TEXT
         )
     """)
     conn.execute("""

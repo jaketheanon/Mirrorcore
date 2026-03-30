@@ -51,6 +51,7 @@ class DatabaseStore:
         self.ensure_phase31_2_decision_router_memory()
         self.ensure_phase34_memory_line_surface()
         self.ensure_phase38_respond_active_learning()
+        self.ensure_phase39_respond_feedback_target()
 
     def initialize_database(self):
         """Initialize the database with all required tables.
@@ -233,7 +234,8 @@ class DatabaseStore:
                 confidence_shown REAL NOT NULL,
                 effective_family TEXT NOT NULL,
                 evidence_path_json TEXT NOT NULL,
-                likely_answer_snippet TEXT NOT NULL
+                likely_answer_snippet TEXT NOT NULL,
+                feedback_target TEXT
             )
             """
         )
@@ -331,15 +333,43 @@ class DatabaseStore:
         )
         conn.commit()
 
+    def ensure_phase39_respond_feedback_target(self):
+        """Phase 39: optional feedback_target on personal_response_feedback."""
+        conn = self.get_db_connection()
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'personal_response_feedback' LIMIT 1"
+        ).fetchone()
+        if not table_exists:
+            return
+        existing_columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(personal_response_feedback)"
+            ).fetchall()
+        }
+        if "feedback_target" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE personal_response_feedback "
+                "ADD COLUMN feedback_target TEXT"
+            )
+            conn.commit()
+
     def _apply_phase38_feedback_to_weights(
         self,
         rating: str,
         partial_aspect: Optional[str],
         evidence_path: Dict[str, Any],
+        feedback_target: Optional[str] = None,
     ) -> None:
         """Adjust respond_evidence_weights from one feedback (deterministic)."""
         r = (rating or "").strip().lower()
         pa = (partial_aspect or "").strip().lower() or None
+        ft = (feedback_target or "").strip().lower() or None
+        if not ft:
+            ft = (evidence_path.get("answer_focus") or "").strip().lower() or None
+        if ft not in ("action", "wording", "both"):
+            ft = "both"
 
         def dkey(prefix: str, x: str) -> str:
             xs = (x or "").strip()
@@ -356,26 +386,51 @@ class DatabaseStore:
         ]
         clarifs = [k for k in clarifs if k]
 
+        # Phase 39: weight adjustments by what the user says was wrong/right.
+        d_wrong, s_wrong, rw_wrong, cl_wrong = 1.0, 1.0, 1.0, 1.0
+        d_wr, s_wr, rw_wr, cl_wr = 1.0, 1.0, 1.0, 1.0
+        if ft == "action":
+            s_wrong, s_wr = 0.38, 0.35
+        elif ft == "wording":
+            d_wrong, rw_wrong, cl_wrong = 0.38, 0.35, 0.35
+            d_wr, rw_wr, cl_wr = 0.35, 0.32, 0.32
+
         if r == "wrong":
             for k in decisions:
-                self.merge_respond_evidence_delta(k, -0.46, mark_wrong=True)
+                self.merge_respond_evidence_delta(
+                    k, -0.46 * d_wrong, mark_wrong=True
+                )
             for k in styles:
-                self.merge_respond_evidence_delta(k, -0.42, mark_wrong=True)
+                self.merge_respond_evidence_delta(
+                    k, -0.42 * s_wrong, mark_wrong=True
+                )
             for k in routes:
-                self.merge_respond_evidence_delta(k, -0.28, mark_wrong=True)
+                self.merge_respond_evidence_delta(
+                    k, -0.28 * rw_wrong, mark_wrong=True
+                )
             for k in clarifs:
-                self.merge_respond_evidence_delta(k, -0.24, mark_wrong=True)
+                self.merge_respond_evidence_delta(
+                    k, -0.24 * cl_wrong, mark_wrong=True
+                )
             return
 
         if r == "right":
             for k in decisions:
-                self.merge_respond_evidence_delta(k, 0.13, mark_right=True)
+                self.merge_respond_evidence_delta(
+                    k, 0.13 * d_wr, mark_right=True
+                )
             for k in styles:
-                self.merge_respond_evidence_delta(k, 0.08, mark_right=True)
+                self.merge_respond_evidence_delta(
+                    k, 0.08 * s_wr, mark_right=True
+                )
             for k in routes:
-                self.merge_respond_evidence_delta(k, 0.05, mark_right=True)
+                self.merge_respond_evidence_delta(
+                    k, 0.05 * rw_wr, mark_right=True
+                )
             for k in clarifs:
-                self.merge_respond_evidence_delta(k, 0.04, mark_right=True)
+                self.merge_respond_evidence_delta(
+                    k, 0.04 * cl_wr, mark_right=True
+                )
             return
 
         if r != "partly":
@@ -411,13 +466,21 @@ class DatabaseStore:
                 self.merge_respond_evidence_delta(k, -0.08, mark_wrong=True)
         else:
             for k in decisions:
-                self.merge_respond_evidence_delta(k, -0.10, mark_wrong=True)
+                self.merge_respond_evidence_delta(
+                    k, -0.10 * d_wrong, mark_wrong=True
+                )
             for k in styles:
-                self.merge_respond_evidence_delta(k, -0.10, mark_wrong=True)
+                self.merge_respond_evidence_delta(
+                    k, -0.10 * s_wrong, mark_wrong=True
+                )
             for k in routes:
-                self.merge_respond_evidence_delta(k, -0.18, mark_wrong=True)
+                self.merge_respond_evidence_delta(
+                    k, -0.18 * rw_wrong, mark_wrong=True
+                )
             for k in clarifs:
-                self.merge_respond_evidence_delta(k, -0.08, mark_wrong=True)
+                self.merge_respond_evidence_delta(
+                    k, -0.08 * cl_wrong, mark_wrong=True
+                )
 
     def record_personal_response_feedback(
         self,
@@ -431,18 +494,30 @@ class DatabaseStore:
         effective_family: str,
         evidence_path: Dict[str, Any],
         likely_answer_snippet: str,
+        feedback_target: Optional[str] = None,
     ) -> str:
-        """Persist one feedback row and apply evidence weight deltas (Phase 38)."""
+        """Persist one feedback row and apply evidence weight deltas (Phase 38+39)."""
         conn = self.get_db_connection()
+        self.ensure_phase39_respond_feedback_target()
         eid = str(uuid4())
         now = datetime.utcnow().isoformat()
+        ft = (feedback_target or "").strip().lower() or None
+        if not ft:
+            if (partial_aspect or "").strip() == "action_ok_word_bad":
+                ft = "wording"
+            elif (partial_aspect or "").strip() == "word_ok_action_bad":
+                ft = "action"
+            elif (partial_aspect or "").strip() == "same_direction_phrase":
+                ft = "wording"
+        if ft not in ("action", "wording", "both", None):
+            ft = None
         conn.execute(
             """
             INSERT INTO personal_response_feedback
             (id, timestamp, scenario_snippet, prompt_norm_hash, rating, partial_aspect,
              replacement_text, confidence_shown, effective_family, evidence_path_json,
-             likely_answer_snippet)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             likely_answer_snippet, feedback_target)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 eid,
@@ -456,10 +531,13 @@ class DatabaseStore:
                 effective_family,
                 json.dumps(evidence_path, sort_keys=True),
                 likely_answer_snippet[:200],
+                ft,
             ),
         )
         conn.commit()
-        self._apply_phase38_feedback_to_weights(rating, partial_aspect, evidence_path)
+        self._apply_phase38_feedback_to_weights(
+            rating, partial_aspect, evidence_path, feedback_target=ft
+        )
         return eid
 
     def list_recent_personal_response_feedback(self, limit: int = 15) -> List[Dict[str, Any]]:
@@ -470,7 +548,7 @@ class DatabaseStore:
             """
             SELECT id, timestamp, scenario_snippet, rating, partial_aspect,
                    replacement_text, confidence_shown, effective_family,
-                   evidence_path_json, likely_answer_snippet
+                   evidence_path_json, likely_answer_snippet, feedback_target
             FROM personal_response_feedback
             ORDER BY timestamp DESC
             LIMIT ?

@@ -2054,6 +2054,7 @@ def handle_respond_feedback(args):
         ts = r.get("timestamp") or ""
         rating = r.get("rating") or ""
         pa = r.get("partial_aspect") or ""
+        fbt = r.get("feedback_target") or ""
         fam = r.get("effective_family") or ""
         snip = (r.get("scenario_snippet") or "").replace("\n", " ")[:72]
         ans = (r.get("likely_answer_snippet") or "").replace("\n", " ")[:72]
@@ -2061,6 +2062,8 @@ def handle_respond_feedback(args):
         line = f"{ts[:19]}  {rating:6}"
         if pa:
             line += f"  ({pa})"
+        elif fbt:
+            line += f"  (target: {fbt})"
         print(line + f"  [{fam}]")
         print(f"  Q: {snip}")
         print(f"  Said: {ans}")

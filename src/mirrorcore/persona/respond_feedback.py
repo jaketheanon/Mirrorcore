@@ -71,12 +71,38 @@ def maybe_prompt_respond_feedback(
         elif p2 in ("3", "s", "same"):
             partial_aspect = "same_direction_phrase"
 
+    feedback_target: Optional[str] = None
+    if rating in ("wrong", "right") and not partial_aspect:
+        print(
+            "Was this mainly about your move, your wording, or both?  "
+            "1 = move  2 = wording  3 = both  (enter = both)"
+        )
+        t3 = _read_line(read_line, "> ").lower()
+        if t3 in ("\x03",):
+            print("Using both for weighting.")
+        elif t3 in ("1", "a", "action", "move"):
+            feedback_target = "action"
+        elif t3 in ("2", "w", "word", "wording"):
+            feedback_target = "wording"
+        elif t3 in ("3", "b", "both"):
+            feedback_target = "both"
+
     replacement: Optional[str] = None
     if rating in ("wrong", "partly"):
         print("Optional: one line you'd say instead (enter to skip)")
         rep = _read_line(read_line, "> ")
         if rep and rep != "\x03" and len(rep) < 2000:
             replacement = rep.strip() or None
+
+    ft_store = feedback_target
+    if (
+        ft_store is None
+        and rating != "partly"
+        and getattr(pr, "answer_focus", None)
+    ):
+        af = str(getattr(pr, "answer_focus", "") or "").strip().lower()
+        if af in ("action", "wording", "both"):
+            ft_store = af
 
     store.record_personal_response_feedback(
         scenario_snippet=scenario_text,
@@ -88,6 +114,7 @@ def maybe_prompt_respond_feedback(
         effective_family=pr.effective_family,
         evidence_path=pr.evidence_path.to_storage_dict(),
         likely_answer_snippet=pr.likely_answer,
+        feedback_target=ft_store,
     )
     print("Noted — I'll weight that path accordingly next time.")
 
