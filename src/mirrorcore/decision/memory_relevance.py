@@ -52,8 +52,87 @@ def gossip_or_backchannel_user_prompt(norm_text: str) -> bool:
             " rumour",
             " two faced",
             " two-faced",
+            "whisper",
+            "speaking ill",
         )
     )
+
+
+def conflict_situational_cues(norm_text: str) -> Dict[str, bool]:
+    """Phase 40: deterministic flags for conflict/boundary subtext (ask + respond)."""
+    pn = normalize_input(norm_text)
+    padded = f" {pn} "
+
+    def hit(*subs: str) -> bool:
+        return any(s in padded or s.strip() in pn for s in subs)
+
+    return {
+        "gossip_backchannel": gossip_or_backchannel_user_prompt(pn),
+        "passive_slight": hit(
+            " passive aggressive",
+            "passive-aggressive",
+            " snide ",
+            "underhanded",
+            "dig at",
+            "digs at",
+            "cold shoulder",
+            "backhanded",
+            "little jab",
+            "jabs at",
+        ),
+        "boundary_push": hit(
+            " pushing",
+            "pushes ",
+            "push it",
+            "testing me",
+            "testing my",
+            "crossed a line",
+            "cross the line",
+            "walk all over",
+            " won't take no",
+            " wont take no",
+            "keep crossing",
+        ),
+        "direct_blunt": hit(
+            " to my face",
+            " yelled",
+            " screamed",
+            " insult",
+            "called me",
+            " blatant",
+            "straight up rude",
+            " outright ",
+        ),
+        "repeat_pattern": hit(
+            " again ",
+            " again.",
+            "keeps ",
+            "every time",
+            " pattern",
+            "not the first",
+            "ongoing",
+            "repeatedly",
+            " keeps ",
+        ),
+        "timing_later": hit(
+            "wait until",
+            " later ",
+            "tomorrow",
+            "cool off",
+            "not today",
+            "sleep on",
+            " when im calm",
+            " when i'm calm",
+        ),
+        "timing_now": hit(
+            " right now",
+            " today ",
+            "asap",
+            "can't let",
+            "cant let",
+            "has to be now",
+        ),
+    }
 
 
 def _gossip_or_backchannel_prompt(norm_text: str) -> bool:
@@ -83,6 +162,8 @@ def _row_supports_backchannel_conflict(
             " confront",
             "say something",
             "clear the air",
+            " sideways ",
+            " indirect ",
         )
     )
 
@@ -305,6 +386,22 @@ def decision_memory_relevance_multiplier(
     base = _apply_respond_subshape_penalties(
         prompt_norm, row_norm, top_p, top_r, dp, dr, ar, base
     )
+
+    # Phase 40: light boost when conflict sub-shape matches (not a substitute for gates).
+    if top_p == CONFLICT_FAMILY and top_r == CONFLICT_FAMILY and base >= 0.35:
+        cp = conflict_situational_cues(prompt_norm)
+        cr = conflict_situational_cues(row_norm)
+        keys = (
+            "gossip_backchannel",
+            "passive_slight",
+            "boundary_push",
+            "direct_blunt",
+            "repeat_pattern",
+        )
+        shared = sum(1 for k in keys if cp.get(k) and cr.get(k))
+        if shared:
+            base *= 1.0 + 0.045 * float(min(3, shared))
+
     return max(0.08, min(1.15, base * axis_factor))
 
 
@@ -519,6 +616,19 @@ def style_memory_passes_respond_conflict_shape(
         )
         if row_c >= 0.92 or ax_c >= 1.0:
             return True
+        passive_ok = any(
+            w in blob_l
+            for w in (
+                "passive",
+                "snide",
+                "indirect",
+                "sideways",
+                "name it",
+                "naming it",
+            )
+        )
+        if passive_ok and ("passive" in prompt_norm or "snide" in prompt_norm):
+            return ax_c >= 0.52 or row_c >= 0.82
         if any(
             w in blob_l
             for w in (
@@ -664,9 +774,23 @@ def profile_memory_fit_score(
     if primary_family == CONFLICT_FAMILY:
         s = d("interpersonal_hurt") * 0.42 + d("conflict_intensity") * 0.4
         s += min(2.0, ax.get(AXIS_CONFLICT_CONFRONTATION, 0.0)) * 0.42
+        s += min(2.0, ax.get(AXIS_BACKCHANNEL_HURT, 0.0)) * 0.28
         if any(
             w in norm_text
-            for w in ("rude", "unfair", "upset", "boss", "coworker", "say something")
+            for w in (
+                "rude",
+                "unfair",
+                "upset",
+                "boss",
+                "coworker",
+                "say something",
+                "passive",
+                "snide",
+                "gossip",
+                "behind",
+                "boundary",
+                "disrespect",
+            )
         ):
             s += 0.35
         return min(1.0, s / 1.85)

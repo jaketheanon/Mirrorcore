@@ -419,6 +419,28 @@ class TestGuidanceWording(unittest.TestCase):
         self.assertNotIn("available options", g.lower())
 
 
+class TestPhase40ConflictDepth(unittest.TestCase):
+    def test_passive_slight_guidance_vocab(self):
+        g = build_routed_decision_guidance(
+            original_question="my colleague is snide and underhanded at meetings",
+            qa_pairs=[],
+            domain_order=[CONFLICT_FAMILY, "general"],
+            profile=None,
+        )
+        low = g.lower()
+        self.assertTrue(
+            any(x in low for x in ("snide", "dig", "passive", "plain", "indirect")),
+            msg=g,
+        )
+
+    def test_conflict_aim_extracts_boundary_stance(self):
+        sit, tend = extract_clarification_evidence(
+            "conflict_aim", "I need to draw a boundary and stop absorbing it"
+        )
+        self.assertTrue(any(k == "conflict_stance" for k, _ in sit))
+        self.assertTrue(any(t[0] == "tendency_hard_boundary" for t in tend))
+
+
 class TestInteractiveFlow(unittest.TestCase):
     @patch("mirrorcore.decision.routed_clarification.build_personal_profile")
     def test_two_rounds_incorporate_answers(self, mock_prof):

@@ -21,13 +21,16 @@ from ..decision.cross_system_knowledge import (
 )
 from ..decision.memory_relevance import (
     _spending_pressure_prompt,
+    conflict_situational_cues,
     decision_memory_relevance_multiplier,
+    decision_row_text_blob,
     gossip_or_backchannel_user_prompt,
     personal_response_decision_families_aligned,
     profile_memory_fit_score,
     respond_main_decision_passes_shape_gate,
     style_memory_passes_respond_conflict_shape,
     style_memory_relevance_multiplier,
+    style_row_text_blob,
 )
 from ..decision.ontology import (
     CONFLICT_FAMILY,
@@ -321,6 +324,263 @@ def score_style_memory_row(
     return score, reasons
 
 
+@dataclass(frozen=True)
+class RespondFeedbackInfluence:
+    """Aggregated same-prompt feedback for ranking (Phase 40)."""
+
+    pref_token_weight: Mapping[str, float]
+    avoidance_demote: float
+    direct_calm_signal: float
+    wrong_replacement_count: int = 0
+    replacement_inject_line: str = ""
+
+
+_FEEDBACK_TOK_STOP = frozenset(
+    {
+        "the",
+        "and",
+        "but",
+        "for",
+        "you",
+        "your",
+        "that",
+        "this",
+        "with",
+        "from",
+        "have",
+        "has",
+        "had",
+        "would",
+        "could",
+        "should",
+        "what",
+        "how",
+        "say",
+        "out",
+        "loud",
+        "just",
+        "like",
+        "than",
+        "then",
+        "them",
+        "they",
+        "very",
+        "also",
+        "into",
+    }
+)
+
+
+def _feedback_family_compatible(stored: str, current: str) -> bool:
+    a = (stored or "").strip().lower()
+    b = (current or "").strip().lower()
+    if not a or not b:
+        return True
+    if a == b:
+        return True
+    if "conflict" in a and "conflict" in b:
+        return True
+    if a == "general" or b == "general":
+        return True
+    return False
+
+
+def _tokenize_feedback_phrase(text: str) -> List[str]:
+    out: List[str] = []
+    for m in _TOKEN_RE.findall((text or "").lower()):
+        if len(m) > 2 and m not in _FEEDBACK_TOK_STOP:
+            out.append(m)
+    return out
+
+
+def _feedback_snippet_signals_avoidance(snippet: str) -> bool:
+    s = (snippet or "").lower()
+    needles = (
+        "let it go",
+        "let it slide",
+        "move on",
+        "ignore it",
+        "just ignore",
+        "not worth the fight",
+        "drop it",
+        "let it ride",
+    )
+    return any(n in s for n in needles)
+
+
+def _memory_blob_avoidance_hit(blob: str) -> bool:
+    b = (blob or "").lower()
+    needles = (
+        "let it go",
+        "let it slide",
+        "move on",
+        "ignore it",
+        "just ignore",
+        "not worth",
+        "don't engage",
+        "dont engage",
+        "walk away",
+        "rise above",
+        "let it ride",
+    )
+    return any(n in b for n in needles)
+
+
+def build_respond_feedback_influence(
+    store: DatabaseStore,
+    prompt_norm_hash: str,
+    effective_family: str,
+) -> RespondFeedbackInfluence:
+    """Derive lexical preference + avoidance demotion from recent same-prompt feedback."""
+    if not (prompt_norm_hash or "").strip():
+        return RespondFeedbackInfluence({}, 0.0, 0.0, 0, "")
+    if not hasattr(store, "list_personal_response_feedback_for_prompt"):
+        return RespondFeedbackInfluence({}, 0.0, 0.0, 0, "")
+    rows = store.list_personal_response_feedback_for_prompt(
+        prompt_norm_hash, limit=40
+    )
+    pref: Dict[str, float] = {}
+    wrong_avoid = 0
+    direct_hits = 0.0
+    wrong_rep_count = 0
+    inject_line = ""
+    for row in rows:
+        if not _feedback_family_compatible(
+            str(row.get("effective_family") or ""), effective_family
+        ):
+            continue
+        rt = (row.get("rating") or "").strip().lower()
+        rep_t = (row.get("replacement_text") or "").strip()
+        snip = str(row.get("likely_answer_snippet") or "")
+        if rt == "wrong" and rep_t:
+            wrong_rep_count += 1
+            if not inject_line:
+                inject_line = rep_t[:400]
+        if rep_t and rt in ("wrong", "partly"):
+            add = 0.20 if rt == "wrong" else 0.10
+            for tok in _tokenize_feedback_phrase(rep_t):
+                pref[tok] = min(0.62, pref.get(tok, 0.0) + add)
+            rl = rep_t.lower()
+            if any(x in rl for x in ("address", "direct", "calm", "straightforward")):
+                direct_hits = min(1.0, direct_hits + 0.32)
+        if rt == "wrong" and _feedback_snippet_signals_avoidance(snip):
+            wrong_avoid += 1
+    if wrong_rep_count >= 2:
+        bump = 0.05 * min(4, wrong_rep_count - 1)
+        for k in list(pref.keys()):
+            pref[k] = min(0.72, pref[k] + bump)
+    demote = 0.0
+    if wrong_avoid >= 1 and direct_hits >= 0.22:
+        demote = min(1.0, 0.44 + 0.16 * max(0, wrong_avoid - 1))
+    if wrong_avoid >= 2 and direct_hits > 0:
+        demote = min(1.0, max(demote, 0.62))
+    if wrong_rep_count >= 2 and direct_hits >= 0.22:
+        demote = min(1.0, max(demote, 0.55 + 0.06 * min(3, wrong_rep_count - 2)))
+    return RespondFeedbackInfluence(
+        pref_token_weight=pref,
+        avoidance_demote=demote,
+        direct_calm_signal=direct_hits,
+        wrong_replacement_count=wrong_rep_count,
+        replacement_inject_line=inject_line.strip(),
+    )
+
+
+def _apply_feedback_influence_to_score(
+    s: float,
+    *,
+    blob: str,
+    feedback_influence: Optional[RespondFeedbackInfluence],
+) -> float:
+    if not feedback_influence:
+        return s
+    out = float(s)
+    blob_l = (blob or "").lower()
+    wrn = int(feedback_influence.wrong_replacement_count or 0)
+    tok_cap = 0.30 if wrn >= 2 else 0.24
+    tok_mul = 0.36 if wrn >= 2 else 0.30
+    pref_cap = 2.85 if wrn >= 2 else 2.45
+    pref_factor = 1.0
+    for tok, wt in feedback_influence.pref_token_weight.items():
+        if len(tok) > 2 and tok in blob_l:
+            pref_factor *= 1.0 + min(tok_cap, float(wt) * tok_mul)
+    out *= min(pref_cap, pref_factor)
+    if (
+        feedback_influence.avoidance_demote > 0
+        and _memory_blob_avoidance_hit(blob_l)
+    ):
+        dm = float(feedback_influence.avoidance_demote)
+        pen = 0.72 if wrn >= 2 else 0.65
+        out *= max(0.06, 1.0 - pen * dm)
+    return out
+
+
+def _sanitize_replacement_for_overlay(raw: str) -> str:
+    t = " ".join((raw or "").strip().split())
+    if len(t) > 220:
+        t = t[:217].rsplit(" ", 1)[0] + "…"
+    return t.strip()
+
+
+def _answer_covers_injection_tokens(answer: str, inj: str) -> bool:
+    toks = [t for t in _tokenize_feedback_phrase(inj) if len(t) > 3]
+    if len(toks) < 2:
+        toks = _tokenize_feedback_phrase(inj)
+    if not toks:
+        return True
+    a = (answer or "").lower()
+    hit = sum(1 for t in toks[:6] if t in a)
+    return hit >= max(2, (len(toks) + 1) // 2)
+
+
+def _apply_feedback_replacement_overlay(
+    answer: str,
+    reasoning: str,
+    *,
+    feedback_influence: RespondFeedbackInfluence,
+    phrase_seed: str,
+    answer_focus: str,
+    eff_pf: str,
+) -> Tuple[str, str]:
+    """Bias final text toward stored replacement lines after repeated wrong + replacement (Phase 40)."""
+    if "conflict" not in (eff_pf or "").lower():
+        return answer, reasoning
+    n_wr = int(feedback_influence.wrong_replacement_count or 0)
+    inj = _sanitize_replacement_for_overlay(
+        feedback_influence.replacement_inject_line or ""
+    )
+    if n_wr < 2 or len(inj) < 8:
+        return answer, reasoning
+    a = (answer or "").strip()
+    low = a.lower()
+    covered = _answer_covers_injection_tokens(a, inj)
+    avoidance_ans = _memory_blob_avoidance_hit(low) or "let it go" in low
+    af = (answer_focus or "both").strip().lower()
+    if not covered and (avoidance_ans or n_wr >= 3):
+        pool = (
+            f"You'd probably handle it more the way you've steered this lately: {inj}",
+            f"My read is you'd land closer to what you've corrected toward before — {inj}",
+            f"Given how you've pushed back on this same ask, you'd probably move more like: {inj}",
+        )
+        new_a = pool[_stable_index(f"{phrase_seed}:fbinj", len(pool))]
+        rs = (reasoning or "").rstrip()
+        tail = " Recent corrections on this phrasing pull the read that way."
+        return new_a, (rs + tail) if rs else tail.strip()
+    if not covered:
+        if af == "wording":
+            b = (
+                f"The wording you'd probably pick, given your corrections, leans more like: {inj}"
+            )
+        else:
+            bridges = (
+                f"If you said it the way you've been nudging it, it might come out more like: {inj}",
+                f"Out loud you'd probably edge closer to what you've written in before: {inj}",
+            )
+            b = bridges[_stable_index(f"{phrase_seed}:fbapp", len(bridges))]
+        sep = "\n\n" if a else ""
+        return f"{a}{sep}{b}", reasoning
+    return answer, reasoning
+
+
 def retrieve_relevant_decision_memories(
     rows: Sequence[Dict[str, Any]],
     prompt: str,
@@ -329,6 +589,7 @@ def retrieve_relevant_decision_memories(
     evidence_mult_map: Optional[Mapping[str, float]] = None,
     *,
     score_bias: float = 1.0,
+    feedback_influence: Optional[RespondFeedbackInfluence] = None,
 ) -> List[Tuple[Dict[str, Any], float, List[str]]]:
     keywords = tokenize_prompt(prompt)
     prompt_norm = normalize_input(prompt)
@@ -344,6 +605,11 @@ def retrieve_relevant_decision_memories(
         )
         s *= decision_memory_relevance_multiplier(prompt_norm, row, s)
         s *= sb
+        s = _apply_feedback_influence_to_score(
+            s,
+            blob=decision_row_text_blob(row),
+            feedback_influence=feedback_influence,
+        )
         scored.append(
             (
                 row,
@@ -365,6 +631,7 @@ def retrieve_relevant_style_memories(
     evidence_mult_map: Optional[Mapping[str, float]] = None,
     *,
     score_bias: float = 1.0,
+    feedback_influence: Optional[RespondFeedbackInfluence] = None,
 ) -> List[Tuple[Dict[str, Any], float, List[str]]]:
     keywords = tokenize_prompt(prompt)
     prompt_counts = _count_occurrences([str(r.get("prompt_id") or "") for r in rows])
@@ -380,6 +647,11 @@ def retrieve_relevant_style_memories(
         )
         s *= style_memory_relevance_multiplier(prompt_norm, row, s)
         s *= sb
+        s = _apply_feedback_influence_to_score(
+            s,
+            blob=style_row_text_blob(row),
+            feedback_influence=feedback_influence,
+        )
         scored.append(
             (
                 row,
@@ -613,6 +885,7 @@ def _strict_conflict_shape_evidence_fallback(
     aggressive_short: bool,
     store: DatabaseStore,
     answer_focus: str = "both",
+    feedback_influence: Optional[RespondFeedbackInfluence] = None,
 ) -> Tuple[str, str, float, List[str], Tuple[str, ...]]:
     """Cautious likely-you line when strict conflict gating finds no decision row.
 
@@ -629,6 +902,12 @@ def _strict_conflict_shape_evidence_fallback(
         if (row.get("correction_status") or "") == "not_really":
             continue
         if sc < 0.28:
+            continue
+        if (
+            feedback_influence
+            and float(feedback_influence.avoidance_demote) >= 0.34
+            and _memory_blob_avoidance_hit(style_row_text_blob(row))
+        ):
             continue
         if not style_memory_passes_respond_conflict_shape(prompt_norm, row):
             continue
@@ -736,6 +1015,121 @@ def _strict_conflict_shape_evidence_fallback(
         )
         return answer, reasoning, 0.37, extra_basis, ()
 
+    cues = conflict_situational_cues(prompt_norm)
+    if (
+        cues["passive_slight"]
+        and not gossip
+        and feedback_influence
+        and float(feedback_influence.direct_calm_signal) >= 0.25
+    ):
+        if af == "action":
+            opts = (
+                "You'd probably address it directly but calmly — one clear example, no pile-on, and space for them to respond.",
+                "My read is you'd name the passive shot in plain words, keep your voice steady, and move it toward a direct fix.",
+            )
+        else:
+            opts = (
+                "You'd probably say you noticed the sideways jabs, that you want it straight between you, and keep the tone calm.",
+                "My read is you'd keep it short and forward — direct words, low heat — because the goal is clarity, not winning a performance.",
+            )
+        answer = opts[_stable_index(f"{phrase_seed}:cpass_fb", len(opts))]
+        if af == "both":
+            act_m = (
+                "You'd probably take one concrete moment, say what it looked like from your side, and ask for direct talk instead of digs.",
+                "My read is you'd keep it work-appropriate but firm — not a lecture — just ending the passive loop.",
+            )
+            answer = _merge_action_wording_paragraphs(
+                act_m[_stable_index(f"{phrase_seed}:cpass_fb_a", len(act_m))],
+                answer,
+                seed=f"{phrase_seed}:cpass_fb_m",
+            )
+        reasoning = (
+            "No tight conflict save on file; your recent corrections on this kind of ask point toward calm, direct addressing."
+        )
+        return answer, reasoning, 0.36, extra_basis, ()
+
+    if cues["passive_slight"] and not gossip:
+        if af == "action":
+            opts = (
+                "You'd probably address the indirect piece head-on — name one specific moment in plain words instead of hinting wider.",
+                "My read is you'd stop treating the snipes as background noise and say what you noticed, once, calmly.",
+            )
+        else:
+            opts = (
+                "You'd probably keep it short: what they did, that the sideways shots hurt, and that you want it straight.",
+                "My read is you'd sound matter-of-fact — no long diagnosis — just naming the dig and asking for direct talk.",
+            )
+        answer = opts[_stable_index(f"{phrase_seed}:cpass", len(opts))]
+        if af == "both":
+            act_m = (
+                "You'd probably move on a single concrete example — not a pattern lecture — so they cannot dodge as easily.",
+                "My read is you'd pick one beat to pin down rather than stacking every past slight.",
+            )
+            answer = _merge_action_wording_paragraphs(
+                act_m[_stable_index(f"{phrase_seed}:cpass_a", len(act_m))],
+                answer,
+                seed=f"{phrase_seed}:cpass_m",
+            )
+        reasoning = (
+            "No tight conflict save on file; this follows passive-aggressive-shaped wording in your prompt, not a stored scenario. "
+            "Useful guess only — confidence stays low."
+        )
+        return answer, reasoning, 0.36, extra_basis, ()
+
+    if cues["boundary_push"] and not gossip:
+        if af == "action":
+            opts = (
+                "You'd probably spell out the limit and what you do if they lean on it again — smaller words, same line each time.",
+                "My read is you'd treat it like upkeep: repeat the boundary without turning it into a big performance.",
+            )
+        else:
+            opts = (
+                "You'd probably say what is not okay, what you need them to stop, and that you are done re-explaining.",
+                "My read is you'd keep the wording steady — the same short sentence — instead of inventing a new speech each round.",
+            )
+        answer = opts[_stable_index(f"{phrase_seed}:cbpush", len(opts))]
+        if af == "both":
+            act_m = (
+                "You'd probably narrow your availability while you hold the line — actions backing the sentence, not extra debate.",
+                "My read is you'd pair fewer openings with the same clean limit until the pattern shifts.",
+            )
+            answer = _merge_action_wording_paragraphs(
+                act_m[_stable_index(f"{phrase_seed}:cbpush_a", len(act_m))],
+                answer,
+                seed=f"{phrase_seed}:cbpush_m",
+            )
+        reasoning = (
+            "No same-shape save; boundary-push cues in what you typed steer this read. Thin evidence — not a quote from your saves."
+        )
+        return answer, reasoning, 0.36, extra_basis, ()
+
+    if cues["repeat_pattern"] and cues["direct_blunt"] and not gossip:
+        if af == "action":
+            opts = (
+                "You'd probably stop treating repeat rudeness like a fluke — same short correction each time until it changes or you pull back.",
+                "My read is you'd switch from hoping it stops to naming it as a repeat and setting what you do next.",
+            )
+        else:
+            opts = (
+                "You'd probably say you have said this before, name the behavior again, and tell them it cannot keep landing.",
+                "My read is you'd sound calm but flat — not louder — because the issue is the repeat, not one sharp moment.",
+            )
+        answer = opts[_stable_index(f"{phrase_seed}:crepdir", len(opts))]
+        if af == "both":
+            act_m = (
+                "You'd probably shrink contact or scope if the blunt disrespect keeps showing up after you name it.",
+                "My read is you'd protect your week — fewer hooks for the same insult loop.",
+            )
+            answer = _merge_action_wording_paragraphs(
+                act_m[_stable_index(f"{phrase_seed}:crepdir_a", len(act_m))],
+                answer,
+                seed=f"{phrase_seed}:crepdir_m",
+            )
+        reasoning = (
+            "No tight save; repeat + direct insult cues in your prompt point this direction. Guess only — confidence stays low."
+        )
+        return answer, reasoning, 0.35, extra_basis, ()
+
     fit = profile_memory_fit_score(CONFLICT_FAMILY, prompt_norm)
     clause = _conflict_profile_tone_clause(profile_risk, communication_style)
     if clause and fit >= 0.38:
@@ -766,7 +1160,18 @@ def _strict_conflict_shape_evidence_fallback(
         )
         return answer, reasoning, 0.35, extra_basis, ()
 
-    if gossip:
+    if gossip and cues["repeat_pattern"]:
+        if af == "action":
+            opts = (
+                "You'd probably treat repeat sideways talk like a pattern — face-to-face, what keeps showing up, and that it stops here.",
+                "My read is you'd say what you heard plainly, close the rumor loop, and name that it keeps happening — not like one weird week.",
+            )
+        else:
+            opts = (
+                "You'd probably say you have heard versions more than once, keep your voice flat, and ask for direct talk instead of chatter.",
+                "My read is you'd sound plain and stop the sideways version — repeat talk is different from one stray comment.",
+            )
+    elif gossip:
         if af == "action":
             opts = (
                 "You'd probably address it directly in person: name what you heard, keep your footing, and shut down the behind-the-back piece.",
@@ -776,6 +1181,17 @@ def _strict_conflict_shape_evidence_fallback(
             opts = (
                 "You'd probably address it directly: name what you heard, keep your voice steady, and say you want the behind-the-back talk to stop.",
                 "My read is you'd go short and clear — not a long fight — but you would not pretend you did not notice people talking about you behind your back.",
+            )
+    elif cues["timing_later"] and not cues["timing_now"]:
+        if af == "action":
+            opts = (
+                "You'd probably wait until you have a steady minute, then have the direct talk you already know you need.",
+                "My read is you'd time it on purpose — not to dodge, just so the words land the way you mean them.",
+            )
+        else:
+            opts = (
+                "You'd probably say less in the heat and more once you can keep it to one clean sentence.",
+                "My read is your wording would be calmer with a pause — same point, less static on the line.",
             )
     else:
         if af == "action":
@@ -1079,6 +1495,8 @@ def generate_personal_response(
 
     prompt_norm = normalize_input(text)
     answer_focus = classify_answer_focus(prompt_norm)
+    phrase_seed = hashlib.sha256(normalize_input(text).encode("utf-8")).hexdigest()[:24]
+    prompt_norm_hash = hashlib.sha256(prompt_norm.encode("utf-8")).hexdigest()
 
     ordered_pf, _ = rank_families(prompt_norm)
     primary_pf = ordered_pf[0][0] if ordered_pf else "general"
@@ -1092,6 +1510,10 @@ def generate_personal_response(
     except Exception:
         mmap = {}
 
+    feedback_influence = build_respond_feedback_influence(
+        store, prompt_norm_hash, str(eff_pf or "general")
+    )
+
     d_bias = 1.09 if answer_focus == "action" else (0.91 if answer_focus == "wording" else 1.0)
     s_bias = 1.09 if answer_focus == "wording" else (0.91 if answer_focus == "action" else 1.0)
     d_ranked = retrieve_relevant_decision_memories(
@@ -1101,6 +1523,7 @@ def generate_personal_response(
         min_score=0.38,
         evidence_mult_map=mmap,
         score_bias=d_bias,
+        feedback_influence=feedback_influence,
     )
     s_ranked = retrieve_relevant_style_memories(
         s_rows,
@@ -1108,6 +1531,7 @@ def generate_personal_response(
         top_k=4,
         evidence_mult_map=mmap,
         score_bias=s_bias,
+        feedback_influence=feedback_influence,
     )
 
     d_gated = [
@@ -1132,8 +1556,6 @@ def generate_personal_response(
             str(top_d[0].get("reasoning_label") or ""),
         )
     )
-    phrase_seed = hashlib.sha256(normalize_input(text).encode("utf-8")).hexdigest()[:24]
-    prompt_norm_hash = hashlib.sha256(prompt_norm.encode("utf-8")).hexdigest()
 
     agreement_boost = 0.0
     memory_basis: List[str] = []
@@ -1163,6 +1585,8 @@ def generate_personal_response(
     cross_boost = clarification_cross_evidence_boost(
         prompt_norm, eff_pf, rel_facts, tmap
     )
+    if int(feedback_influence.wrong_replacement_count or 0) >= 2:
+        cross_boost *= 0.52
     if cross_boost > 0:
         agreement_boost = min(1.0, agreement_boost + cross_boost)
 
@@ -1509,6 +1933,7 @@ def generate_personal_response(
             aggressive_short=aggressive_short,
             store=store,
             answer_focus=answer_focus,
+            feedback_influence=feedback_influence,
         )
         answer = ans
         reasoning = reas
@@ -1665,6 +2090,15 @@ def generate_personal_response(
             route_keys=("insufficient_evidence",),
             answer_focus=answer_focus,
         )
+
+    answer, reasoning = _apply_feedback_replacement_overlay(
+        answer,
+        reasoning,
+        feedback_influence=feedback_influence,
+        phrase_seed=phrase_seed,
+        answer_focus=answer_focus,
+        eff_pf=str(eff_pf or "general"),
+    )
 
     path_m = _respond_path_multipliers(evidence_path, mmap)
     conf = _compute_response_confidence(

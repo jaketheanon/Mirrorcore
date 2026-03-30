@@ -16,6 +16,7 @@ from ..persona.profile import PersonalProfile, build_personal_profile
 from ..router import normalize_input
 from .cross_system_knowledge import build_ask_interview_memory_line_candidates
 from .memory_relevance import (
+    conflict_situational_cues,
     profile_decision_speed_snippet_allowed,
     profile_memory_fit_score,
     profile_risk_snippet_allowed,
@@ -227,6 +228,24 @@ def _all_slots() -> Tuple[ClarificationSlot, ...]:
             ),
         ),
         ClarificationSlot(
+            "conflict_aim",
+            frozenset({CONFLICT_FAMILY}),
+            19,
+            "What are you mainly leaning toward — letting it ride, saying something, drawing a line, or taking space?",
+            filled_markers=(
+                "let it go", "let it ride", "drop it", "move on", "letting it",
+                "say something", "speak up", "call it out", "address",
+                "boundary", "hard line", "won't accept", "draw a line",
+                "distance", "pull back", "less contact", "space", "step back",
+                "wait until", "later", "cool off", "not today",
+            ),
+            boost_dims=("conflict_intensity", "interpersonal_hurt"),
+            question_variants=(
+                "Right now, are you more toward riding it out, saying your piece, setting a boundary, or backing off contact?",
+                "Which way feels closer — let it pass, speak up, name a limit, or give yourself distance?",
+            ),
+        ),
+        ClarificationSlot(
             "stakes_real",
             frozenset({CONFLICT_FAMILY}),
             26,
@@ -430,6 +449,46 @@ def _extract_situation_and_tendency(
             tend.append(("tendency_peace_over_confrontation", 0.35))
         if has("say", "clear", "honest", "address"):
             tend.append(("tendency_clarity_priority", 0.35))
+    elif sid == "pattern_vs_once":
+        if has(
+            "pattern",
+            "keeps",
+            "again",
+            "every time",
+            "not the first",
+            "repeatedly",
+            "ongoing",
+        ):
+            sit.append(("disrespect_pattern", "repeat"))
+            tend.append(("tendency_repeat_disrespect_not_oneoff", 0.38))
+        elif has("one time", "first time", "only once", "just this once"):
+            sit.append(("disrespect_pattern", "once"))
+    elif sid == "timing_conflict":
+        if has("today", "now", "right away", "asap", "cant wait", "can't wait"):
+            sit.append(("conflict_timing_pref", "now"))
+        elif has("wait", "later", "tomorrow", "calm", "cool", "sleep"):
+            sit.append(("conflict_timing_pref", "later"))
+    elif sid == "conflict_aim":
+        if has("let it", "let it ride", "drop", "move on", "ignore", "let pass"):
+            sit.append(("conflict_stance", "let_ride"))
+            tend.append(("tendency_let_ride_conflict", 0.34))
+        if has("say", "speak", "call out", "address", "confront", "tell them"):
+            sit.append(("conflict_stance", "speak"))
+            tend.append(("tendency_speak_up_conflict", 0.35))
+        if has("boundary", "line", "won't accept", " wont accept", "not ok", "not okay", "limit"):
+            sit.append(("conflict_stance", "boundary"))
+            tend.append(("tendency_hard_boundary", 0.35))
+        if has(
+            "distance",
+            "space",
+            "pull back",
+            "less contact",
+            "back off",
+            "cool off",
+            "step away",
+        ):
+            sit.append(("conflict_stance", "distance"))
+            tend.append(("tendency_pull_back_contact", 0.33))
     elif sid == "reversibility":
         if has("undo", "change", "reversible", "adjust"):
             sit.append(("choice_reversibility", "high"))
@@ -826,7 +885,233 @@ def _tendency_line_candidates(
             ek, es, et = low_e[_stable_index(f"{seed}:tlowe", len(low_e))]
             out.append((ek, es, et))
 
+    rd = float(tmap.get("tendency_repeat_disrespect_not_oneoff", 0.0))
+    if rd >= 0.44 and primary_family == CONFLICT_FAMILY:
+        hurt0 = dims0.get("interpersonal_hurt", 0) + dims0.get("conflict_intensity", 0)
+        if hurt0 >= 0.68 and fit >= 0.48:
+            out.append(
+                (
+                    "tendency_repeat_disrespect",
+                    rd * fit * 1.02,
+                    "Repeat disrespect is a different beast than one rough moment — small, steady responses "
+                    "usually beat hoping it magically stops.",
+                )
+            )
+
+    su = float(tmap.get("tendency_speak_up_conflict", 0.0))
+    if su >= 0.44 and primary_family == CONFLICT_FAMILY and fit >= 0.48:
+        out.append(
+            (
+                "tendency_speak_up",
+                su * fit * 1.01,
+                "You’ve leaned toward naming problems instead of swallowing them — if that habit fits here, "
+                "keep the line short and specific.",
+            )
+        )
+
+    hb = float(tmap.get("tendency_hard_boundary", 0.0))
+    if hb >= 0.44 and primary_family == CONFLICT_FAMILY and fit >= 0.48:
+        out.append(
+            (
+                "tendency_hard_boundary_line",
+                hb * fit * 1.02,
+                "You’ve circled limits before — plain rules you can repeat beat one explosive ‘finally’ moment.",
+            )
+        )
+
+    pb = float(tmap.get("tendency_pull_back_contact", 0.0))
+    if pb >= 0.43 and primary_family == CONFLICT_FAMILY and fit >= 0.48:
+        out.append(
+            (
+                "tendency_pull_back",
+                pb * fit * 1.01,
+                "Backing off contact has been a real move for you — less availability is still a decision, not dodgeball.",
+            )
+        )
+
+    lr = float(tmap.get("tendency_let_ride_conflict", 0.0))
+    if lr >= 0.43 and primary_family == CONFLICT_FAMILY and fit >= 0.52:
+        if dims0.get("interpersonal_hurt", 0) + dims0.get("conflict_intensity", 0) >= 0.85:
+            out.append(
+                (
+                    "tendency_let_ride_cost",
+                    lr * fit * 0.94,
+                    "You sometimes ride things out for peace — just check the cost if the same slight keeps landing.",
+                )
+            )
+
     return out
+
+
+def _conflict_family_guidance(
+    ctx: str,
+    merged_norm: str,
+    dimensions: Dict[str, float],
+    phrase_seed: str,
+) -> str:
+    """Phase 40: primary conflict/boundary paragraph (deterministic, plain language)."""
+    cues = conflict_situational_cues(merged_norm)
+    hurt = float(dimensions.get("interpersonal_hurt", 0) or 0) + float(
+        dimensions.get("conflict_intensity", 0) or 0
+    )
+    repeat_ctx = cues["repeat_pattern"] or any(
+        x in ctx
+        for x in (
+            "keeps happening",
+            "again and again",
+            " every time",
+            "pattern",
+            "not the first",
+            "repeatedly",
+        )
+    )
+    once_ctx = any(
+        x in ctx
+        for x in ("one time", "first time", "only once", "just this once")
+    )
+    stance_let = any(
+        x in ctx
+        for x in (
+            "let it go",
+            "let it ride",
+            "drop it",
+            "move on",
+            "let it pass",
+            "letting it",
+        )
+    )
+    stance_speak = any(
+        x in ctx
+        for x in ("say something", "speak up", "call it out", "address", "confront", "tell them")
+    )
+    stance_boundary = any(
+        x in ctx
+        for x in ("boundary", "hard line", "draw a line", "won't accept", " wont accept", "limit")
+    )
+    stance_distance = any(
+        x in ctx
+        for x in ("distance", "pull back", "less contact", "space", "step back", "back off")
+    )
+    timing_later_ctx = cues["timing_later"] or any(
+        x in ctx for x in ("wait until", "later", "tomorrow", "calmer", "cool off", "not today")
+    )
+    timing_now_ctx = cues["timing_now"] or ("today" in ctx and "wait" not in ctx)
+    peace_pref = any(x in ctx for x in ("peace", "quiet", "avoid", "keep calm"))
+    clarity_pref = any(x in ctx for x in ("say", "clear", "honest", "address", "speak"))
+
+    def pick(*variants: str) -> str:
+        return variants[_stable_index(f"{phrase_seed}:cf40", len(variants))]
+
+    if cues["gossip_backchannel"] and repeat_ctx:
+        return pick(
+            "Sideways talk that keeps coming back is usually a pattern, not a misunderstanding. "
+            "A short, direct talk tends to beat letting it spread — keep names and facts plain, and say you want it handled face-to-face.",
+            "When whispering keeps happening, treating it like a one-off joke usually teaches people it is fine to continue. "
+            "Most people shut the loop with what they heard, that it is not okay, and that it stops here.",
+        )
+    if cues["gossip_backchannel"]:
+        return pick(
+            "Behind-the-back stuff rots trust even if you want to be easygoing. "
+            "If you move, use one fact you know and ask for direct talk instead of more hallway versions.",
+            "Gossip is usually calmer to close in person than over text. "
+            "You can keep your tone steady and still be blunt that sideways talk is not okay with you.",
+        )
+    if cues["passive_slight"] and repeat_ctx:
+        return pick(
+            "Little digs that keep landing are a habit problem — swallowing every one usually trains it. "
+            "Name the exact behavior once in plain words, without stacking every old example.",
+            "Passive cuts add up. A calm, specific line about what you notice often stops the drip better than hinting.",
+        )
+    if cues["passive_slight"]:
+        return pick(
+            "Passive-aggressive stuff is easy to dodge by pretending it is nothing — that usually invites more of it. "
+            "Naming one concrete moment tends to land better than vague ‘you are being weird’ energy.",
+            "Snide shots wear you down slowly. One short, plain correction can still fit a calm tone.",
+        )
+    if cues["boundary_push"] and repeat_ctx:
+        return pick(
+            "If they keep pressing the same line after you already said no, that is boundary testing, not normal friction. "
+            "A steady rule plus what you do if it crosses again beats hoping they read your mind.",
+            "Repeated pushing needs a clear limit you can repeat the same way every time — short sentence, same words.",
+        )
+    if cues["boundary_push"]:
+        return pick(
+            "When someone leans across a line you drew, smaller reminders usually beat saving it for one big blow-up.",
+            "Boundary push calls for plain wording — what is not okay and what changes if it happens again.",
+        )
+    if stance_boundary and timing_later_ctx:
+        return pick(
+            "A boundary can land better after you are steady. Pick the moment, then keep it short — not a lecture.",
+            "Waiting until you are calm is not wasted time if the line has to hold. One clear sentence beats pushing while fried.",
+        )
+    if stance_boundary:
+        return pick(
+            "A real boundary is behavior — what you will not keep eating, and what you do if it keeps happening.",
+            "Draw the line as one concrete rule, not a long list. Plain words, easy to repeat.",
+        )
+    if stance_distance:
+        return pick(
+            "Taking space is a move — less contact, fewer favors, fewer openings while you see what you can live with.",
+            "Backing off contact can be honest when repair is not on the table. Keep the pull-back simple and repeatable.",
+        )
+    if stance_let and repeat_ctx and hurt >= 1.0:
+        return pick(
+            "Letting it ride only stays fair to you if the cost is truly low — repeat disrespect usually needs some response, even a small one.",
+            "If the same slight keeps landing, ‘drop it’ often trains it. A tiny, clear correction can still fit a peace-first goal.",
+        )
+    if stance_let:
+        return pick(
+            "Letting it go only works if you can live with the trade — less mess now, maybe more bitterness later. "
+            "If the sting is small and the relationship matters more, riding it out can be a real choice.",
+            "If you let it pass, treat it as a decision — not as proof it did not bother you. Check in with yourself in a few days.",
+        )
+    if stance_speak and timing_later_ctx:
+        return pick(
+            "Words can wait until your voice is steady — jot the one point you need so you do not lose it in the heat.",
+            "Later is fine if the point is still true tomorrow. Pick a time that does not ambush them or you.",
+        )
+    if stance_speak and cues["direct_blunt"]:
+        return pick(
+            "Straight disrespect still deserves a clean answer — short and specific, not a speech unless safety is on the line.",
+            "Blunt rudeness is easier to meet with plain words than with clever comebacks. Say what happened and what you expect next time.",
+        )
+    if stance_speak:
+        return pick(
+            "If you speak, one fact and one ask usually go further than a full case file.",
+            "Know what you want after — patch it, distance, or just being left alone — before you open your mouth.",
+        )
+    if peace_pref and clarity_pref:
+        return pick(
+            "You can want calm and still be clear — steady voice, short line, repeat if they dodge.",
+            "Peace with clarity is mostly slowing the heat, not watering down the truth. One clean sentence beats a long vent.",
+        )
+    if peace_pref:
+        return pick(
+            "If calm matters most, small steady limits usually beat one huge blow-up. You can stay decent and still say what you will not take.",
+            "If you want calm more than drama, repeat small limits instead of saving it all for one blast — kind can still mean firm.",
+            "If keeping the peace matters most, small steady limits usually beat one huge blow-up. You can stay decent and still say what you will not take.",
+        )
+    if clarity_pref:
+        return pick(
+            "If something needs saying, one clear point and one example beats a long speech. Say what you want next time, not your whole history.",
+            "When you need words out, lead with one fact and one ask — short and concrete beats a long vent.",
+            "If something needs saying, one clear point and one example beats a long speech. Name what you want next time, not your whole life story.",
+        )
+    if once_ctx and cues["passive_slight"]:
+        return pick(
+            "One snide moment might be a bad day — worth one calm name-it line if it stops there.",
+            "A single dig can be noise; decide if one plain correction is enough or if you are done investing.",
+        )
+    if timing_now_ctx and not timing_later_ctx and hurt >= 1.1:
+        return pick(
+            "If it has to be today, keep the lane narrow — one issue, no laundry list, and an exit if it gets circular.",
+            "Urgent does not mean sloppy. Even same-day words land better as one clean point than a scattershot vent.",
+        )
+    return pick(
+        "This is mostly about what you can live with afterward. Decide if you want repair, distance, or straight talk — those take different moves.",
+        "Ask what you want on the other side: patch it up, back away, or say it plain. Each goal needs a different playbook.",
+        "This is mostly about what you can live with afterward. Decide if you want things patched, some distance, or just straight talk — those take different moves.",
+    )
 
 
 def _pattern_repeat_line_keyed(
@@ -993,45 +1278,9 @@ def build_routed_decision_guidance(
             )
             bodies.append(v[_stable_index(f"{phrase_seed}:ob_def", len(v))])
     elif primary == CONFLICT_FAMILY:
-        if "peace" in ctx or "quiet" in ctx or "avoid" in ctx:
-            v = (
-                (
-                    "If calm matters most, small steady limits usually beat one huge blow-up. You can stay decent and still say what you won’t take."
-                ),
-                (
-                    "If keeping the peace matters most, small steady limits usually beat one huge blow-up. You can stay decent and still say what you won’t take."
-                ),
-                (
-                    "If you want calm more than drama, repeat small boundaries instead of saving it all for one blast — you can be kind and still draw a line."
-                ),
-            )
-            bodies.append(v[_stable_index(f"{phrase_seed}:cf_peace", len(v))])
-        elif "say" in ctx or "clear" in ctx or "honest" in ctx:
-            v = (
-                (
-                    "If something needs saying, one clear point and one example beats a long speech. Say what you want next time, not your whole life story."
-                ),
-                (
-                    "If something needs saying, one clear point and one example beats a long speech. Name what you want next time, not your whole history."
-                ),
-                (
-                    "When you need words out, lead with one fact and one ask — short and concrete beats a long vent."
-                ),
-            )
-            bodies.append(v[_stable_index(f"{phrase_seed}:cf_say", len(v))])
-        else:
-            v = (
-                (
-                    "This is mostly about what you can live with afterward. Decide if you want things fixed, some distance, or just straight talk — those take different moves."
-                ),
-                (
-                    "This is mostly about what you can live with afterward. Decide if you want repair, distance, or straight talk — those take different moves."
-                ),
-                (
-                    "Ask what you want on the other side: patch it up, back away, or say it plain. Each goal needs a different playbook."
-                ),
-            )
-            bodies.append(v[_stable_index(f"{phrase_seed}:cf_def", len(v))])
+        bodies.append(
+            _conflict_family_guidance(ctx, merged_norm, dims_order, phrase_seed)
+        )
     elif primary == RISK_TIMING:
         v = (
             (

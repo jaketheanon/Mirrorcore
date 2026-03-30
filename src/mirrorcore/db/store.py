@@ -265,10 +265,16 @@ class DatabaseStore:
         """Map stored weight row to a retrieval multiplier (deterministic, bounded)."""
         b = float(balance or 0.0)
         w = int(wrong_count or 0)
-        base = 1.0 + b * 0.062
-        streak = min(9, w) * 0.034
+        base = 1.0 + b * 0.072
+        streak = min(12, w) * 0.041
         m = base - streak
-        return max(0.26, min(1.13, m))
+        if w >= 4:
+            floor = 0.11
+        elif w >= 2:
+            floor = 0.17
+        else:
+            floor = 0.24
+        return max(floor, min(1.13, m))
 
     def get_respond_evidence_multiplier_map(self) -> Dict[str, float]:
         """All evidence keys → multiplier for respond / ask memory ranking."""
@@ -355,12 +361,47 @@ class DatabaseStore:
             )
             conn.commit()
 
+    def list_personal_response_feedback_for_prompt(
+        self, prompt_norm_hash: str, limit: int = 40
+    ) -> List[Dict[str, Any]]:
+        """Newest-first feedback rows for one prompt hash (Phase 40)."""
+        conn = self.get_db_connection()
+        lim = max(1, min(80, int(limit)))
+        h = (prompt_norm_hash or "").strip()
+        if not h:
+            return []
+        rows = conn.execute(
+            """
+            SELECT id, timestamp, scenario_snippet, rating, partial_aspect,
+                   replacement_text, confidence_shown, effective_family,
+                   evidence_path_json, likely_answer_snippet, feedback_target
+            FROM personal_response_feedback
+            WHERE prompt_norm_hash = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (h, lim),
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["evidence_path"] = json.loads(d.pop("evidence_path_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                d["evidence_path"] = {}
+            out.append(d)
+        return out
+
     def _apply_phase38_feedback_to_weights(
         self,
         rating: str,
         partial_aspect: Optional[str],
         evidence_path: Dict[str, Any],
         feedback_target: Optional[str] = None,
+        *,
+        repeat_scale: float = 1.0,
+        replacement_text: Optional[str] = None,
+        effective_family: Optional[str] = None,
     ) -> None:
         """Adjust respond_evidence_weights from one feedback (deterministic)."""
         r = (rating or "").strip().lower()
@@ -370,6 +411,19 @@ class DatabaseStore:
             ft = (evidence_path.get("answer_focus") or "").strip().lower() or None
         if ft not in ("action", "wording", "both"):
             ft = "both"
+        rs = max(1.0, min(3.15, float(repeat_scale or 1.0)))
+        rep = (replacement_text or "").strip().lower()
+        rep_direct_calm = any(
+            x in rep
+            for x in (
+                "address",
+                "direct",
+                "calm",
+                "straightforward",
+                "honest conversation",
+                "name it",
+            )
+        )
 
         def dkey(prefix: str, x: str) -> str:
             xs = (x or "").strip()
@@ -385,6 +439,8 @@ class DatabaseStore:
             dkey("clarif_slot", x) for x in evidence_path.get("clarif_slot_keys") or []
         ]
         clarifs = [k for k in clarifs if k]
+        has_specific = bool(decisions or styles)
+        route_clar_scale = 0.32 if (r == "wrong" and has_specific) else 1.0
 
         # Phase 39: weight adjustments by what the user says was wrong/right.
         d_wrong, s_wrong, rw_wrong, cl_wrong = 1.0, 1.0, 1.0, 1.0
@@ -395,46 +451,54 @@ class DatabaseStore:
             d_wrong, rw_wrong, cl_wrong = 0.38, 0.35, 0.35
             d_wr, rw_wr, cl_wr = 0.35, 0.32, 0.32
 
+        fam_l = (effective_family or "").lower()
+        conflict_ctx = "conflict" in fam_l
+        shape_pen = 1.15 * rs if (conflict_ctx and rep_direct_calm and r == "wrong") else rs
+        wrong_d_base = -0.57 * shape_pen
+        wrong_s_base = -0.50 * shape_pen
+
         if r == "wrong":
             for k in decisions:
                 self.merge_respond_evidence_delta(
-                    k, -0.46 * d_wrong, mark_wrong=True
+                    k, wrong_d_base * d_wrong, mark_wrong=True
                 )
             for k in styles:
                 self.merge_respond_evidence_delta(
-                    k, -0.42 * s_wrong, mark_wrong=True
+                    k, wrong_s_base * s_wrong, mark_wrong=True
                 )
             for k in routes:
                 self.merge_respond_evidence_delta(
-                    k, -0.28 * rw_wrong, mark_wrong=True
+                    k, -0.28 * rw_wrong * route_clar_scale, mark_wrong=True
                 )
             for k in clarifs:
                 self.merge_respond_evidence_delta(
-                    k, -0.24 * cl_wrong, mark_wrong=True
+                    k, -0.24 * cl_wrong * route_clar_scale, mark_wrong=True
                 )
             return
 
         if r == "right":
             for k in decisions:
                 self.merge_respond_evidence_delta(
-                    k, 0.13 * d_wr, mark_right=True
+                    k, 0.13 * d_wr * min(1.35, rs), mark_right=True
                 )
             for k in styles:
                 self.merge_respond_evidence_delta(
-                    k, 0.08 * s_wr, mark_right=True
+                    k, 0.08 * s_wr * min(1.35, rs), mark_right=True
                 )
             for k in routes:
                 self.merge_respond_evidence_delta(
-                    k, 0.05 * rw_wr, mark_right=True
+                    k, 0.05 * rw_wr * min(1.25, rs), mark_right=True
                 )
             for k in clarifs:
                 self.merge_respond_evidence_delta(
-                    k, 0.04 * cl_wr, mark_right=True
+                    k, 0.04 * cl_wr * min(1.25, rs), mark_right=True
                 )
             return
 
         if r != "partly":
             return
+
+        rc = 0.32 if has_specific else 1.0
 
         # Partly right — split by aspect; unknown aspect = light touch everywhere.
         if pa == "action_ok_word_bad":
@@ -443,27 +507,27 @@ class DatabaseStore:
             for k in styles:
                 self.merge_respond_evidence_delta(k, -0.36, mark_wrong=True)
             for k in routes:
-                self.merge_respond_evidence_delta(k, -0.12, mark_wrong=True)
+                self.merge_respond_evidence_delta(k, -0.12 * rw_wrong * rc, mark_wrong=True)
             for k in clarifs:
-                self.merge_respond_evidence_delta(k, -0.10, mark_wrong=True)
+                self.merge_respond_evidence_delta(k, -0.10 * cl_wrong * rc, mark_wrong=True)
         elif pa == "word_ok_action_bad":
             for k in decisions:
                 self.merge_respond_evidence_delta(k, -0.34, mark_wrong=True)
             for k in styles:
                 self.merge_respond_evidence_delta(k, 0.05, mark_right=True)
             for k in routes:
-                self.merge_respond_evidence_delta(k, -0.12, mark_wrong=True)
+                self.merge_respond_evidence_delta(k, -0.12 * rw_wrong * rc, mark_wrong=True)
             for k in clarifs:
-                self.merge_respond_evidence_delta(k, -0.10, mark_wrong=True)
+                self.merge_respond_evidence_delta(k, -0.10 * cl_wrong * rc, mark_wrong=True)
         elif pa == "same_direction_phrase":
             for k in decisions:
                 self.merge_respond_evidence_delta(k, 0.03, mark_right=True)
             for k in styles:
                 self.merge_respond_evidence_delta(k, -0.18, mark_wrong=True)
             for k in routes:
-                self.merge_respond_evidence_delta(k, -0.16, mark_wrong=True)
+                self.merge_respond_evidence_delta(k, -0.16 * rw_wrong * rc, mark_wrong=True)
             for k in clarifs:
-                self.merge_respond_evidence_delta(k, -0.08, mark_wrong=True)
+                self.merge_respond_evidence_delta(k, -0.08 * cl_wrong * rc, mark_wrong=True)
         else:
             for k in decisions:
                 self.merge_respond_evidence_delta(
@@ -475,11 +539,11 @@ class DatabaseStore:
                 )
             for k in routes:
                 self.merge_respond_evidence_delta(
-                    k, -0.18 * rw_wrong, mark_wrong=True
+                    k, -0.18 * rw_wrong * rc, mark_wrong=True
                 )
             for k in clarifs:
                 self.merge_respond_evidence_delta(
-                    k, -0.08 * cl_wrong, mark_wrong=True
+                    k, -0.08 * cl_wrong * rc, mark_wrong=True
                 )
 
     def record_personal_response_feedback(
@@ -511,6 +575,18 @@ class DatabaseStore:
                 ft = "wording"
         if ft not in ("action", "wording", "both", None):
             ft = None
+        rlow = (rating or "").strip().lower()
+        prior_wrong = 0
+        if rlow == "wrong":
+            pr = conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM personal_response_feedback
+                WHERE prompt_norm_hash = ? AND LOWER(TRIM(rating)) = 'wrong'
+                """,
+                (prompt_norm_hash,),
+            ).fetchone()
+            prior_wrong = int(pr["n"]) if pr else 0
+        repeat_scale = min(3.15, 1.0 + 0.43 * prior_wrong)
         conn.execute(
             """
             INSERT INTO personal_response_feedback
@@ -536,7 +612,13 @@ class DatabaseStore:
         )
         conn.commit()
         self._apply_phase38_feedback_to_weights(
-            rating, partial_aspect, evidence_path, feedback_target=ft
+            rating,
+            partial_aspect,
+            evidence_path,
+            feedback_target=ft,
+            repeat_scale=repeat_scale,
+            replacement_text=replacement_text,
+            effective_family=effective_family,
         )
         return eid
 

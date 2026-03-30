@@ -34,6 +34,10 @@ SITUATION_KEY_FAMILIES: Dict[str, frozenset] = {
     "choice_reversibility": frozenset(
         {RISK_TIMING, SPENDING, GENERAL, CONFLICT_FAMILY, LOYALTY_BOUNDARY}
     ),
+    # Phase 40: conflict stance / pattern from clarification answers
+    "conflict_stance": frozenset({CONFLICT_FAMILY}),
+    "conflict_timing_pref": frozenset({CONFLICT_FAMILY, RISK_TIMING}),
+    "disrespect_pattern": frozenset({CONFLICT_FAMILY}),
 }
 
 
@@ -106,6 +110,26 @@ def filter_relevant_situation_facts(
                 dims.get("wait_vs_act", 0) + dims.get("uncertainty", 0) < 0.55
                 and "revers" not in prompt_norm
                 and "undo" not in prompt_norm
+            ):
+                continue
+        if sk in ("conflict_stance", "disrespect_pattern", "conflict_timing_pref"):
+            hurt = dims.get("interpersonal_hurt", 0) + dims.get("conflict_intensity", 0)
+            if eff != CONFLICT_FAMILY and hurt < 0.82:
+                continue
+            if hurt < 0.45 and not any(
+                x in prompt_norm
+                for x in (
+                    "rude",
+                    "disrespect",
+                    "boundary",
+                    "coworker",
+                    "boss",
+                    "say something",
+                    "upset",
+                    "gossip",
+                    "behind",
+                    "passive",
+                )
             ):
                 continue
         out.append(row)
@@ -269,5 +293,17 @@ def clarification_cross_evidence_boost(
             boost += min(0.07, peace * 0.09)
         if clar >= 0.48 and hurt >= 0.62:
             boost += min(0.06, clar * 0.08)
+        sp = float(tmap.get("tendency_speak_up_conflict", 0.0))
+        hb = float(tmap.get("tendency_hard_boundary", 0.0))
+        pb = float(tmap.get("tendency_pull_back_contact", 0.0))
+        lr = float(tmap.get("tendency_let_ride_conflict", 0.0))
+        if sp >= 0.44 and hurt >= 0.55:
+            boost += min(0.055, sp * 0.07)
+        if hb >= 0.44 and hurt >= 0.55:
+            boost += min(0.052, hb * 0.065)
+        if pb >= 0.43 and hurt >= 0.55:
+            boost += min(0.048, pb * 0.06)
+        if lr >= 0.43 and hurt >= 0.62:
+            boost += min(0.045, lr * 0.055)
 
     return min(0.24, boost)

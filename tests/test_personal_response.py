@@ -22,6 +22,7 @@ from mirrorcore.decision.memory_relevance import respond_main_decision_passes_sh
 from mirrorcore.decision.routed_clarification import rank_families
 from mirrorcore.persona.respond import (
     RespondEvidencePath,
+    build_respond_feedback_influence,
     classify_answer_focus,
     generate_personal_response,
     retrieve_relevant_decision_memories,
@@ -941,6 +942,182 @@ class TestPhase38RespondFeedback(unittest.TestCase):
             pr.evidence_path.to_storage_dict().get("answer_focus", ""),
             ("action", "wording", "both"),
         )
+
+
+class TestPhase40FeedbackInfluence(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = DatabaseStore(Path(self.tmp.name))
+        self.db.initialize_database()
+
+    def tearDown(self):
+        self.db.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_list_feedback_for_prompt_hash(self):
+        h = "cafef00d" * 4
+        self.db.record_personal_response_feedback(
+            scenario_snippet="x",
+            prompt_norm_hash=h,
+            rating="wrong",
+            partial_aspect=None,
+            replacement_text="address it directly",
+            confidence_shown=0.5,
+            effective_family="conflict",
+            evidence_path={"decision_ids": ["d1"], "route_keys": ["strong_decision"]},
+            likely_answer_snippet="let it go",
+            feedback_target="both",
+        )
+        rows = self.db.list_personal_response_feedback_for_prompt(h, limit=5)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["replacement_text"], "address it directly")
+
+    def test_repeated_wrong_with_replacement_shifts_passive_aggressive_answer(self):
+        self.db.record_decision_memory(
+            scenario_id="pa_snide",
+            scenario_text=(
+                "passive aggressive coworker snide remarks sideways comments at work "
+                "when someone is being passive aggressive"
+            ),
+            choice_label="Let it go and stay professional",
+            choice_value="x",
+            reasoning_label="Not worth the energy today",
+            reasoning_value="y",
+            value_tags=["patience", "professional"],
+            trait_signals={},
+            confidence_score=0.92,
+            correction_status="accurate",
+        )
+        self.db.record_decision_memory(
+            scenario_id="pa_direct",
+            scenario_text=("teammate passive aggressive undermine work need to address calmly"),
+            choice_label="Address it directly but calmly",
+            choice_value="d",
+            reasoning_label="Stop the sideways pattern",
+            reasoning_value="s",
+            value_tags=["directness"],
+            trait_signals={},
+            confidence_score=0.88,
+            correction_status="accurate",
+        )
+        q = (
+            "what would i do and say if someone is being passive aggressive at work"
+        )
+        pr = generate_personal_response(q, self.db)
+        self.assertIn("let it go", pr.likely_answer.lower())
+        h = pr.prompt_norm_hash
+        for _ in range(3):
+            self.db.record_personal_response_feedback(
+                scenario_snippet=q,
+                prompt_norm_hash=h,
+                rating="wrong",
+                partial_aspect=None,
+                replacement_text="address it directly but calmly",
+                confidence_shown=pr.confidence,
+                effective_family=pr.effective_family,
+                evidence_path=pr.evidence_path.to_storage_dict(),
+                likely_answer_snippet=pr.likely_answer[:200],
+                feedback_target="both",
+            )
+            pr = generate_personal_response(q, self.db)
+        low = pr.likely_answer.lower()
+        self.assertNotIn("let it go", low)
+        self.assertTrue(
+            ("address" in low or "direct" in low or "calm" in low or "plain" in low),
+            msg=pr.likely_answer,
+        )
+        infl = build_respond_feedback_influence(self.db, h, pr.effective_family)
+        self.assertGreater(len(infl.pref_token_weight), 0)
+        self.assertGreater(infl.avoidance_demote, 0.3)
+
+    def test_two_wrong_with_same_replacement_injects_replacement_text(self):
+        self.db.record_decision_memory(
+            scenario_id="pa_one",
+            scenario_text="passive aggressive colleague at work snide passive aggressive",
+            choice_label="Let it go for now",
+            choice_value="a",
+            reasoning_label="Keep it smooth",
+            reasoning_value="b",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.91,
+            correction_status="accurate",
+        )
+        q = "what would i do and say if someone is being passive aggressive at work"
+        rep = "address it directly but calmly"
+        pr = generate_personal_response(q, self.db)
+        h = pr.prompt_norm_hash
+        for _ in range(2):
+            self.db.record_personal_response_feedback(
+                scenario_snippet=q,
+                prompt_norm_hash=h,
+                rating="wrong",
+                partial_aspect=None,
+                replacement_text=rep,
+                confidence_shown=pr.confidence,
+                effective_family=pr.effective_family,
+                evidence_path=pr.evidence_path.to_storage_dict(),
+                likely_answer_snippet=pr.likely_answer[:200],
+                feedback_target="both",
+            )
+            pr = generate_personal_response(q, self.db)
+        self.assertIn("address it directly but calmly", pr.likely_answer.lower())
+
+    def test_feedback_influence_biases_retrieval_against_avoidance_row(self):
+        from mirrorcore.persona.respond import RespondFeedbackInfluence
+
+        rows = [
+            {
+                "id": "avoid",
+                "timestamp": "2025-01-01",
+                "scenario_id": "s1",
+                "scenario_text": "passive aggressive dig at work coworker snide",
+                "choice_label": "Let it go",
+                "choice_value": "x",
+                "reasoning_label": "Keep the peace",
+                "reasoning_value": "p",
+                "value_tags": ["patience"],
+                "trait_signals": {},
+                "correction_status": "uncorrected",
+                "confidence_score": 0.9,
+            },
+            {
+                "id": "direct",
+                "timestamp": "2025-01-02",
+                "scenario_id": "s2",
+                "scenario_text": "passive teammate work need to talk",
+                "choice_label": "Address it calmly and directly",
+                "choice_value": "y",
+                "reasoning_label": "Clear the air",
+                "reasoning_value": "c",
+                "value_tags": ["directness"],
+                "trait_signals": {},
+                "correction_status": "uncorrected",
+                "confidence_score": 0.88,
+            },
+        ]
+        prompt = "what would i say passive aggressive coworker at work"
+        base = retrieve_relevant_decision_memories(
+            rows, prompt, top_k=2, min_score=0.05
+        )
+        self.assertEqual(base[0][0]["id"], "avoid")
+        infl = RespondFeedbackInfluence(
+            pref_token_weight={"address": 0.45, "calmly": 0.45, "directly": 0.45},
+            avoidance_demote=0.7,
+            direct_calm_signal=0.6,
+        )
+        biased = retrieve_relevant_decision_memories(
+            rows,
+            prompt,
+            top_k=2,
+            min_score=0.05,
+            feedback_influence=infl,
+        )
+        m0 = {r[0]["id"]: r[1] for r in base}
+        m1 = {r[0]["id"]: r[1] for r in biased}
+        self.assertGreater(m1["direct"], m0["direct"])
+        self.assertLess(m1["avoid"], m0["avoid"])
 
 
 if __name__ == "__main__":

@@ -169,6 +169,12 @@ _ONTOLOGY_AXIS_RULES: Tuple[Tuple[str, Tuple[str, ...], float], ...] = (
             "badmouth",
             "trash talk",
             "gossip",
+            " passive aggressive",
+            "passive-aggressive",
+            " snide ",
+            "underhanded",
+            "whisper",
+            " speaking ill",
         ),
         1.25,
     ),
@@ -189,6 +195,15 @@ _ONTOLOGY_AXIS_RULES: Tuple[Tuple[str, Tuple[str, ...], float], ...] = (
             "crossed the line",
             "argument",
             "fight",
+            "passive aggressive",
+            "passive-aggressive",
+            "snide",
+            "dig at",
+            "digs at",
+            "testing my patience",
+            "pushing boundaries",
+            "push my buttons",
+            "walk all over",
         ),
         0.9,
     ),
@@ -365,10 +380,33 @@ _LEGACY_DIMENSION_RULES: Tuple[Tuple[str, Tuple[str, ...], float], ...] = (
             "unfair",
             "snubbed",
             "dismissed me",
+            "passive aggressive",
+            "passive-aggressive",
+            " snide ",
+            "underhanded",
+            "dig at me",
+            "keeps disrespect",
+            "pushing it",
+            "pushes boundaries",
         ),
         1.15,
     ),
-    ("conflict_intensity", ("argue", "fight", "angry", "resent", "toxic", "unfair", "silent treatment"), 1.0),
+    (
+        "conflict_intensity",
+        (
+            "argue",
+            "fight",
+            "angry",
+            "resent",
+            "toxic",
+            "unfair",
+            "silent treatment",
+            "every time",
+            "keeps doing",
+            "pattern",
+        ),
+        1.0,
+    ),
     (
         "wait_vs_act",
         (
@@ -460,6 +498,9 @@ _FAMILY_KEYWORDS: Dict[str, Tuple[Tuple[str, float], ...]] = {
         ("rude", 1.0),
         ("let it go", 1.1),
         ("say something", 1.1),
+        ("passive aggressive", 1.05),
+        ("behind my back", 1.0),
+        ("boundary", 0.95),
     ),
     RISK_TIMING: (
         ("wait", 0.9),
@@ -560,6 +601,9 @@ def _augment_dimensions_from_ontology_axes(
         add("interpersonal_hurt", 0.9)
     if "someone keeps" in padded or "keeps talking" in padded:
         add("interpersonal_hurt", 0.55)
+    if "passive aggressive" in padded or "passive-aggressive" in norm_text:
+        add("interpersonal_hurt", 0.65)
+        add("conflict_intensity", 0.45)
 
 
 def score_dimensions(norm_text: str) -> Dict[str, float]:
@@ -690,6 +734,16 @@ _INTERPERSONAL_CONFLICT_MARKERS: Tuple[str, ...] = (
     "two-faced",
     " trash talk",
     " badmouth",
+    " passive aggressive",
+    "passive-aggressive",
+    " snide",
+    " underhanded",
+    "dig at me",
+    " behind my back",
+    "behind your back",
+    "pushing my buttons",
+    "pushes boundaries",
+    "testing my patience",
 )
 
 
@@ -1019,6 +1073,23 @@ _SLOT_COVERAGE_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
             "every time",
             "pattern",
             "not the first time",
+        ),
+    ),
+    (
+        "conflict_aim",
+        (
+            "let it go",
+            "let it ride",
+            "drop it",
+            "move on",
+            "speak up",
+            "say something",
+            "set a boundary",
+            "draw a line",
+            "pull back",
+            "take space",
+            "less contact",
+            "distance myself",
         ),
     ),
 )

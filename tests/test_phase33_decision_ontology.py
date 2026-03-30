@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from mirrorcore.decision.ontology import (
     AXIS_BACKCHANNEL_HURT,
     AXIS_BILLS_FINANCIAL_PRESSURE,
+    AXIS_CONFLICT_CONFRONTATION,
     AXIS_OVERLOAD_BURNOUT,
     AXIS_TIMING_WAIT_VS_ACT,
     AXIS_WORK_OBLIGATION,
@@ -47,6 +48,11 @@ class TestOntologyAxes(unittest.TestCase):
         t = normalize_input("someone keeps talking shit behind my back. what do i do?")
         ax = score_ontology_axes(t)
         self.assertGreater(ax.get(AXIS_BACKCHANNEL_HURT, 0), 0)
+
+    def test_phase40_passive_aggressive_hits_conflict_axis(self):
+        t = normalize_input("my teammate is passive aggressive and snide in meetings")
+        ax = score_ontology_axes(t)
+        self.assertGreater(ax.get(AXIS_CONFLICT_CONFRONTATION, 0), 0)
 
     def test_wait_or_act_axis(self):
         t = normalize_input("I don't know whether to wait or act now.")

@@ -46,6 +46,24 @@ class TestSituationFactFilter(unittest.TestCase):
             SPENDING,
         )
 
+    def test_phase40_conflict_stance_fact_kept_for_boundary_prompt(self):
+        facts = [{"slot_key": "conflict_stance", "slot_value": "boundary"}]
+        out = filter_relevant_situation_facts(
+            facts,
+            primary_family=CONFLICT_FAMILY,
+            prompt_norm=normalize_input("coworker keeps pushing my boundaries what do i do"),
+        )
+        self.assertEqual(len(out), 1)
+
+    def test_phase40_conflict_stance_dropped_without_conflict_cues(self):
+        facts = [{"slot_key": "conflict_stance", "slot_value": "speak"}]
+        out = filter_relevant_situation_facts(
+            facts,
+            primary_family=CONFLICT_FAMILY,
+            prompt_norm=normalize_input("should i learn python this weekend"),
+        )
+        self.assertEqual(out, [])
+
 
 class TestClarificationCrossBoost(unittest.TestCase):
     def test_boost_from_aligned_facts_and_tendency(self):
@@ -58,6 +76,20 @@ class TestClarificationCrossBoost(unittest.TestCase):
             tmap,
         )
         self.assertGreater(b, 0.05)
+
+    def test_phase40_conflict_tendency_boosts(self):
+        tmap = {
+            "tendency_speak_up_conflict": 0.5,
+            "tendency_hard_boundary": 0.48,
+            "tendency_pull_back_contact": 0.47,
+        }
+        b = clarification_cross_evidence_boost(
+            normalize_input("rude disrespect say something"),
+            CONFLICT_FAMILY,
+            [],
+            tmap,
+        )
+        self.assertGreater(b, 0.08)
 
 
 class TestAskInterviewCandidates(unittest.TestCase):
