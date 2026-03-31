@@ -336,6 +336,17 @@ class RespondFeedbackInfluence:
     replacement_inject_line: str = ""
 
 
+@dataclass(frozen=True)
+class RespondExampleInfluence:
+    """Promoted reusable examples derived from repeated corrections (Phase 42)."""
+
+    token_weight: Mapping[str, float]
+    action_line: str = ""
+    wording_line: str = ""
+    both_line: str = ""
+    strongest_strength: float = 0.0
+
+
 _FEEDBACK_TOK_STOP = frozenset(
     {
         "the",
@@ -515,6 +526,72 @@ def _apply_feedback_influence_to_score(
     return out
 
 
+def _build_example_influence(
+    store: DatabaseStore,
+    *,
+    effective_family: str,
+    answer_focus: str,
+    route_hints: Sequence[str],
+) -> RespondExampleInfluence:
+    if not hasattr(store, "list_reusable_response_examples"):
+        return RespondExampleInfluence({})
+    rows = store.list_reusable_response_examples(
+        effective_family=effective_family,
+        route_keys=list(route_hints),
+        answer_focus=answer_focus,
+        limit=6,
+        min_strength=0.55,
+    )
+    if not rows:
+        return RespondExampleInfluence({})
+    tok: Dict[str, float] = {}
+    action_line = ""
+    wording_line = ""
+    both_line = ""
+    top = 0.0
+    for r in rows:
+        txt = str(r.get("example_text") or "").strip()
+        et = str(r.get("example_type") or "").strip().lower()
+        strength = max(0.0, min(1.0, float(r.get("strength") or 0.0)))
+        if not txt:
+            continue
+        top = max(top, strength)
+        add = min(0.28, 0.08 + strength * 0.18)
+        for t in _tokenize_feedback_phrase(txt):
+            tok[t] = min(0.9, tok.get(t, 0.0) + add)
+        if et == "action" and not action_line:
+            action_line = txt
+        elif et == "wording" and not wording_line:
+            wording_line = txt
+        elif et == "both" and not both_line:
+            both_line = txt
+    return RespondExampleInfluence(
+        token_weight=tok,
+        action_line=action_line,
+        wording_line=wording_line,
+        both_line=both_line,
+        strongest_strength=top,
+    )
+
+
+def _apply_example_influence_to_score(
+    s: float,
+    *,
+    blob: str,
+    example_influence: Optional[RespondExampleInfluence],
+) -> float:
+    if not example_influence or not example_influence.token_weight:
+        return s
+    out = float(s)
+    blob_l = (blob or "").lower()
+    bump = 1.0
+    for tok, wt in example_influence.token_weight.items():
+        if len(tok) > 2 and tok in blob_l:
+            bump *= 1.0 + min(0.18, float(wt) * 0.22)
+    out *= min(2.15, bump)
+    return out
+
+
 def _sanitize_replacement_for_overlay(raw: str) -> str:
     t = " ".join((raw or "").strip().split())
     if len(t) > 220:
@@ -597,6 +674,58 @@ def _apply_feedback_replacement_overlay(
     return answer, reasoning
 
 
+def _apply_example_overlay(
+    answer: str,
+    reasoning: str,
+    *,
+    example_influence: Optional[RespondExampleInfluence],
+    answer_focus: str,
+    phrase_seed: str,
+) -> Tuple[str, str, bool]:
+    """When strong promoted examples exist, gently pull final line toward them."""
+    if not example_influence:
+        return answer, reasoning, False
+    if float(example_influence.strongest_strength or 0.0) < 0.55:
+        return answer, reasoning, False
+    af = (answer_focus or "both").strip().lower()
+    line = ""
+    if af == "action":
+        line = example_influence.action_line or example_influence.both_line
+    elif af == "wording":
+        line = example_influence.wording_line or example_influence.both_line
+    else:
+        line = (
+            example_influence.both_line
+            or example_influence.action_line
+            or example_influence.wording_line
+        )
+    line = _sanitize_replacement_for_overlay(line)
+    if len(line) < 8:
+        return answer, reasoning, False
+    if _answer_covers_injection_tokens(answer, line):
+        return answer, reasoning, False
+    if af == "both":
+        act = _both_mode_action_line(
+            line,
+            "",
+            primary_family="general",
+            seed=f"{phrase_seed}:exact",
+            cautious=False,
+            blunt=0.5,
+            aggressive_short=False,
+        )
+        out = _merge_action_wording_paragraphs(act, line, seed=f"{phrase_seed}:exm")
+    else:
+        opts = (
+            f"I'd keep it closer to this: {line}",
+            f"This lines up with what I've corrected before: {line}",
+        )
+        out = opts[_stable_index(f"{phrase_seed}:exov", len(opts))]
+    rb = (reasoning or "").rstrip()
+    tail = " This also lines up with a saved repeated correction."
+    return out, (rb + tail) if rb else tail.strip(), True
+
+
 def retrieve_relevant_decision_memories(
     rows: Sequence[Dict[str, Any]],
     prompt: str,
@@ -606,6 +735,7 @@ def retrieve_relevant_decision_memories(
     *,
     score_bias: float = 1.0,
     feedback_influence: Optional[RespondFeedbackInfluence] = None,
+    example_influence: Optional[RespondExampleInfluence] = None,
 ) -> List[Tuple[Dict[str, Any], float, List[str]]]:
     keywords = tokenize_prompt(prompt)
     prompt_norm = normalize_input(prompt)
@@ -631,6 +761,11 @@ def retrieve_relevant_decision_memories(
             blob=blob,
             feedback_influence=feedback_influence,
         )
+        s = _apply_example_influence_to_score(
+            s,
+            blob=blob,
+            example_influence=example_influence,
+        )
         scored.append(
             (
                 row,
@@ -653,6 +788,7 @@ def retrieve_relevant_style_memories(
     *,
     score_bias: float = 1.0,
     feedback_influence: Optional[RespondFeedbackInfluence] = None,
+    example_influence: Optional[RespondExampleInfluence] = None,
 ) -> List[Tuple[Dict[str, Any], float, List[str]]]:
     keywords = tokenize_prompt(prompt)
     prompt_counts = _count_occurrences([str(r.get("prompt_id") or "") for r in rows])
@@ -672,6 +808,11 @@ def retrieve_relevant_style_memories(
             s,
             blob=style_row_text_blob(row),
             feedback_influence=feedback_influence,
+        )
+        s = _apply_example_influence_to_score(
+            s,
+            blob=style_row_text_blob(row),
+            example_influence=example_influence,
         )
         scored.append(
             (
@@ -1836,6 +1977,17 @@ def generate_personal_response(
     feedback_influence = build_respond_feedback_influence(
         store, prompt_norm_hash, str(eff_pf or "general")
     )
+    ex_route_hints: List[str] = ["strong_decision", "medium_decision"]
+    if strict_shape and eff_pf == CONFLICT_FAMILY:
+        ex_route_hints.append("strict_conflict_fallback")
+    if strict_shape and eff_pf == SPENDING:
+        ex_route_hints.append("strict_spending_fallback")
+    example_influence = _build_example_influence(
+        store,
+        effective_family=str(eff_pf or "general"),
+        answer_focus=answer_focus,
+        route_hints=ex_route_hints,
+    )
 
     d_bias = 1.09 if answer_focus == "action" else (0.91 if answer_focus == "wording" else 1.0)
     s_bias = 1.09 if answer_focus == "wording" else (0.91 if answer_focus == "action" else 1.0)
@@ -1847,6 +1999,7 @@ def generate_personal_response(
         evidence_mult_map=mmap,
         score_bias=d_bias,
         feedback_influence=feedback_influence,
+        example_influence=example_influence,
     )
     s_ranked = retrieve_relevant_style_memories(
         s_rows,
@@ -1855,6 +2008,7 @@ def generate_personal_response(
         evidence_mult_map=mmap,
         score_bias=s_bias,
         feedback_influence=feedback_influence,
+        example_influence=example_influence,
     )
 
     d_gated = [
@@ -2425,6 +2579,32 @@ def generate_personal_response(
         answer_focus=answer_focus,
         eff_pf=str(eff_pf or "general"),
     )
+    answer, reasoning, used_example_overlay = _apply_example_overlay(
+        answer,
+        reasoning,
+        example_influence=example_influence,
+        answer_focus=answer_focus,
+        phrase_seed=phrase_seed,
+    )
+    if used_example_overlay:
+        rks = tuple(list(evidence_path.route_keys) + ["example_memory_overlay"])
+        evidence_path = RespondEvidencePath(
+            decision_ids=evidence_path.decision_ids,
+            style_ids=evidence_path.style_ids,
+            route_keys=rks,
+            clarif_slot_keys=evidence_path.clarif_slot_keys,
+            answer_focus=evidence_path.answer_focus,
+        )
+        ex_key = f"respond_mb_example_{str(eff_pf or 'general')}_{answer_focus}"
+        if not hasattr(store, "should_surface_memory_line") or store.should_surface_memory_line(
+            ex_key
+        ):
+            memory_basis.append("Saved repeated correction example")
+            if hasattr(store, "record_memory_line_surface"):
+                try:
+                    store.record_memory_line_surface(ex_key)
+                except Exception:
+                    pass
     answer = _phase41_style_realism_pass(answer, answer_focus=answer_focus)
 
     path_m = _respond_path_multipliers(evidence_path, mmap)

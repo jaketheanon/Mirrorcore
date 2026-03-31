@@ -309,6 +309,24 @@ def initialize_database(conn: sqlite3.Connection):
         )
     """)
 
+    # Phase 42 — promoted reusable examples from repeated respond corrections
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS personal_response_examples (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            prompt_norm_hash TEXT NOT NULL,
+            effective_family TEXT NOT NULL,
+            shape_key TEXT NOT NULL,
+            example_type TEXT NOT NULL,
+            example_text TEXT NOT NULL,
+            support_count INTEGER NOT NULL DEFAULT 0,
+            contradict_count INTEGER NOT NULL DEFAULT 0,
+            strength REAL NOT NULL DEFAULT 0.0,
+            last_feedback_at TEXT NOT NULL
+        )
+    """)
+
     # Create indexes for performance
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_persona_profile_trait_name ON persona_profile(trait_name)",
@@ -337,6 +355,9 @@ def initialize_database(conn: sqlite3.Connection):
         "CREATE INDEX IF NOT EXISTS idx_memory_line_surface_key ON memory_line_surface_events(line_key)",
         "CREATE INDEX IF NOT EXISTS idx_personal_response_feedback_ts ON personal_response_feedback(timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_personal_response_feedback_hash ON personal_response_feedback(prompt_norm_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_personal_response_examples_prompt_hash ON personal_response_examples(prompt_norm_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_personal_response_examples_family_shape ON personal_response_examples(effective_family, shape_key)",
+        "CREATE INDEX IF NOT EXISTS idx_personal_response_examples_type_strength ON personal_response_examples(example_type, strength)",
     ]
     
     for index_sql in indexes:

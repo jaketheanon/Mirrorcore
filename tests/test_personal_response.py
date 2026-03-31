@@ -1428,5 +1428,99 @@ class TestPhase40FeedbackInfluence(unittest.TestCase):
         self.assertLess(m1["avoid"], m0["avoid"])
 
 
+class TestPhase42CorrectionPromotionExamples(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = DatabaseStore(Path(self.tmp.name))
+        self.db.initialize_database()
+
+    def tearDown(self):
+        self.db.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_one_off_replacement_not_reusable_yet(self):
+        self.db.record_personal_response_feedback(
+            scenario_snippet="x",
+            prompt_norm_hash="h1",
+            rating="wrong",
+            partial_aspect=None,
+            replacement_text="address it directly but calmly",
+            confidence_shown=0.5,
+            effective_family="interpersonal_conflict",
+            evidence_path={"route_keys": ["strong_decision"], "answer_focus": "wording"},
+            likely_answer_snippet="let it go",
+            feedback_target="wording",
+        )
+        rows = self.db.list_reusable_response_examples(
+            effective_family="interpersonal_conflict",
+            route_keys=["strong_decision"],
+            answer_focus="wording",
+        )
+        self.assertEqual(rows, [])
+
+    def test_repeated_corrections_promote_reusable_example(self):
+        for _ in range(3):
+            self.db.record_personal_response_feedback(
+                scenario_snippet="x",
+                prompt_norm_hash="h2",
+                rating="wrong",
+                partial_aspect=None,
+                replacement_text="address it directly but calmly",
+                confidence_shown=0.5,
+                effective_family="interpersonal_conflict",
+                evidence_path={"route_keys": ["strong_decision"], "answer_focus": "wording"},
+                likely_answer_snippet="let it go",
+                feedback_target="wording",
+            )
+        rows = self.db.list_reusable_response_examples(
+            effective_family="interpersonal_conflict",
+            route_keys=["strong_decision"],
+            answer_focus="wording",
+        )
+        self.assertGreaterEqual(len(rows), 1)
+        self.assertIn("address it directly", rows[0]["example_text"])
+        self.assertGreaterEqual(float(rows[0]["strength"]), 0.55)
+        self.assertGreaterEqual(int(rows[0]["support_count"]), 2)
+
+    def test_promoted_wording_example_can_shift_future_output(self):
+        self.db.record_decision_memory(
+            scenario_id="pa_one",
+            scenario_text="passive aggressive coworker at work",
+            choice_label="Let it go for now",
+            choice_value="a",
+            reasoning_label="Keep it smooth",
+            reasoning_value="k",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        q = "what would i say if someone is being passive aggressive at work"
+        first = generate_personal_response(q, self.db)
+        self.assertIn("let it go", first.likely_answer.lower())
+        for _ in range(3):
+            self.db.record_personal_response_feedback(
+                scenario_snippet=q,
+                prompt_norm_hash=first.prompt_norm_hash,
+                rating="wrong",
+                partial_aspect=None,
+                replacement_text="address it directly but calmly",
+                confidence_shown=first.confidence,
+                effective_family=first.effective_family,
+                evidence_path=first.evidence_path.to_storage_dict(),
+                likely_answer_snippet=first.likely_answer[:200],
+                feedback_target="wording",
+            )
+            first = generate_personal_response(q, self.db)
+        low = first.likely_answer.lower()
+        self.assertTrue("address" in low or "directly" in low, msg=first.likely_answer)
+        examples = self.db.list_reusable_response_examples(
+            effective_family=first.effective_family,
+            answer_focus="wording",
+        )
+        self.assertGreaterEqual(len(examples), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,8 @@ from typing import Dict, Any, List, Optional, Union, Tuple
 from pathlib import Path
 import sqlite3
 import json
+import hashlib
+import re
 from datetime import datetime, timedelta
 from uuid import uuid4
 from ..memory.extractor import LearningSignal
@@ -52,6 +54,7 @@ class DatabaseStore:
         self.ensure_phase34_memory_line_surface()
         self.ensure_phase38_respond_active_learning()
         self.ensure_phase39_respond_feedback_target()
+        self.ensure_phase42_response_examples()
 
     def initialize_database(self):
         """Initialize the database with all required tables.
@@ -361,6 +364,41 @@ class DatabaseStore:
             )
             conn.commit()
 
+    def ensure_phase42_response_examples(self):
+        """Phase 42: reusable examples promoted from repeated corrections."""
+        conn = self.get_db_connection()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS personal_response_examples (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                prompt_norm_hash TEXT NOT NULL,
+                effective_family TEXT NOT NULL,
+                shape_key TEXT NOT NULL,
+                example_type TEXT NOT NULL,
+                example_text TEXT NOT NULL,
+                support_count INTEGER NOT NULL DEFAULT 0,
+                contradict_count INTEGER NOT NULL DEFAULT 0,
+                strength REAL NOT NULL DEFAULT 0.0,
+                last_feedback_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_personal_response_examples_prompt_hash "
+            "ON personal_response_examples(prompt_norm_hash)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_personal_response_examples_family_shape "
+            "ON personal_response_examples(effective_family, shape_key)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_personal_response_examples_type_strength "
+            "ON personal_response_examples(example_type, strength)"
+        )
+        conn.commit()
+
     def list_personal_response_feedback_for_prompt(
         self, prompt_norm_hash: str, limit: int = 40
     ) -> List[Dict[str, Any]]:
@@ -620,6 +658,15 @@ class DatabaseStore:
             replacement_text=replacement_text,
             effective_family=effective_family,
         )
+        self._promote_response_example_from_feedback(
+            prompt_norm_hash=prompt_norm_hash,
+            effective_family=effective_family,
+            rating=rating,
+            replacement_text=replacement_text,
+            feedback_target=ft,
+            partial_aspect=partial_aspect,
+            evidence_path=evidence_path,
+        )
         return eid
 
     def list_recent_personal_response_feedback(self, limit: int = 15) -> List[Dict[str, Any]]:
@@ -645,6 +692,206 @@ class DatabaseStore:
             except (json.JSONDecodeError, TypeError):
                 d["evidence_path"] = {}
             out.append(d)
+        return out
+
+    @staticmethod
+    def _normalize_example_text(raw: str) -> str:
+        t = " ".join((raw or "").strip().split()).lower()
+        return re.sub(r"\s+", " ", t)[:400]
+
+    @staticmethod
+    def _phase42_shape_key(evidence_path: Dict[str, Any]) -> str:
+        routes = sorted(
+            [
+                str(x).strip().lower()
+                for x in (evidence_path.get("route_keys") or [])
+                if str(x).strip()
+            ]
+        )[:2]
+        slots = sorted(
+            [
+                str(x).strip().lower()
+                for x in (evidence_path.get("clarif_slot_keys") or [])
+                if str(x).strip()
+            ]
+        )[:1]
+        rk = "|".join(routes) if routes else "none"
+        sk = "|".join(slots) if slots else "none"
+        return f"r:{rk};c:{sk}"
+
+    @staticmethod
+    def _phase42_example_type(
+        *,
+        feedback_target: Optional[str],
+        partial_aspect: Optional[str],
+        evidence_path: Dict[str, Any],
+    ) -> str:
+        pa = (partial_aspect or "").strip().lower()
+        if pa == "action_ok_word_bad":
+            return "wording"
+        if pa == "word_ok_action_bad":
+            return "action"
+        if pa == "same_direction_phrase":
+            return "wording"
+        ft = (feedback_target or "").strip().lower()
+        if ft in ("action", "wording", "both"):
+            return ft
+        af = (evidence_path.get("answer_focus") or "").strip().lower()
+        if af in ("action", "wording", "both"):
+            return af
+        return "both"
+
+    def _promote_response_example_from_feedback(
+        self,
+        *,
+        prompt_norm_hash: str,
+        effective_family: str,
+        rating: str,
+        replacement_text: Optional[str],
+        feedback_target: Optional[str],
+        partial_aspect: Optional[str],
+        evidence_path: Dict[str, Any],
+    ) -> None:
+        """Phase 42: turn repeated replacements into reusable example memory."""
+        rep = self._normalize_example_text(replacement_text or "")
+        if not rep or len(rep) < 8:
+            return
+        r = (rating or "").strip().lower()
+        if r not in ("wrong", "partly", "right"):
+            return
+        et = self._phase42_example_type(
+            feedback_target=feedback_target,
+            partial_aspect=partial_aspect,
+            evidence_path=evidence_path,
+        )
+        shape = self._phase42_shape_key(evidence_path)
+        fam = (effective_family or "general").strip().lower() or "general"
+        key_seed = f"{prompt_norm_hash}|{fam}|{et}|{rep}"
+        eid = hashlib.sha256(key_seed.encode("utf-8")).hexdigest()[:40]
+        now = datetime.utcnow().isoformat()
+        conn = self.get_db_connection()
+
+        delta = 0.0
+        support_inc = 0
+        if r == "wrong":
+            delta, support_inc = 0.26, 1
+        elif r == "partly":
+            delta, support_inc = 0.13, 1
+        elif r == "right":
+            delta, support_inc = 0.07, 0
+
+        row = conn.execute(
+            "SELECT support_count, contradict_count, strength FROM personal_response_examples "
+            "WHERE id = ?",
+            (eid,),
+        ).fetchone()
+        if not row:
+            base = 0.18 if r == "wrong" else (0.12 if r == "partly" else 0.08)
+            conn.execute(
+                """
+                INSERT INTO personal_response_examples
+                (id, created_at, updated_at, prompt_norm_hash, effective_family, shape_key,
+                 example_type, example_text, support_count, contradict_count, strength, last_feedback_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    eid,
+                    now,
+                    now,
+                    prompt_norm_hash,
+                    fam,
+                    shape,
+                    et,
+                    rep,
+                    support_inc,
+                    0,
+                    base,
+                    now,
+                ),
+            )
+        else:
+            strength = max(-1.0, min(1.0, float(row["strength"] or 0.0) + delta))
+            support = int(row["support_count"] or 0) + support_inc
+            conn.execute(
+                """
+                UPDATE personal_response_examples
+                SET updated_at = ?, support_count = ?, strength = ?, last_feedback_at = ?
+                WHERE id = ?
+                """,
+                (now, support, strength, now, eid),
+            )
+
+        # Contradictory replacements in the same shape/type lose strength.
+        others = conn.execute(
+            """
+            SELECT id, support_count, contradict_count, strength
+            FROM personal_response_examples
+            WHERE prompt_norm_hash = ? AND effective_family = ?
+              AND example_type = ? AND id != ?
+            """,
+            (prompt_norm_hash, fam, et, eid),
+        ).fetchall()
+        for orow in others:
+            new_contra = int(orow["contradict_count"] or 0) + 1
+            new_strength = max(-1.0, min(1.0, float(orow["strength"] or 0.0) - 0.16))
+            conn.execute(
+                """
+                UPDATE personal_response_examples
+                SET updated_at = ?, contradict_count = ?, strength = ?, last_feedback_at = ?
+                WHERE id = ?
+                """,
+                (now, new_contra, new_strength, now, str(orow["id"])),
+            )
+
+        conn.commit()
+
+    def list_reusable_response_examples(
+        self,
+        *,
+        effective_family: str,
+        route_keys: Optional[List[str]] = None,
+        answer_focus: str = "both",
+        limit: int = 8,
+        min_strength: float = 0.55,
+    ) -> List[Dict[str, Any]]:
+        """Phase 42: fetch promoted examples that are strong enough to reuse."""
+        conn = self.get_db_connection()
+        fam = (effective_family or "general").strip().lower() or "general"
+        af = (answer_focus or "both").strip().lower()
+        if af not in ("action", "wording", "both"):
+            af = "both"
+        types = ("action", "both") if af == "action" else (
+            ("wording", "both") if af == "wording" else ("action", "wording", "both")
+        )
+        lim = max(1, min(20, int(limit)))
+        rows = conn.execute(
+            f"""
+            SELECT id, prompt_norm_hash, effective_family, shape_key, example_type, example_text,
+                   support_count, contradict_count, strength, updated_at, last_feedback_at
+            FROM personal_response_examples
+            WHERE effective_family = ?
+              AND example_type IN ({",".join("?" for _ in types)})
+              AND strength >= ?
+              AND support_count >= 2
+            ORDER BY strength DESC, support_count DESC, last_feedback_at DESC, id ASC
+            LIMIT ?
+            """,
+            (fam, *types, float(min_strength), lim * 3),
+        ).fetchall()
+        route_set = {
+            str(x).strip().lower() for x in (route_keys or []) if str(x).strip()
+        }
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            if route_set:
+                sk = str(d.get("shape_key") or "")
+                shape_ok = any(f"r:{rk}" in sk or f"|{rk}" in sk or f"{rk};" in sk for rk in route_set)
+                if not shape_ok and "r:none" not in sk:
+                    continue
+            out.append(d)
+            if len(out) >= lim:
+                break
         return out
 
     def count_recent_memory_line_surfaces(self, line_key: str, window: int = 24) -> int:
