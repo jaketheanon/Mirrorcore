@@ -27,6 +27,7 @@ from ..decision.memory_relevance import (
     gossip_or_backchannel_user_prompt,
     personal_response_decision_families_aligned,
     profile_memory_fit_score,
+    public_audience_disrespect_prompt,
     respond_main_decision_passes_shape_gate,
     style_memory_passes_respond_conflict_shape,
     style_memory_relevance_multiplier,
@@ -556,24 +557,39 @@ def _apply_feedback_replacement_overlay(
     avoidance_ans = _memory_blob_avoidance_hit(low) or "let it go" in low
     af = (answer_focus or "both").strip().lower()
     if not covered and (avoidance_ans or n_wr >= 3):
+        if af == "both":
+            act_opts = (
+                "I'd step in calmer but clearer — closer to what I've been asking for on this kind of prompt.",
+                "I'd handle it more directly after the corrections I've stacked on this one.",
+            )
+            act_line = act_opts[
+                _stable_index(f"{phrase_seed}:fbinj_both_act", len(act_opts))
+            ]
+            w_inj = inj.strip()
+            if w_inj and not (w_inj.startswith('"') and w_inj.endswith('"')):
+                w_inj = f'"{w_inj}"'
+            merged = _merge_action_wording_paragraphs(
+                act_line, w_inj, seed=f"{phrase_seed}:fbinj_m"
+            )
+            rs = (reasoning or "").rstrip()
+            tail = " Recent feedback nudged the say-line that way."
+            return merged, (rs + tail) if rs else tail.strip()
         pool = (
-            f"You'd probably handle it more the way you've steered this lately: {inj}",
-            f"My read is you'd land closer to what you've corrected toward before — {inj}",
-            f"Given how you've pushed back on this same ask, you'd probably move more like: {inj}",
+            f"I'd handle it more like: {inj}",
+            f"I'd land here after the corrections I've given on this: {inj}",
+            f"I'm pushing toward something closer to: {inj}",
         )
         new_a = pool[_stable_index(f"{phrase_seed}:fbinj", len(pool))]
         rs = (reasoning or "").rstrip()
-        tail = " Recent corrections on this phrasing pull the read that way."
+        tail = " Recent feedback on this prompt nudges the line that way."
         return new_a, (rs + tail) if rs else tail.strip()
     if not covered:
         if af == "wording":
-            b = (
-                f"The wording you'd probably pick, given your corrections, leans more like: {inj}"
-            )
+            b = f"I'd phrase it closer to: {inj}"
         else:
             bridges = (
-                f"If you said it the way you've been nudging it, it might come out more like: {inj}",
-                f"Out loud you'd probably edge closer to what you've written in before: {inj}",
+                f"Said plainly, more like: {inj}",
+                f"Out loud, closer to: {inj}",
             )
             b = bridges[_stable_index(f"{phrase_seed}:fbapp", len(bridges))]
         sep = "\n\n" if a else ""
@@ -596,6 +612,7 @@ def retrieve_relevant_decision_memories(
     scenario_counts = _count_occurrences([str(r.get("scenario_id") or "") for r in rows])
     mmap = evidence_mult_map or {}
     sb = max(0.5, min(1.35, float(score_bias or 1.0)))
+    is_public_disrespect = public_audience_disrespect_prompt(prompt_norm)
     scored: List[Tuple[Dict[str, Any], float, List[str], str, str]] = []
     for row in rows:
         rid = str(row.get("id") or "")
@@ -603,11 +620,15 @@ def retrieve_relevant_decision_memories(
         s, reasons = score_decision_memory_row(
             row, keywords, scenario_counts, evidence_row_mult=em
         )
+        blob = decision_row_text_blob(row)
         s *= decision_memory_relevance_multiplier(prompt_norm, row, s)
+        if is_public_disrespect and _memory_blob_avoidance_hit(blob):
+            # Public disrespect is not a low-stakes "ignore it" shape.
+            s *= 0.22
         s *= sb
         s = _apply_feedback_influence_to_score(
             s,
-            blob=decision_row_text_blob(row),
+            blob=blob,
             feedback_influence=feedback_influence,
         )
         scored.append(
@@ -734,6 +755,145 @@ def _shorten_sentence(text: str, aggressive: bool) -> str:
     return cut + "…"
 
 
+def _phase41_style_realism_pass(text: str, *, answer_focus: str) -> str:
+    """Deterministic phrasing cleanup for more natural first-person voice.
+
+    Keep logic/evidence unchanged; only de-meta the surface wording.
+    """
+    out = (text or "").strip()
+    if not out:
+        return out
+
+    # Strip explicit retrieval narration from the main response text.
+    noise = (
+        "If I'm reading your saves right, ",
+        "From what's on file, ",
+        "on file you tend to ",
+        "on file you tend to be ",
+        "My read is ",
+        "my read is ",
+        "My guess is ",
+        "my guess is ",
+        "given your corrections, ",
+        "Given your corrections, ",
+    )
+    for n in noise:
+        out = out.replace(n, "")
+
+    # Shift from "system describing user" toward spoken first-person style.
+    swaps = (
+        ("you'd probably", "I'd probably"),
+        ("you'd likely", "I'd probably"),
+        ("you'd most likely", "I'd probably"),
+        ("you're most likely to say", "I'd probably say"),
+        ("you'd probably say something like:", "I'd probably say:"),
+        ("you'd probably say:", "I'd probably say:"),
+        ("you'd probably go with:", "I'd probably go with:"),
+        ("you'd probably choose:", "I'd probably choose:"),
+        ("what you'd probably do", "what I'd do"),
+        ("What you'd probably do", "What I'd do"),
+        ("you'd", "I'd"),
+        ("You'd", "I'd"),
+        ("You are", "I am"),
+        ("you are", "I am"),
+        ("you were", "I was"),
+        ("You were", "I was"),
+        ("you've", "I've"),
+        ("You've", "I've"),
+        ("you want", "I want"),
+        ("You want", "I want"),
+        ("you noticed", "I noticed"),
+        ("you heard", "I heard"),
+        ("You heard", "I heard"),
+    )
+    for a, b in swaps:
+        out = out.replace(a, b)
+        if a != a.title():
+            out = out.replace(a.title(), b)
+
+    # Keep combined mode explicit and natural.
+    if (answer_focus or "").strip().lower() == "both":
+        out = out.replace("If you said it out loud, ", "If I said it out loud, ")
+        out = out.replace("In plain words, ", "In plain words, I'd ")
+        out = out.replace("If You said it out loud, ", "If I said it out loud, ")
+
+    # Tighter voice: drop redundant "probably" after "I'd".
+    out = out.replace("I'd probably ", "I'd ")
+    out = out.replace("i'd probably ", "i'd ")
+
+    # Spending / leftovers: second-person out-loud hooks → first person.
+    out = out.replace("If you said it out loud, ", "If I said it out loud, ")
+    out = out.replace("if you said it out loud, ", "If I said it out loud, ")
+    out = out.replace("The line you'd probably use with yourself is ", "The line I'd use with myself is ")
+
+    # Tone/meta clauses sometimes leak from older templates; strip known fragments.
+    for _rm in (
+        ", with pretty blunt wording",
+        ", with fairly soft wording",
+        ", with short and direct wording",
+        ", with fairly detailed wording",
+        "pretty blunt in how you usually phrase things",
+        "fairly soft in how you usually phrase things",
+        "short and direct in how you usually phrase things",
+        "fairly detailed in how you usually phrase things",
+    ):
+        out = out.replace(_rm, "")
+    out = re.sub(
+        r"\s*[—:]\s*that's usually me:\s*.+?\.",
+        ".",
+        out,
+        flags=re.IGNORECASE | re.DOTALL,
+        count=1,
+    )
+    # Collapse repeated spaces only; preserve newlines for both-mode paragraphs.
+    out = re.sub(r" {2,}", " ", out)
+
+    # Likely-you voice is first-person: fix self-reference (I'd + your → my).
+    for old, new in (
+        ("what you heard", "what I heard"),
+        ("What you heard", "What I heard"),
+        ("protect your energy", "protect my energy"),
+        ("Protect your energy", "Protect my energy"),
+        ("your energy the way", "my energy the way"),
+        ("your energy and go", "my energy and go"),
+        ("your bandwidth", "my bandwidth"),
+        ("Your bandwidth", "My bandwidth"),
+        ("say your piece", "say my piece"),
+        ("Say your piece", "Say my piece"),
+        ("keep your tone", "keep my tone"),
+        ("Keep your tone", "Keep my tone"),
+        ("keep your voice", "keep my voice"),
+        ("Keep your voice", "Keep my voice"),
+        ("keep your footing", "keep my footing"),
+        ("Keep your footing", "Keep my footing"),
+        ("narrow your availability", "narrow my availability"),
+        ("Narrow your availability", "Narrow my availability"),
+        ("protect your week", "protect my week"),
+        ("shrinking your week", "shrinking my week"),
+        ("spell out the limit and what you do", "spell out the limit and what I do"),
+    ):
+        out = out.replace(old, new)
+
+    # Clean obvious filler artifacts after replacements.
+    out = out.replace("I'd I'd I'd ", "I'd ")
+    out = out.replace("I'd I'd ", "I'd ")
+    out = out.replace("  ", " ")
+    out = out.replace(" .", ".")
+    if (answer_focus or "").strip().lower() == "both":
+        out = re.sub(r"\n{2,}", "\n", out)
+        if "\n" not in out:
+            for sm in (
+                " If I said it out loud",
+                " if I said it out loud",
+                " I'd say out loud",
+            ):
+                if sm in out:
+                    i = out.index(sm)
+                    out = out[:i].rstrip() + "\n" + out[i:].lstrip()
+                    break
+    return out.strip()
+
+
 def _family_label(primary_family: str) -> str:
     pf = (primary_family or "").strip().lower()
     if "conflict" in pf:
@@ -750,6 +910,132 @@ def _to_lower_start(text: str) -> str:
     if not t:
         return ""
     return t[0].lower() + t[1:] if len(t) > 1 else t.lower()
+
+
+def _action_mode_choice_gloss(choice: str) -> str:
+    """Short behavioral anchor for action mode — avoids full scripted lines."""
+    c = (choice or "").strip()
+    if not c:
+        return ""
+    if len(c) <= 46:
+        return _to_lower_start(c)
+    split = re.split(r"[.;]", c, maxsplit=1)
+    first = (split[0] or "").strip()
+    if first and len(first) <= 52:
+        return _to_lower_start(first)
+    words = c.split()
+    lim = 10
+    chunk = " ".join(words[:lim]).rstrip(",;:")
+    tail = "…" if len(words) > lim else ""
+    return _to_lower_start(chunk) + tail
+
+
+def _both_mode_action_line(
+    choice: str,
+    why: str,
+    *,
+    primary_family: str,
+    seed: str,
+    cautious: bool,
+    blunt: float,
+    aggressive_short: bool,
+) -> str:
+    """First paragraph for answer_focus=both: what I'd *do*, grounded in reasoning — not the out-loud script."""
+    fam = _family_label(primary_family)
+    w = (why or "").strip().lower()
+    why_low = _to_lower_start(why) if (why or "").strip() else ""
+    yfrag = f" Mostly because {why_low}." if why_low else ""
+    cautious_openers = (
+        "If I'm reading your saves right, ",
+        "From what's on file, ",
+        "",
+    )
+    pref = (
+        cautious_openers[_stable_index(f"{seed}:cp", len(cautious_openers))]
+        if cautious
+        else ""
+    )
+
+    soft_why = any(
+        x in w for x in ("smooth", "peace", "energy", "calm", "worth", "battle", "recover")
+    )
+    firm_why = any(
+        x in w
+        for x in (
+            "stop",
+            "direct",
+            "pattern",
+            "boundary",
+            "clear the",
+            "spiral",
+            "firm",
+            " say no",
+            "said no",
+        )
+    )
+
+    if fam == "conflict":
+        if firm_why and not soft_why:
+            pool = (
+                f"{pref}I'd step in, name what's sideways, and move it toward a straight talk — calm, but I wouldn't pretend I didn't notice.{yfrag}",
+                f"{pref}I'd address it with one clear beat and keep the heat low — still forward, not a performance.{yfrag}",
+            )
+        elif soft_why and not firm_why:
+            pool = (
+                f"{pref}I'd keep my footing and not feed the snippy loop — small move, not a big scene.{yfrag}",
+                f"{pref}I'd let the sharp moment pass without starting a war, but I wouldn't act like I didn't clock it.{yfrag}",
+            )
+        else:
+            pool = (
+                f"{pref}I'd bring it back to a direct conversation instead of letting it hang in the air.{yfrag}",
+                f"{pref}I'd say what I noticed once, plainly, and ask for it clean between us.{yfrag}",
+            )
+    elif fam == "overload":
+        if any(
+            x in w
+            for x in (
+                "energy",
+                "bandwidth",
+                "burn",
+                "drain",
+                "overload",
+                "protect",
+                "recover",
+                "capacity",
+            )
+        ):
+            pool = (
+                f"{pref}I'd guard my bandwidth and keep the no simple — same line if they circle back.{yfrag}",
+                f"{pref}I'd stop renegotiating the same ask and park the extras until I'm steadier.{yfrag}",
+            )
+        else:
+            pool = (
+                f"{pref}I'd draw the line where it fits what I can actually give.{yfrag}",
+                f"{pref}I'd make the smaller yes obvious, or the full no obvious — not both.{yfrag}",
+            )
+    elif fam == "timing":
+        pool = (
+            f"{pref}I'd wait for a cleaner beat so the words land the way I mean them.{yfrag}",
+            f"{pref}I'd pause for one more signal before I lock the move.{yfrag}",
+        )
+    else:
+        cg = _action_mode_choice_gloss(choice)
+        if cg:
+            pool = (
+                f"{pref}I'd lean toward {cg}.{yfrag}",
+                f"{pref}I'd take the practical read: {cg}.{yfrag}",
+            )
+        else:
+            pool = (
+                f"{pref}I'd handle it straight without dragging it out.{yfrag}",
+                f"{pref}I'd pick the low-drama path that still gets it handled.{yfrag}",
+            )
+
+    line = pool[_stable_index(f"{seed}:both_act:{fam}", len(pool))]
+    line = line.replace("..", ".").strip()
+    if not line.endswith("."):
+        line += "."
+    return _shorten_sentence(line, aggressive_short)
 
 
 def _conflict_profile_tone_clause(
@@ -853,24 +1139,32 @@ def _respond_strict_decision_shape_prompt(prompt_norm: str, eff_pf: str) -> bool
 
 
 def _merge_action_wording_paragraphs(action_line: str, wording_line: str, *, seed: str) -> str:
-    """Join separate action and wording paragraphs when the ask is both (Phase 39)."""
-    a = (action_line or "").strip()
+    """Join do vs say when the ask is both (Phase 41 final).
+
+    One line for what I'd do, one line for what I'd say — single ``\\n`` between
+    them so the split survives narrow formatters; wording is flattened to one line.
+    """
+    a = " ".join((action_line or "").split())
     w = (wording_line or "").strip()
     if not w:
         return a
     if a == w:
         tail = (
-            "If you said it out loud, it would probably track the same move — nothing more specific splits the act from the line here.",
-            "Out loud you'd probably end up in the same place — your saves don't tease apart a different script from the action.",
+            "If I said it out loud, it'd land the same either way.",
+            "Same beat whether I'm doing it or saying it — not really two different scripts here.",
         )
-        return f"{a}\n\n{tail[_stable_index(f'{seed}:br_dup', len(tail))]}"
-    bridge = (
-        "If you said it out loud, it would sound more like:",
-        "If you said it out loud, you'd probably land here:",
-        "In plain words, it might come out like:",
-    )
-    b = bridge[_stable_index(f"{seed}:br", len(bridge))]
-    return f"{a}\n\n{b}\n{w}"
+        return f"{a}\n{tail[_stable_index(f'{seed}:br_dup', len(tail))]}"
+    w_flat = " ".join(w.split())
+    low_w = w_flat.lower()
+    if low_w.startswith("if i said it out loud"):
+        wording_block = w_flat
+    else:
+        intros = (
+            "If I said it out loud, it'd be something like:",
+            "If I said it out loud, maybe:",
+        )
+        wording_block = f"{intros[_stable_index(f'{seed}:wlpr', len(intros))]} {w_flat}"
+    return f"{a}\n{wording_block}"
 
 
 def _strict_conflict_shape_evidence_fallback(
@@ -927,7 +1221,7 @@ def _strict_conflict_shape_evidence_fallback(
             utterance_mode=ut_style,
         )
         if af == "both":
-            act_a = _natural_likely_line(
+            act_a = _both_mode_action_line(
                 choice,
                 why,
                 primary_family=CONFLICT_FAMILY,
@@ -935,14 +1229,13 @@ def _strict_conflict_shape_evidence_fallback(
                 cautious=True,
                 blunt=blunt,
                 aggressive_short=aggressive_short,
-                utterance_mode="action",
             )
             answer = _merge_action_wording_paragraphs(
                 act_a, answer, seed=f"{phrase_seed}:sf_m"
             )
         reasoning = (
-            "No same-shape decision save on file; a style calibration that fits this conflict shape still points this way. "
-            "Indirect evidence only — confidence stays low."
+            "No close matching decision; style calibration that fits this conflict shape still points this way. "
+            "Indirect only — confidence stays low."
         )
         conf_cap = 0.41 if sc >= 0.52 else 0.38
         pid = str(row.get("prompt_id") or "").strip() or "style"
@@ -965,6 +1258,34 @@ def _strict_conflict_shape_evidence_fallback(
         sid = str(row.get("id") or "").strip()
         stuple = (sid,) if sid else ()
         return answer, reasoning, conf_cap, extra_basis, stuple
+
+    public_disrespect = public_audience_disrespect_prompt(prompt_norm)
+    if public_disrespect:
+        if af == "action":
+            opts = (
+                "You'd probably address it cleanly in the moment or right after — short, steady, and clear about the line.",
+                "My read is you'd set a boundary without performing: name it, keep calm, and keep it moving.",
+            )
+        else:
+            opts = (
+                "You'd probably keep it calm but direct: that was not okay in front of people, and you want it handled straight.",
+                "My read is you'd say it plainly without a scene — you can disagree, but public disrespect is not okay.",
+            )
+        answer = opts[_stable_index(f"{phrase_seed}:cpub", len(opts))]
+        if af == "both":
+            act_pub = (
+                "You'd probably mark the line right away or right after, then move it to a direct one-on-one.",
+                "My read is you'd keep the response controlled but firm — no pile-on, no pretending it was fine.",
+            )
+            answer = _merge_action_wording_paragraphs(
+                act_pub[_stable_index(f"{phrase_seed}:cpub_a", len(act_pub))],
+                answer,
+                seed=f"{phrase_seed}:cpub_m",
+            )
+        reasoning = (
+            "No close same-shape save; public disrespect cues raise the conflict stakes, so this leans calm/direct over passive ignoring."
+        )
+        return answer, reasoning, 0.37, extra_basis, ()
 
     peace = float(tmap.get("tendency_peace_over_confrontation", 0) or 0)
     clar = float(tmap.get("tendency_clarity_priority", 0) or 0)
@@ -1135,19 +1456,19 @@ def _strict_conflict_shape_evidence_fallback(
     if clause and fit >= 0.38:
         if af == "action":
             opts = (
-                f"You'd probably show up direct and keep the heat low — on file you tend to be {clause}.",
-                f"My read is you'd move plainly without extra drama; {clause} matches how you usually handle pressure.",
+                "You'd probably show up direct without turning it into a scene — say it once, steady, no big performance.",
+                "You'd probably handle it head-on and skip the extra packaging around it.",
             )
         else:
             opts = (
-                f"You'd probably say it straight and keep the heat low — on file you tend to be {clause}.",
-                f"My read is you'd speak up plainly; {clause} is close to how you sound when you are being direct.",
+                "You'd probably open by naming what you heard, keep your voice steady, and ask for a face-to-face talk.",
+                "You'd probably say the behind-the-back part stops here and you want it handled person-to-person, not as chatter.",
             )
         answer = opts[_stable_index(f"{phrase_seed}:cprof", len(opts))]
         if af == "both":
             act_p = (
-                f"You'd probably handle it head-on without polishing too much — {clause} is the backbone of how you move.",
-                f"My read is you'd pick the direct channel; {clause} is how you usually play it.",
+                "You'd probably handle it head-on without polishing too much — plain intent, low drama.",
+                "You'd probably pick the direct channel and keep the heat down while you still say the thing.",
             )
             answer = _merge_action_wording_paragraphs(
                 act_p[_stable_index(f"{phrase_seed}:cprof_a", len(act_p))],
@@ -1158,6 +1479,7 @@ def _strict_conflict_shape_evidence_fallback(
             "No tight gossip-or-conflict save; this leans on your overall communication pattern from past answers, "
             "not one labeled situation. Indirect only — confidence stays moderate or low."
         )
+        reasoning += f" Profile tendency (not a quote): {clause}."
         return answer, reasoning, 0.35, extra_basis, ()
 
     if gossip and cues["repeat_pattern"]:
@@ -1270,12 +1592,12 @@ def _strict_spending_pressure_evidence_fallback(
         af = "both"
     if af in ("wording", "both"):
         talk_track = (
-            "The line you'd probably use with yourself is blunt: essentials first, treat the big want like it can wait.",
-            "If you said it out loud, it would sound like triage — roof and bills stable before the shiny buy.",
+            "The line I'd use with myself is blunt: essentials first, treat the big want like it can wait.",
+            "If I said it out loud, it would sound like triage — roof and bills stable before the shiny buy.",
         )
         tt = talk_track[_stable_index(f"{phrase_seed}:spendtt", len(talk_track))]
         if af == "both":
-            answer = f"{answer}\n\nIf you said it out loud, it might sound like this:\n{tt}"
+            answer = f"{answer}\n\nIf I said it out loud, it might sound like this:\n{tt}"
         else:
             answer = answer + " " + tt
 
@@ -1342,12 +1664,13 @@ def _natural_likely_line(
 
     if um == "action":
         ch_low = _to_lower_start(choice)
+        cg = _action_mode_choice_gloss(choice) if choice else ch_low
         yfrag = f" — mostly because {why_low}" if why_low else ""
         if fam == "conflict":
             if choice:
                 variants = (
-                    f"{pref}you'd probably handle this head-on: {choice}{yfrag}.",
-                    f"{pref}you'd probably step in directly the way you tend to: {choice}{yfrag}.",
+                    f"{pref}you'd probably handle this head-on — {cg}{yfrag}.",
+                    f"{pref}you'd probably step in directly and keep it to one clean move — {cg}{yfrag}.",
                 )
             else:
                 variants = (
@@ -1357,8 +1680,8 @@ def _natural_likely_line(
         elif fam == "overload":
             if choice:
                 variants = (
-                    f"{pref}you'd probably draw the line here: {choice}{yfrag}.",
-                    f"{pref}you'd probably protect your energy the way that save describes: {choice}{yfrag}.",
+                    f"{pref}you'd probably draw the line here — {cg}{yfrag}.",
+                    f"{pref}you'd probably protect your bandwidth and hold to that limit — {cg}{yfrag}.",
                 )
             else:
                 variants = (
@@ -1368,8 +1691,8 @@ def _natural_likely_line(
         elif fam == "timing":
             if choice:
                 variants = (
-                    f"{pref}you'd probably take the pause-first move: {choice}{yfrag}.",
-                    f"{pref}you'd probably wait for a cleaner beat instead of forcing it — {ch_low}{yfrag}.",
+                    f"{pref}you'd probably take the pause-first move — {cg}{yfrag}.",
+                    f"{pref}you'd probably wait for a cleaner beat instead of forcing it — {cg}{yfrag}.",
                 )
             else:
                 variants = (
@@ -1379,8 +1702,8 @@ def _natural_likely_line(
         else:
             if choice:
                 variants = (
-                    f"{pref}you'd probably {ch_low}{yfrag}.",
-                    f"{pref}you'd probably lean toward {ch_low}{yfrag}.",
+                    f"{pref}you'd probably {cg}{yfrag}.",
+                    f"{pref}you'd probably lean toward {cg}{yfrag}.",
                 )
             else:
                 variants = (
@@ -1390,8 +1713,8 @@ def _natural_likely_line(
     elif fam == "conflict":
         if choice:
             variants = (
-                f"{pref}you'd probably say something like: \"{choice}.\"",
-                f"{pref}you're most likely to say: \"{choice}.\"",
+                f"{pref}\"{choice}.\" — that's about how it comes out.",
+                f"{pref}I put it like this: \"{choice}.\"",
             )
         else:
             variants = (
@@ -1541,6 +1864,12 @@ def generate_personal_response(
             prompt_norm, r, effective_primary=eff_pf
         )
     ]
+    if public_audience_disrespect_prompt(prompt_norm):
+        d_gated = [
+            (r, s, rs)
+            for r, s, rs in d_gated
+            if not _memory_blob_avoidance_hit(decision_row_text_blob(r))
+        ]
     top_d = d_gated[0] if d_gated else None
     top_score = top_d[1] if top_d else 0.0
     top_family_aligned = (
@@ -1757,7 +2086,7 @@ def generate_personal_response(
         choice = str(row.get("choice_label") or "").strip()
         why = str(row.get("reasoning_label") or "").strip()
         if answer_focus == "both":
-            act = _natural_likely_line(
+            act = _both_mode_action_line(
                 choice,
                 why,
                 primary_family=eff_pf,
@@ -1765,7 +2094,6 @@ def generate_personal_response(
                 cautious=weak_or_cross,
                 blunt=blunt,
                 aggressive_short=aggressive_short,
-                utterance_mode="action",
             )
             wrd = _natural_likely_line(
                 choice,
@@ -1792,7 +2120,7 @@ def generate_personal_response(
                 utterance_mode="action" if answer_focus == "action" else "wording",
             )
         reasoning = (
-            "Closest same-family saves point this way, plus your interview and style patterns."
+            "Closest same-family entry supports this read; your calibration adds a little color."
         )
         if cross_boost >= 0.09:
             reasoning += " Recent same-theme check-ins add a little support."
@@ -1832,7 +2160,7 @@ def generate_personal_response(
         choice = str(row.get("choice_label") or "").strip()
         why = str(row.get("reasoning_label") or "").strip()
         if answer_focus == "both":
-            act = _natural_likely_line(
+            act = _both_mode_action_line(
                 choice,
                 why,
                 primary_family=eff_pf,
@@ -1840,7 +2168,6 @@ def generate_personal_response(
                 cautious=True,
                 blunt=blunt,
                 aggressive_short=aggressive_short,
-                utterance_mode="action",
             )
             wrd = _natural_likely_line(
                 choice,
@@ -2023,22 +2350,21 @@ def generate_personal_response(
         if surf_ok:
             variants = (
                 (
-                    "Nothing saved fits this question tightly. If I’m winging it from your old answers, "
-                    f"I’d sound {profile_hint} — I’d still want a few more facts before I stuck to that."
+                    "Nothing on file fits this question tightly. I'd still slow down and grab a few more facts "
+                    "before I acted on a guess about how I'd play it."
                 ),
                 (
-                    "I can’t hook this to one past choice. The loose read from your saves is "
-                    f"{profile_hint} — I’d want more detail before I trusted it."
+                    "I can’t hook this to one past choice. I'd want more detail before I trusted a read."
                 ),
                 (
-                    "No close save for this one. Guessing from patterns, you usually come across as "
-                    f"{profile_hint} — I’d slow down and fill in blanks before I called that solid."
+                    "No close match for this one. I'd fill in a couple blanks before I called any read solid."
                 ),
             )
             answer = variants[_stable_index(f"{phrase_seed}:pf", len(variants))]
             reasoning = (
                 "That’s from your saved style and values, not a single labeled decision."
             )
+            reasoning += f" Loose tendency read: {profile_hint}."
             conf_caps.append(0.48)
             if hasattr(store, "record_memory_line_surface"):
                 try:
@@ -2099,6 +2425,7 @@ def generate_personal_response(
         answer_focus=answer_focus,
         eff_pf=str(eff_pf or "general"),
     )
+    answer = _phase41_style_realism_pass(answer, answer_focus=answer_focus)
 
     path_m = _respond_path_multipliers(evidence_path, mmap)
     conf = _compute_response_confidence(

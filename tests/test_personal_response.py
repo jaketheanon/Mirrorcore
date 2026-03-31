@@ -388,7 +388,36 @@ class TestRespondGeneration(unittest.TestCase):
         self.assertNotIn("skews leans", low)
         self.assertNotIn("leans cautious;", low)
         self.assertNotIn("usually skews leans", low)
-        self.assertTrue("cautious" in low or "blunt" in low or "direct" in low)
+        rb = pr.reasoning_brief.lower()
+        self.assertTrue(
+            "cautious" in rb or "blunt" in rb or "profile tendency" in rb,
+            msg=pr.reasoning_brief,
+        )
+        self.assertNotRegex(low, r"cautious on risk.*wording")
+        self.assertNotIn("say it straight", low)
+        self.assertNotIn("heat low", low)
+
+    def test_phase41_no_mixed_pronouns_on_overload_action(self):
+        """First-person likely-you lines must not pair I'd with your (self-energy/bandwidth)."""
+        self.db.record_decision_memory(
+            scenario_id="shift_v3",
+            scenario_text="You're exhausted and asked to cover another shift.",
+            choice_label="I can't take this one. I need to recover tonight.",
+            choice_value="n",
+            reasoning_label="Protect energy",
+            reasoning_value="p",
+            value_tags=["boundaries"],
+            trait_signals={"boundary_strain": 0.82},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "i am burnt out and they asked me to help again what would i do",
+            self.db,
+        )
+        low = pr.likely_answer.lower()
+        self.assertNotRegex(low, r"i'd[^\n]{0,120}your energy")
+        self.assertNotRegex(low, r"i'd[^\n]{0,120}your bandwidth")
 
     def test_conflict_gossip_fallback_stays_useful_without_same_shape_save(self):
         """Phase 37.2: strict gossip gating with no conflict row still gives a direct-address read."""
@@ -482,6 +511,33 @@ class TestRespondGeneration(unittest.TestCase):
         low = pr.likely_answer.lower()
         self.assertTrue(("say" in low) or ("talk" in low))
         self.assertNotIn("i’d probably choose", low)
+
+    def test_phase41_reduces_meta_narration_in_main_answer(self):
+        self.db.record_decision_memory(
+            scenario_id="gossip_v3",
+            scenario_text="Coworker keeps talking behind your back.",
+            choice_label="Let's talk directly. I want it handled face-to-face.",
+            choice_value="a",
+            reasoning_label="Clear it early and keep it calm",
+            reasoning_value="c",
+            value_tags=["directness"],
+            trait_signals={"diplomacy": 0.45},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "what would i say if someone keeps talking shit behind my back",
+            self.db,
+        )
+        low = pr.likely_answer.lower()
+        self.assertNotIn("my read is", low)
+        self.assertNotIn("on file you tend to", low)
+        self.assertNotIn("from what's on file", low)
+        self.assertTrue(
+            ("i'd" in low) or ("i " in low) or ("that's about how" in low),
+            msg=pr.likely_answer,
+        )
+        self.assertNotIn("you'd probably say", low)
 
     def test_overload_prompt_sounds_like_boundary_setting(self):
         self.db.record_decision_memory(
@@ -790,13 +846,11 @@ class TestPhase39AnswerFocus(unittest.TestCase):
             pr = generate_personal_response(q, db)
             self.assertEqual(pr.answer_focus, "both")
             ans = pr.likely_answer
-            self.assertGreaterEqual(ans.count("\n"), 2)
-            bridges = (
-                "if you said it out loud",
-                "in plain words",
-            )
+            self.assertIn("\n", ans)
+            lines = [ln.strip() for ln in ans.split("\n") if ln.strip()]
+            self.assertGreaterEqual(len(lines), 2, msg=ans)
             low = ans.lower()
-            self.assertTrue(any(b in low for b in bridges))
+            self.assertIn("if i said it out loud", low, msg=ans)
             self.assertIn('"', ans)
             # Not a single paragraph that is only a quoted line / phrasing teaser.
             one_line = " ".join(ans.split())
@@ -804,6 +858,260 @@ class TestPhase39AnswerFocus(unittest.TestCase):
             self.assertFalse(
                 one_line.lower().startswith('you\'d probably say something like: "')
                 and one_line.count('"') <= 2
+            )
+        finally:
+            db.close()
+            Path(tmp.name).unlink(missing_ok=True)
+
+
+class TestPhase41OutputRealism(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = DatabaseStore(Path(self.tmp.name))
+        self.db.initialize_database()
+
+    def tearDown(self):
+        self.db.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_main_answer_avoids_tone_meta_phrases(self):
+        """Tone is shown through phrasing, not summarized as 'cautious on risk, … wording'."""
+        self.db.record_decision_memory(
+            scenario_id="shift_v1",
+            scenario_text="Coworker wants you to cover another shift.",
+            choice_label="Say no",
+            choice_value="n",
+            reasoning_label="Overload",
+            reasoning_value="o",
+            value_tags=["boundaries"],
+            trait_signals={
+                "risk_tolerance": 0.2,
+                "bluntness": 0.75,
+                "diplomacy": 0.35,
+            },
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "what would i say if someone keeps talking shit behind my back",
+            self.db,
+        )
+        low = pr.likely_answer.lower()
+        self.assertNotRegex(low, r"on risk, with .+ wording")
+        self.assertNotIn("pretty blunt wording", low)
+        self.assertNotIn("fairly soft wording", low)
+
+    def test_main_answer_avoids_internal_save_jargon(self):
+        self.db.record_decision_memory(
+            scenario_id="shift_v3",
+            scenario_text="You're exhausted and asked to cover another shift.",
+            choice_label="I can't take this one. I need to recover tonight.",
+            choice_value="n",
+            reasoning_label="Protect energy",
+            reasoning_value="p",
+            value_tags=["boundaries"],
+            trait_signals={"boundary_strain": 0.82},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "i am burnt out and they asked me to help again what would i do",
+            self.db,
+        )
+        low = pr.likely_answer.lower()
+        self.assertNotIn("save describes", low)
+        self.assertNotIn("the way that save", low)
+
+    def test_both_mode_action_paragraph_is_not_script_hybrid(self):
+        """Move vs script: first block should not paste the full choice like the quote block."""
+        self.db.record_decision_memory(
+            scenario_id="pa_one",
+            scenario_text="passive aggressive colleague at work snide passive aggressive",
+            choice_label="Let it go for now",
+            choice_value="a",
+            reasoning_label="Keep it smooth",
+            reasoning_value="b",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.91,
+            correction_status="uncorrected",
+        )
+        q = "what would i do and say if someone is being passive aggressive at work"
+        pr = generate_personal_response(q, self.db)
+        self.assertEqual(pr.answer_focus, "both")
+        lines = [ln.strip() for ln in pr.likely_answer.split("\n") if ln.strip()]
+        self.assertGreaterEqual(len(lines), 2, msg=pr.likely_answer)
+        self.assertNotEqual(lines[0].lower(), lines[-1].lower())
+        low = pr.likely_answer.lower()
+        self.assertIn("if i said it out loud", low)
+        self.assertNotRegex(
+            lines[0].lower(),
+            r"handle this head-on: let it go",
+            msg=lines[0],
+        )
+
+    def test_action_mode_avoids_and_say_script_hook(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        db = DatabaseStore(Path(tmp.name))
+        db.initialize_database()
+        try:
+            db.record_decision_memory(
+                scenario_id="push_v1",
+                scenario_text="Coworker keeps asking after you already said no.",
+                choice_label="I already said no — I'm not reopening it tonight.",
+                choice_value="n",
+                reasoning_label="Hold the line",
+                reasoning_value="h",
+                value_tags=["boundaries"],
+                trait_signals={},
+                confidence_score=0.9,
+                correction_status="accurate",
+            )
+            pr = generate_personal_response(
+                "what would i do if a coworker keeps pushing after i already said no",
+                db,
+            )
+            self.assertEqual(pr.answer_focus, "action")
+            self.assertNotRegex(pr.likely_answer.lower(), r"\band say:")
+        finally:
+            db.close()
+            Path(tmp.name).unlink(missing_ok=True)
+
+    def test_public_disrespect_blocks_avoidance_style_row(self):
+        """High-scoring 'let it go' style must not anchor public disrespect."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        db = DatabaseStore(Path(tmp.name))
+        db.initialize_database()
+        try:
+            db.record_style_memory(
+                prompt_id="avoid_style_v1",
+                prompt_text="When someone is rude in front of others",
+                selected_label="Let it go and keep your composure",
+                selected_value="x",
+                style_tags=["patience", "let it go"],
+                tone_signals={"diplomacy": 0.82, "directness": 0.2},
+                confidence_score=0.9,
+                correction_status="accurate",
+            )
+            pr = generate_personal_response(
+                "what would i say if someone disrespects me in front of other people",
+                db,
+            )
+            self.assertNotIn("let it go", pr.likely_answer.lower())
+        finally:
+            db.close()
+            Path(tmp.name).unlink(missing_ok=True)
+
+    def test_public_disrespect_does_not_quote_let_it_go(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        db = DatabaseStore(Path(tmp.name))
+        db.initialize_database()
+        try:
+            db.record_decision_memory(
+                scenario_id="pub_rude_avoid",
+                scenario_text="Someone threw shade at you among friends; stay smooth.",
+                choice_label="Let it go and move on",
+                choice_value="l",
+                reasoning_label="Not worth the drama tonight",
+                reasoning_value="n",
+                value_tags=["patience"],
+                trait_signals={},
+                confidence_score=0.92,
+                correction_status="accurate",
+            )
+            db.record_decision_memory(
+                scenario_id="pub_rude_direct",
+                scenario_text="Coworker was rude to you in front of the team.",
+                choice_label="Pull them aside and say that was not okay",
+                choice_value="p",
+                reasoning_label="Keep it clean but direct",
+                reasoning_value="k",
+                value_tags=["directness"],
+                trait_signals={},
+                confidence_score=0.9,
+                correction_status="accurate",
+            )
+            pr = generate_personal_response(
+                "what would i say if someone disrespects me in front of other people",
+                db,
+            )
+            low = pr.likely_answer.lower()
+            self.assertNotIn("let it go", low)
+            self.assertTrue(
+                any(w in low for w in ("address", "direct", "aside", "okay", "say")),
+                msg=pr.likely_answer,
+            )
+        finally:
+            db.close()
+            Path(tmp.name).unlink(missing_ok=True)
+
+    def test_public_disrespect_with_only_avoidance_decision_stays_direct(self):
+        """Even with only avoidance memory, public disrespect should not default to passivity."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        db = DatabaseStore(Path(tmp.name))
+        db.initialize_database()
+        try:
+            db.record_decision_memory(
+                scenario_id="pub_only_avoid",
+                scenario_text="They were rude to me in front of everyone.",
+                choice_label="Let it go and move on",
+                choice_value="l",
+                reasoning_label="Keep the peace",
+                reasoning_value="k",
+                value_tags=["patience"],
+                trait_signals={},
+                confidence_score=0.95,
+                correction_status="accurate",
+            )
+            pr = generate_personal_response(
+                "what would i say if someone disrespects me in front of people",
+                db,
+            )
+            low = pr.likely_answer.lower()
+            self.assertNotIn("let it go", low)
+            self.assertTrue(
+                any(w in low for w in ("not okay", "direct", "boundary", "calm", "clear")),
+                msg=pr.likely_answer,
+            )
+        finally:
+            db.close()
+            Path(tmp.name).unlink(missing_ok=True)
+
+    def test_public_disrespect_prefers_calm_direct_not_aggressive(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        db = DatabaseStore(Path(tmp.name))
+        db.initialize_database()
+        try:
+            db.record_decision_memory(
+                scenario_id="pub_mix",
+                scenario_text="Disrespect in front of others at work.",
+                choice_label="Let it go and move on",
+                choice_value="l",
+                reasoning_label="Keep peace",
+                reasoning_value="k",
+                value_tags=["patience"],
+                trait_signals={},
+                confidence_score=0.9,
+                correction_status="accurate",
+            )
+            pr = generate_personal_response(
+                "what would i say if someone disrespects me in public",
+                db,
+            )
+            low = pr.likely_answer.lower()
+            self.assertTrue(
+                any(w in low for w in ("calm", "direct", "not okay", "clear")),
+                msg=pr.likely_answer,
+            )
+            self.assertFalse(
+                any(w in low for w in ("destroy", "humiliate", "make a scene")),
+                msg=pr.likely_answer,
             )
         finally:
             db.close()

@@ -135,6 +135,92 @@ def conflict_situational_cues(norm_text: str) -> Dict[str, bool]:
     }
 
 
+def public_audience_disrespect_prompt(norm_text: str) -> bool:
+    """Spectators / exposure plus disrespect — not the same as private annoyance."""
+    pn = normalize_input(norm_text or "")
+    if not pn:
+        return False
+    audience = any(
+        x in pn
+        for x in (
+            "in front of",
+            "in front of other",
+            "with other people",
+            "other people",
+            "other folks",
+            "everyone was",
+            "everybody was",
+            "everyone ",
+            "everybody ",
+            "publicly",
+            "in public",
+            "humiliat",
+            "embarrass",
+            "with people watching",
+            "around others",
+            "in the room",
+            "in a meeting",
+            "during the meeting",
+            "whole team ",
+            "whole group",
+        )
+    )
+    disrespect = any(
+        x in pn
+        for x in (
+            "disrespect",
+            "disrespected",
+            "belittl",
+            "mocked",
+            "ridicul",
+            "insult",
+        )
+    )
+    return audience and disrespect
+
+
+def _row_is_pure_conflict_avoidance(row: Mapping[str, Any]) -> bool:
+    """Low-stakes de-escalation only — unsafe as the main read for public disrespect."""
+    blob = " ".join(
+        [
+            str(row.get("choice_label") or ""),
+            str(row.get("reasoning_label") or ""),
+            str(row.get("scenario_text") or ""),
+        ]
+    ).lower()
+    avoid_needles = (
+        "let it go",
+        "let it slide",
+        "let it ride",
+        "just ignore",
+        "ignore it",
+        "move on",
+        "not worth the",
+        "not worth it",
+        "walk away",
+        "rise above",
+        "drop it",
+    )
+    direct_needles = (
+        "address",
+        "speak up",
+        "say something",
+        "direct",
+        "talk to",
+        "conversation",
+        "boundary",
+        "call out",
+        "call them",
+        "name it",
+        "confront",
+        "tell them",
+        "pull aside",
+    )
+    if not any(n in blob for n in avoid_needles):
+        return False
+    return not any(n in blob for n in direct_needles)
+
+
 def _gossip_or_backchannel_prompt(norm_text: str) -> bool:
     return gossip_or_backchannel_user_prompt(norm_text)
 
@@ -402,6 +488,13 @@ def decision_memory_relevance_multiplier(
         if shared:
             base *= 1.0 + 0.045 * float(min(3, shared))
 
+    if (
+        top_p == CONFLICT_FAMILY
+        and public_audience_disrespect_prompt(prompt_norm)
+        and _row_is_pure_conflict_avoidance(row)
+    ):
+        base *= 0.11
+
     return max(0.08, min(1.15, base * axis_factor))
 
 
@@ -497,6 +590,10 @@ def respond_main_decision_passes_shape_gate(
                 return False
         if _gossip_or_backchannel_prompt(prompt_norm):
             return _row_supports_backchannel_conflict(row_norm, ar)
+        if public_audience_disrespect_prompt(
+            prompt_norm
+        ) and _row_is_pure_conflict_avoidance(row):
+            return False
         if interpersonal_conflict_markers_present(prompt_norm) and top_r == GENERAL:
             return row_c >= 0.9
         return True
@@ -607,6 +704,20 @@ def style_memory_passes_respond_conflict_shape(
         return True
 
     if interpersonal_conflict_markers_present(prompt_norm):
+        if public_audience_disrespect_prompt(prompt_norm):
+            pub_avoid = (
+                "let it go",
+                "let it slide",
+                "let it ride",
+                "just ignore",
+                "ignore it",
+                "move on",
+                "walk away",
+                "rise above",
+                "drop it",
+            )
+            if any(p in label_l or p in tags_l for p in pub_avoid):
+                return False
         _, dr, ar = rank_families_full(style_norm)
         row_c = float(dr.get("interpersonal_hurt", 0) or 0) + float(
             dr.get("conflict_intensity", 0) or 0
