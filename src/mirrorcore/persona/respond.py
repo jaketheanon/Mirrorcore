@@ -334,6 +334,8 @@ class RespondFeedbackInfluence:
     direct_calm_signal: float
     wrong_replacement_count: int = 0
     replacement_inject_line: str = ""
+    # Phase 43: same-prompt replacements disagree; damp confidence / overlays.
+    replacement_direction_mixed: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -345,6 +347,11 @@ class RespondExampleInfluence:
     wording_line: str = ""
     both_line: str = ""
     strongest_strength: float = 0.0
+    winning_effective_strength: float = 0.0
+    contradiction_level: float = 0.0
+    consistency: float = 1.0
+    winning_gap: float = 0.0
+    uses_fallback_only: bool = False
 
 
 _FEEDBACK_TOK_STOP = frozenset(
@@ -438,6 +445,11 @@ def _memory_blob_avoidance_hit(blob: str) -> bool:
     return any(n in b for n in needles)
 
 
+def _normalize_replacement_direction(text: str) -> str:
+    t = " ".join((text or "").strip().lower().split())
+    return t[:400]
+
+
 def build_respond_feedback_influence(
     store: DatabaseStore,
     prompt_norm_hash: str,
@@ -445,9 +457,9 @@ def build_respond_feedback_influence(
 ) -> RespondFeedbackInfluence:
     """Derive lexical preference + avoidance demotion from recent same-prompt feedback."""
     if not (prompt_norm_hash or "").strip():
-        return RespondFeedbackInfluence({}, 0.0, 0.0, 0, "")
+        return RespondFeedbackInfluence({}, 0.0, 0.0, 0, "", 0.0)
     if not hasattr(store, "list_personal_response_feedback_for_prompt"):
-        return RespondFeedbackInfluence({}, 0.0, 0.0, 0, "")
+        return RespondFeedbackInfluence({}, 0.0, 0.0, 0, "", 0.0)
     rows = store.list_personal_response_feedback_for_prompt(
         prompt_norm_hash, limit=40
     )
@@ -456,6 +468,14 @@ def build_respond_feedback_influence(
     direct_hits = 0.0
     wrong_rep_count = 0
     inject_line = ""
+    replacement_direction_mixed = 0.0
+
+    # Phase 43: aggregate wrong+replacement by direction (support beats one-off recency).
+    rep_counts: Dict[str, int] = {}
+    # Newest-first list → first stored text per norm is the latest wording for that direction.
+    rep_newest_text: Dict[str, str] = {}
+    dominant_norm = ""
+
     for row in rows:
         if not _feedback_family_compatible(
             str(row.get("effective_family") or ""), effective_family
@@ -466,15 +486,99 @@ def build_respond_feedback_influence(
         snip = str(row.get("likely_answer_snippet") or "")
         if rt == "wrong" and rep_t:
             wrong_rep_count += 1
-            if not inject_line:
+        if rt == "wrong" and rep_t:
+            rn = _normalize_replacement_direction(rep_t)
+            if len(rn) >= 8:
+                rep_counts[rn] = rep_counts.get(rn, 0) + 1
+                if rn not in rep_newest_text:
+                    rep_newest_text[rn] = rep_t[:400]
+
+    establish_index: Dict[str, int] = {}
+    _ei = 0
+    for row in reversed(rows):
+        if not _feedback_family_compatible(
+            str(row.get("effective_family") or ""), effective_family
+        ):
+            continue
+        if (row.get("rating") or "").strip().lower() != "wrong":
+            continue
+        rep_t = (row.get("replacement_text") or "").strip()
+        rn = _normalize_replacement_direction(rep_t)
+        if len(rn) < 8:
+            continue
+        if rn not in establish_index:
+            establish_index[rn] = _ei
+            _ei += 1
+
+    if rep_counts:
+        sorted_norms = sorted(
+            rep_counts.keys(),
+            key=lambda k: (-rep_counts[k], establish_index.get(k, 999), k),
+        )
+        dominant_norm = sorted_norms[0]
+        inject_line = (rep_newest_text.get(dominant_norm) or "").strip()
+        dom_c = rep_counts[dominant_norm]
+        second_c = rep_counts[sorted_norms[1]] if len(sorted_norms) > 1 else 0
+
+        newest_contra_norm: Optional[str] = None
+        for row in rows:
+            if not _feedback_family_compatible(
+                str(row.get("effective_family") or ""), effective_family
+            ):
+                continue
+            if (row.get("rating") or "").strip().lower() != "wrong":
+                continue
+            rep_t = (row.get("replacement_text") or "").strip()
+            if not rep_t:
+                continue
+            rn = _normalize_replacement_direction(rep_t)
+            if len(rn) < 8:
+                continue
+            newest_contra_norm = rn
+            break
+
+        if newest_contra_norm is not None:
+            n_new = rep_counts.get(newest_contra_norm, 0)
+            if dom_c >= 2 and n_new == 1 and newest_contra_norm != dominant_norm:
+                replacement_direction_mixed = max(replacement_direction_mixed, 0.48)
+            elif dom_c >= 2 and second_c >= 2 and second_c >= dom_c - 1:
+                replacement_direction_mixed = max(replacement_direction_mixed, 0.36)
+    else:
+        for row in rows:
+            if not _feedback_family_compatible(
+                str(row.get("effective_family") or ""), effective_family
+            ):
+                continue
+            rt = (row.get("rating") or "").strip().lower()
+            rep_t = (row.get("replacement_text") or "").strip()
+            if rt == "wrong" and rep_t and not inject_line:
                 inject_line = rep_t[:400]
+                break
+
+    for row in rows:
+        if not _feedback_family_compatible(
+            str(row.get("effective_family") or ""), effective_family
+        ):
+            continue
+        rt = (row.get("rating") or "").strip().lower()
+        rep_t = (row.get("replacement_text") or "").strip()
+        snip = str(row.get("likely_answer_snippet") or "")
+        rn = _normalize_replacement_direction(rep_t) if rep_t else ""
+        dom_c = rep_counts.get(dominant_norm, 0) if dominant_norm else 0
         if rep_t and rt in ("wrong", "partly"):
-            add = 0.20 if rt == "wrong" else 0.10
+            mult = 1.0
+            if dominant_norm and rn and rn != dominant_norm:
+                cn = rep_counts.get(rn, 0)
+                if dom_c >= 2 and cn == 1:
+                    mult = 0.20
+                elif dom_c >= 2 and cn < dom_c:
+                    mult = min(1.0, 0.38 + 0.14 * float(cn))
+            add = (0.20 if rt == "wrong" else 0.10) * mult
             for tok in _tokenize_feedback_phrase(rep_t):
                 pref[tok] = min(0.62, pref.get(tok, 0.0) + add)
             rl = rep_t.lower()
             if any(x in rl for x in ("address", "direct", "calm", "straightforward")):
-                direct_hits = min(1.0, direct_hits + 0.32)
+                direct_hits = min(1.0, direct_hits + 0.32 * mult)
         if rt == "wrong" and _feedback_snippet_signals_avoidance(snip):
             wrong_avoid += 1
     if wrong_rep_count >= 2:
@@ -494,6 +598,7 @@ def build_respond_feedback_influence(
         direct_calm_signal=direct_hits,
         wrong_replacement_count=wrong_rep_count,
         replacement_inject_line=inject_line.strip(),
+        replacement_direction_mixed=replacement_direction_mixed,
     )
 
 
@@ -539,11 +644,68 @@ def _build_example_influence(
         effective_family=effective_family,
         route_keys=list(route_hints),
         answer_focus=answer_focus,
-        limit=6,
-        min_strength=0.55,
+        limit=10,
+        min_strength=0.2,
     )
     if not rows:
         return RespondExampleInfluence({})
+    # Deterministic contradiction handling (Phase 43):
+    # group reusable examples by normalized text and compare support-weighted strength.
+    candidates: List[Tuple[str, str, float, float, int, float]] = []
+    # (norm_text, example_type, effective_strength, contradiction_level, support_count, recency_weight)
+    for r in rows:
+        txt = str(r.get("example_text") or "").strip()
+        if not txt:
+            continue
+        norm = " ".join(txt.lower().split())
+        candidates.append(
+            (
+                norm,
+                str(r.get("example_type") or "").strip().lower() or "both",
+                float(r.get("effective_strength") or r.get("strength") or 0.0),
+                max(0.0, min(1.0, float(r.get("contradiction_level") or 0.0))),
+                max(0, int(r.get("support_count") or 0)),
+                max(0.0, min(1.0, float(r.get("recency_weight") or 0.0))),
+            )
+        )
+    if not candidates:
+        return RespondExampleInfluence({})
+    by_text: Dict[str, Dict[str, float]] = {}
+    for norm, _, eff, contra, support, rec in candidates:
+        slot = by_text.setdefault(
+            norm,
+            {"score": 0.0, "support": 0.0, "contra": 0.0, "recency": 0.0, "count": 0.0},
+        )
+        slot["score"] += max(0.0, eff)
+        slot["support"] += float(support)
+        slot["contra"] += float(contra)
+        slot["recency"] += float(rec)
+        slot["count"] += 1.0
+    text_ranked = sorted(
+        by_text.items(),
+        key=lambda kv: (
+            -float(kv[1]["score"]),
+            -float(kv[1]["support"]),
+            float(kv[1]["contra"]) / max(1.0, float(kv[1]["count"])),
+            kv[0],
+        ),
+    )
+    top_key, top_stat = text_ranked[0]
+    runner_score = float(text_ranked[1][1]["score"]) if len(text_ranked) > 1 else 0.0
+    total_score = sum(float(v["score"]) for _, v in text_ranked)
+    dominance = float(top_stat["score"]) / max(0.0001, total_score)
+    contradiction_level = 1.0 - max(0.0, min(1.0, dominance))
+    gap = max(0.0, float(top_stat["score"]) - runner_score)
+    top_sup = float(top_stat["support"])
+    if len(text_ranked) > 1:
+        r1_stat = text_ranked[1][1]
+        runner_sup = float(r1_stat["support"])
+        r_score = float(r1_stat["score"])
+        t_score = float(top_stat["score"])
+        if top_sup >= 2.0 and runner_sup <= 1.0 and r_score >= 0.17 * max(0.001, t_score):
+            contradiction_level = max(contradiction_level, 0.46)
+        if top_sup >= 2.0 and runner_sup >= 2.0 and runner_sup + 0.4 >= top_sup:
+            contradiction_level = max(contradiction_level, 0.39)
     tok: Dict[str, float] = {}
     action_line = ""
     wording_line = ""
@@ -552,8 +714,14 @@ def _build_example_influence(
     for r in rows:
         txt = str(r.get("example_text") or "").strip()
         et = str(r.get("example_type") or "").strip().lower()
-        strength = max(0.0, min(1.0, float(r.get("strength") or 0.0)))
+        strength = max(
+            0.0,
+            min(1.1, float(r.get("effective_strength") or r.get("strength") or 0.0)),
+        )
         if not txt:
+            continue
+        norm_txt = " ".join(txt.lower().split())
+        if norm_txt != top_key:
             continue
         top = max(top, strength)
         add = min(0.28, 0.08 + strength * 0.18)
@@ -571,6 +739,11 @@ def _build_example_influence(
         wording_line=wording_line,
         both_line=both_line,
         strongest_strength=top,
+        winning_effective_strength=max(0.0, min(1.1, float(top_stat["score"]))),
+        contradiction_level=max(0.0, min(1.0, contradiction_level)),
+        consistency=max(0.0, min(1.0, 1.0 - contradiction_level)),
+        winning_gap=max(0.0, min(1.0, gap)),
+        uses_fallback_only=top < 0.56,
     )
 
 
@@ -633,12 +806,24 @@ def _apply_feedback_replacement_overlay(
     covered = _answer_covers_injection_tokens(a, inj)
     avoidance_ans = _memory_blob_avoidance_hit(low) or "let it go" in low
     af = (answer_focus or "both").strip().lower()
+    fb_mix = max(0.0, min(1.0, float(feedback_influence.replacement_direction_mixed or 0.0)))
+    cautious_fb = fb_mix >= 0.36
     if not covered and (avoidance_ans or n_wr >= 3):
         if af == "both":
-            act_opts = (
-                "I'd step in calmer but clearer — closer to what I've been asking for on this kind of prompt.",
-                "I'd handle it more directly after the corrections I've stacked on this one.",
-            )
+            if cautious_fb:
+                act_opts = (
+                    "I'd still lean calmer and clearer — the stronger saved pattern points that way.",
+                    "I'd step more direct, but I'm not ignoring that one newer note pulled another way.",
+                )
+                tail = (
+                    " The repeat pattern says one line; one recent correction disagreed, so I'm holding this lighter."
+                )
+            else:
+                act_opts = (
+                    "I'd step in calmer but clearer — closer to what I've been asking for on this kind of prompt.",
+                    "I'd handle it more directly after the corrections I've stacked on this one.",
+                )
+                tail = " Recent feedback nudged the say-line that way."
             act_line = act_opts[
                 _stable_index(f"{phrase_seed}:fbinj_both_act", len(act_opts))
             ]
@@ -649,25 +834,40 @@ def _apply_feedback_replacement_overlay(
                 act_line, w_inj, seed=f"{phrase_seed}:fbinj_m"
             )
             rs = (reasoning or "").rstrip()
-            tail = " Recent feedback nudged the say-line that way."
             return merged, (rs + tail) if rs else tail.strip()
-        pool = (
-            f"I'd handle it more like: {inj}",
-            f"I'd land here after the corrections I've given on this: {inj}",
-            f"I'm pushing toward something closer to: {inj}",
-        )
+        if cautious_fb:
+            pool = (
+                f"I'd still lean more like: {inj}, but one newer correction pointed a different way.",
+                f"Stronger repeat pattern lands closer to: {inj} — I'm weighing one recent disagree lightly.",
+            )
+            tail = " Holding the line softer until the disagreement repeats."
+        else:
+            pool = (
+                f"I'd handle it more like: {inj}",
+                f"I'd land here after the corrections I've given on this: {inj}",
+                f"I'm pushing toward something closer to: {inj}",
+            )
+            tail = " Recent feedback on this prompt nudges the line that way."
         new_a = pool[_stable_index(f"{phrase_seed}:fbinj", len(pool))]
         rs = (reasoning or "").rstrip()
-        tail = " Recent feedback on this prompt nudges the line that way."
         return new_a, (rs + tail) if rs else tail.strip()
     if not covered:
         if af == "wording":
-            b = f"I'd phrase it closer to: {inj}"
+            if cautious_fb:
+                b = f"I'd still phrase it closer to: {inj}, though one recent note didn't match that pattern."
+            else:
+                b = f"I'd phrase it closer to: {inj}"
         else:
-            bridges = (
-                f"Said plainly, more like: {inj}",
-                f"Out loud, closer to: {inj}",
-            )
+            if cautious_fb:
+                bridges = (
+                    f"Said plainly, I'd still lean toward: {inj}, with one newer correction pulling another way.",
+                    f"Out loud, closer to: {inj} — but I'm not treating one-off noise as the new default.",
+                )
+            else:
+                bridges = (
+                    f"Said plainly, more like: {inj}",
+                    f"Out loud, closer to: {inj}",
+                )
             b = bridges[_stable_index(f"{phrase_seed}:fbapp", len(bridges))]
         sep = "\n\n" if a else ""
         return f"{a}{sep}{b}", reasoning
@@ -687,6 +887,11 @@ def _apply_example_overlay(
         return answer, reasoning, False
     if float(example_influence.strongest_strength or 0.0) < 0.55:
         return answer, reasoning, False
+    mix_ex = float(example_influence.contradiction_level or 0.0)
+    # Conflicting same-shape examples: avoid overconfident direct overlay.
+    if mix_ex >= 0.48:
+        return answer, reasoning, False
+    cautious_ex = 0.34 <= mix_ex < 0.48
     af = (answer_focus or "both").strip().lower()
     line = ""
     if af == "action":
@@ -705,24 +910,44 @@ def _apply_example_overlay(
     if _answer_covers_injection_tokens(answer, line):
         return answer, reasoning, False
     if af == "both":
-        act = _both_mode_action_line(
-            line,
-            "",
-            primary_family="general",
-            seed=f"{phrase_seed}:exact",
-            cautious=False,
-            blunt=0.5,
-            aggressive_short=False,
-        )
-        out = _merge_action_wording_paragraphs(act, line, seed=f"{phrase_seed}:exm")
+        if cautious_ex:
+            hedges = (
+                f"I might keep the say-line closer to: {line}, but past saves don't fully agree yet.",
+                f"If I had to pick wording: maybe {line} — still mixed against older saves.",
+            )
+            hx = hedges[_stable_index(f"{phrase_seed}:excau", len(hedges))]
+            base_a = (answer or "").strip()
+            sep = "\n" if base_a else ""
+            out = f"{base_a}{sep}{hx}"
+        else:
+            act = _both_mode_action_line(
+                line,
+                "",
+                primary_family="general",
+                seed=f"{phrase_seed}:exact",
+                cautious=False,
+                blunt=0.5,
+                aggressive_short=False,
+            )
+            out = _merge_action_wording_paragraphs(act, line, seed=f"{phrase_seed}:exm")
     else:
-        opts = (
-            f"I'd keep it closer to this: {line}",
-            f"This lines up with what I've corrected before: {line}",
-        )
+        if cautious_ex:
+            opts = (
+                f"I might lean toward: {line}, though saved corrections still disagree some.",
+                f"Rough direction: {line} — I'm not locking it while examples pull two ways.",
+            )
+        else:
+            opts = (
+                f"I'd keep it closer to this: {line}",
+                f"This lines up with what I've corrected before: {line}",
+            )
         out = opts[_stable_index(f"{phrase_seed}:exov", len(opts))]
     rb = (reasoning or "").rstrip()
-    tail = " This also lines up with a saved repeated correction."
+    tail = (
+        " Past saved lines don't fully line up, so I'm keeping the wording softer."
+        if cautious_ex
+        else " This also lines up with a saved repeated correction."
+    )
     return out, (rb + tail) if rb else tail.strip(), True
 
 
@@ -859,6 +1084,9 @@ def _compute_response_confidence(
     *,
     decision_family_aligned: bool = True,
     path_multipliers: Optional[Sequence[float]] = None,
+    example_influence: Optional[RespondExampleInfluence] = None,
+    route_keys: Optional[Sequence[str]] = None,
+    feedback_direction_mixed: float = 0.0,
 ) -> float:
     base = 0.32
     ev = min(1.0, profile.total_evidence_weight / 8.0)
@@ -885,6 +1113,33 @@ def _compute_response_confidence(
     if path_multipliers:
         deficit = sum(max(0.0, 1.0 - float(m)) for m in path_multipliers if m < 1.0)
         base -= min(0.24, 0.058 * deficit)
+    rks = {str(x).strip().lower() for x in (route_keys or ()) if str(x).strip()}
+    fallback_route = any(
+        x in rks
+        for x in (
+            "profile_pattern_fallback",
+            "profile_pattern_fallback_suppressed",
+            "weak_profile_signal",
+            "insufficient_evidence",
+            "strict_shape_miss",
+            "strict_conflict_fallback",
+            "strict_spending_fallback",
+        )
+    )
+    if fallback_route:
+        base -= 0.08
+    if example_influence:
+        cx = max(0.0, min(1.0, float(example_influence.contradiction_level or 0.0)))
+        base -= 0.18 * cx
+        if float(example_influence.winning_gap or 0.0) >= 0.34 and cx <= 0.28:
+            base += 0.04
+        if float(example_influence.winning_effective_strength or 0.0) >= 0.92 and cx <= 0.2:
+            base += 0.03
+        if bool(example_influence.uses_fallback_only):
+            base -= 0.05
+    fb_mix = max(0.0, min(1.0, float(feedback_direction_mixed or 0.0)))
+    if fb_mix > 0:
+        base -= 0.19 * fb_mix
     return max(0.12, min(0.9, base))
 
 
@@ -2080,6 +2335,10 @@ def generate_personal_response(
         agreement_boost,
         decision_family_aligned=top_family_aligned,
         path_multipliers=None,
+        example_influence=example_influence,
+        feedback_direction_mixed=float(
+            feedback_influence.replacement_direction_mixed or 0.0
+        ),
     )
 
     verb = _verbosity_from_profile(profile)
@@ -2579,6 +2838,14 @@ def generate_personal_response(
         answer_focus=answer_focus,
         eff_pf=str(eff_pf or "general"),
     )
+    _fb_mix = float(feedback_influence.replacement_direction_mixed or 0.0)
+    if _fb_mix >= 0.42:
+        rl = (reasoning or "").lower()
+        if "disagree" not in rl and "one newer" not in rl and "one-off" not in rl:
+            reasoning = (
+                (reasoning or "").rstrip()
+                + " One newer correction disagrees with the stronger pattern, so I'm holding this lighter."
+            )
     answer, reasoning, used_example_overlay = _apply_example_overlay(
         answer,
         reasoning,
@@ -2605,6 +2872,22 @@ def generate_personal_response(
                     store.record_memory_line_surface(ex_key)
                 except Exception:
                     pass
+    if example_influence and float(example_influence.contradiction_level or 0.0) >= 0.34:
+        reasoning += " Past examples are mixed here, so confidence stays lower."
+        if not used_example_overlay and "example_memory_overlay" not in evidence_path.route_keys:
+            evidence_path = RespondEvidencePath(
+                decision_ids=evidence_path.decision_ids,
+                style_ids=evidence_path.style_ids,
+                route_keys=tuple(list(evidence_path.route_keys) + ["example_conflict_mixed"]),
+                clarif_slot_keys=evidence_path.clarif_slot_keys,
+                answer_focus=evidence_path.answer_focus,
+            )
+    elif (
+        example_influence
+        and float(example_influence.winning_effective_strength or 0.0) >= 0.9
+        and float(example_influence.contradiction_level or 0.0) <= 0.18
+    ):
+        reasoning += " Repeated corrections in the same shape point in one direction."
     answer = _phase41_style_realism_pass(answer, answer_focus=answer_focus)
 
     path_m = _respond_path_multipliers(evidence_path, mmap)
@@ -2615,7 +2898,25 @@ def generate_personal_response(
         agreement_boost,
         decision_family_aligned=top_family_aligned,
         path_multipliers=path_m or None,
+        example_influence=example_influence,
+        route_keys=evidence_path.route_keys,
+        feedback_direction_mixed=float(
+            feedback_influence.replacement_direction_mixed or 0.0
+        ),
     )
+    if float(feedback_influence.replacement_direction_mixed or 0.0) >= 0.38:
+        conf_caps.append(0.54)
+    if (
+        example_influence
+        and float(example_influence.contradiction_level or 0.0) >= 0.52
+    ):
+        conf_caps.append(0.5)
+    elif (
+        example_influence
+        and float(example_influence.winning_effective_strength or 0.0) >= 0.95
+        and float(example_influence.contradiction_level or 0.0) <= 0.14
+    ):
+        conf = min(0.86, conf + 0.03)
     for cap in conf_caps:
         conf = min(conf, cap)
 

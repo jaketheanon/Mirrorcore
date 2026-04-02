@@ -845,6 +845,100 @@ class DatabaseStore:
 
         conn.commit()
 
+    @staticmethod
+    def _parse_iso_timestamp(value: str) -> Optional[datetime]:
+        t = (value or "").strip()
+        if not t:
+            return None
+        try:
+            return datetime.fromisoformat(t.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _phase43_example_recency_weight(last_feedback_at: str) -> float:
+        """
+        Deterministic recency weighting for reusable examples.
+
+        Recent repeated corrections matter more, while old strong patterns do
+        not instantly collapse to zero.
+        """
+        ts = DatabaseStore._parse_iso_timestamp(last_feedback_at)
+        if not ts:
+            return 0.84
+        now = datetime.utcnow()
+        if ts.tzinfo is not None:
+            now = now.replace(tzinfo=ts.tzinfo)
+        age_days = max(0.0, (now - ts).total_seconds() / 86400.0)
+        if age_days <= 7:
+            return 1.0
+        if age_days <= 21:
+            return 0.95
+        if age_days <= 45:
+            return 0.88
+        if age_days <= 90:
+            return 0.79
+        if age_days <= 180:
+            return 0.68
+        return 0.58
+
+    @staticmethod
+    def _phase43_example_support_weight(support_count: int) -> float:
+        """One-off noise should not dominate older repeated examples."""
+        s = max(0, int(support_count or 0))
+        if s <= 1:
+            return 0.72
+        if s == 2:
+            return 0.9
+        if s == 3:
+            return 1.0
+        if s == 4:
+            return 1.06
+        return min(1.16, 1.06 + 0.02 * min(6, s - 4))
+
+    @staticmethod
+    def _phase43_example_contradiction_penalty(
+        support_count: int, contradict_count: int
+    ) -> Tuple[float, float]:
+        """
+        Return (multiplier, contradiction_level).
+        contradiction_level is 0..1 where higher means more mixed examples.
+        """
+        s = max(0, int(support_count or 0))
+        c = max(0, int(contradict_count or 0))
+        total = max(1, s + c)
+        ratio = float(c) / float(total)
+        # Strong confirmed rows still survive moderate contradiction,
+        # while heavily contradicted rows are damped hard.
+        if c <= 0:
+            return 1.0, 0.0
+        if ratio >= 0.62:
+            return 0.48, min(1.0, ratio)
+        if ratio >= 0.42:
+            return 0.64, min(1.0, ratio)
+        if ratio >= 0.25:
+            return 0.8, min(1.0, ratio)
+        return 0.91, min(1.0, ratio)
+
+    def _phase43_effective_example_strength(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach calibrated reusable-example strength for ranking and conflict handling."""
+        base = max(-1.0, min(1.0, float(row.get("strength") or 0.0)))
+        support = int(row.get("support_count") or 0)
+        recency_w = self._phase43_example_recency_weight(
+            str(row.get("last_feedback_at") or row.get("updated_at") or "")
+        )
+        support_w = self._phase43_example_support_weight(support)
+        contra_w, contra_level = self._phase43_example_contradiction_penalty(
+            support, int(row.get("contradict_count") or 0)
+        )
+        effective = max(-1.0, min(1.2, base * recency_w * support_w * contra_w))
+        out = dict(row)
+        out["recency_weight"] = recency_w
+        out["support_weight"] = support_w
+        out["contradiction_level"] = contra_level
+        out["effective_strength"] = effective
+        return out
+
     def list_reusable_response_examples(
         self,
         *,
@@ -881,14 +975,26 @@ class DatabaseStore:
         route_set = {
             str(x).strip().lower() for x in (route_keys or []) if str(x).strip()
         }
-        out: List[Dict[str, Any]] = []
+        ranked: List[Dict[str, Any]] = []
         for r in rows:
-            d = dict(r)
+            d = self._phase43_effective_example_strength(dict(r))
             if route_set:
                 sk = str(d.get("shape_key") or "")
                 shape_ok = any(f"r:{rk}" in sk or f"|{rk}" in sk or f"{rk};" in sk for rk in route_set)
                 if not shape_ok and "r:none" not in sk:
                     continue
+            ranked.append(d)
+        ranked.sort(
+            key=lambda x: (
+                -float(x.get("effective_strength") or 0.0),
+                -int(x.get("support_count") or 0),
+                float(x.get("contradiction_level") or 0.0),
+                str(x.get("last_feedback_at") or ""),
+                str(x.get("id") or ""),
+            )
+        )
+        out: List[Dict[str, Any]] = []
+        for d in ranked:
             out.append(d)
             if len(out) >= lim:
                 break

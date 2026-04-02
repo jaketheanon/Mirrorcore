@@ -1521,6 +1521,262 @@ class TestPhase42CorrectionPromotionExamples(unittest.TestCase):
         )
         self.assertGreaterEqual(len(examples), 1)
 
+    def test_contradicted_examples_are_tracked_and_damped(self):
+        for _ in range(3):
+            self.db.record_personal_response_feedback(
+                scenario_snippet="x",
+                prompt_norm_hash="h3",
+                rating="wrong",
+                partial_aspect=None,
+                replacement_text="address it directly but calmly",
+                confidence_shown=0.5,
+                effective_family="interpersonal_conflict",
+                evidence_path={"route_keys": ["strong_decision"], "answer_focus": "wording"},
+                likely_answer_snippet="let it go",
+                feedback_target="wording",
+            )
+        for _ in range(2):
+            self.db.record_personal_response_feedback(
+                scenario_snippet="x",
+                prompt_norm_hash="h3",
+                rating="wrong",
+                partial_aspect=None,
+                replacement_text="let it go and move on",
+                confidence_shown=0.5,
+                effective_family="interpersonal_conflict",
+                evidence_path={"route_keys": ["strong_decision"], "answer_focus": "wording"},
+                likely_answer_snippet="address it",
+                feedback_target="wording",
+            )
+        rows = self.db.list_reusable_response_examples(
+            effective_family="interpersonal_conflict",
+            route_keys=["strong_decision"],
+            answer_focus="wording",
+            limit=6,
+            min_strength=0.2,
+        )
+        self.assertGreaterEqual(len(rows), 1)
+        self.assertTrue(any(int(r.get("contradict_count") or 0) > 0 for r in rows))
+
+
+class TestPhase43ContradictionConfidence(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = DatabaseStore(Path(self.tmp.name))
+        self.db.initialize_database()
+
+    def tearDown(self):
+        self.db.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_mixed_examples_lower_confidence_and_reason_mentions_mixed(self):
+        self.db.record_decision_memory(
+            scenario_id="pa_one",
+            scenario_text="passive aggressive coworker at work",
+            choice_label="Let it go for now",
+            choice_value="a",
+            reasoning_label="Keep it smooth",
+            reasoning_value="k",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        q = "what would i say if someone is being passive aggressive at work"
+        for _ in range(3):
+            self.db.record_personal_response_feedback(
+                scenario_snippet=q,
+                prompt_norm_hash="mix_hash_1",
+                rating="wrong",
+                partial_aspect=None,
+                replacement_text="address it directly but calmly",
+                confidence_shown=0.55,
+                effective_family="interpersonal_conflict",
+                evidence_path={"route_keys": ["strong_decision"], "answer_focus": "wording"},
+                likely_answer_snippet="let it go",
+                feedback_target="wording",
+            )
+        for _ in range(3):
+            self.db.record_personal_response_feedback(
+                scenario_snippet=q,
+                prompt_norm_hash="mix_hash_1",
+                rating="wrong",
+                partial_aspect=None,
+                replacement_text="let it go and move on",
+                confidence_shown=0.55,
+                effective_family="interpersonal_conflict",
+                evidence_path={"route_keys": ["strong_decision"], "answer_focus": "wording"},
+                likely_answer_snippet="address it",
+                feedback_target="wording",
+            )
+        pr_mixed = generate_personal_response(q, self.db)
+        self.assertLessEqual(pr_mixed.confidence, 0.58)
+        for _ in range(3):
+            self.db.record_personal_response_feedback(
+                scenario_snippet=q,
+                prompt_norm_hash="mix_hash_1",
+                rating="wrong",
+                partial_aspect=None,
+                replacement_text="address it directly but calmly",
+                confidence_shown=0.55,
+                effective_family="interpersonal_conflict",
+                evidence_path={"route_keys": ["strong_decision"], "answer_focus": "wording"},
+                likely_answer_snippet="let it go",
+                feedback_target="wording",
+            )
+        pr_resolved = generate_personal_response(q, self.db)
+        self.assertLessEqual(pr_resolved.confidence, 0.86)
+
+    def test_repeated_agreeing_examples_can_raise_confidence_carefully(self):
+        q = "what would i say if someone is being passive aggressive at work"
+        self.db.record_decision_memory(
+            scenario_id="pa_two",
+            scenario_text="passive aggressive coworker at work",
+            choice_label="Address it directly but calmly",
+            choice_value="d",
+            reasoning_label="Stop the sideways pattern",
+            reasoning_value="s",
+            value_tags=["directness"],
+            trait_signals={},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        for _ in range(6):
+            self.db.record_personal_response_feedback(
+                scenario_snippet=q,
+                prompt_norm_hash="agree_hash_1",
+                rating="wrong",
+                partial_aspect=None,
+                replacement_text="address it directly but calmly",
+                confidence_shown=0.55,
+                effective_family="interpersonal_conflict",
+                evidence_path={"route_keys": ["strong_decision"], "answer_focus": "wording"},
+                likely_answer_snippet="let it go",
+                feedback_target="wording",
+            )
+        pr = generate_personal_response(q, self.db)
+        self.assertGreaterEqual(pr.confidence, 0.45)
+        self.assertLessEqual(pr.confidence, 0.86)
+
+    def test_one_contradictory_correction_does_not_flip_dominant_direction(self):
+        """Phase 43.1: one new replacement must not override stronger repeat support."""
+        self.db.record_decision_memory(
+            scenario_id="pa_one",
+            scenario_text="passive aggressive coworker at work",
+            choice_label="Let it go for now",
+            choice_value="a",
+            reasoning_label="Keep it smooth",
+            reasoning_value="k",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        q = "what would i say if someone is being passive aggressive at work"
+        pr0 = generate_personal_response(q, self.db)
+        h = pr0.prompt_norm_hash
+        for _ in range(5):
+            self.db.record_personal_response_feedback(
+                scenario_snippet=q,
+                prompt_norm_hash=h,
+                rating="wrong",
+                partial_aspect=None,
+                replacement_text="address it directly but calmly",
+                confidence_shown=pr0.confidence,
+                effective_family=pr0.effective_family,
+                evidence_path=pr0.evidence_path.to_storage_dict(),
+                likely_answer_snippet=pr0.likely_answer[:200],
+                feedback_target="wording",
+            )
+        pr_stable = generate_personal_response(q, self.db)
+        self.db.record_personal_response_feedback(
+            scenario_snippet=q,
+            prompt_norm_hash=h,
+            rating="wrong",
+            partial_aspect=None,
+            replacement_text="just ignore it and move on",
+            confidence_shown=pr_stable.confidence,
+            effective_family=pr_stable.effective_family,
+            evidence_path=pr_stable.evidence_path.to_storage_dict(),
+            likely_answer_snippet=pr_stable.likely_answer[:200],
+            feedback_target="wording",
+        )
+        pr_after = generate_personal_response(q, self.db)
+        low = pr_after.likely_answer.lower()
+        self.assertTrue(
+            "address" in low or "direct" in low or "calm" in low,
+            msg=pr_after.likely_answer,
+        )
+        self.assertFalse(
+            "just ignore it and move on" in low,
+            msg=pr_after.likely_answer,
+        )
+        self.assertLess(pr_after.confidence, pr_stable.confidence)
+
+    def test_one_contra_lowers_confidence_and_accumulated_contra_can_shift(self):
+        q = "what would i say if someone is being passive aggressive at work"
+        self.db.record_decision_memory(
+            scenario_id="pa_one",
+            scenario_text="passive aggressive coworker at work",
+            choice_label="Let it go for now",
+            choice_value="a",
+            reasoning_label="Keep it smooth",
+            reasoning_value="k",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr0 = generate_personal_response(q, self.db)
+        h = pr0.prompt_norm_hash
+        for _ in range(4):
+            self.db.record_personal_response_feedback(
+                scenario_snippet=q,
+                prompt_norm_hash=h,
+                rating="wrong",
+                partial_aspect=None,
+                replacement_text="address it directly but calmly",
+                confidence_shown=pr0.confidence,
+                effective_family=pr0.effective_family,
+                evidence_path=pr0.evidence_path.to_storage_dict(),
+                likely_answer_snippet=pr0.likely_answer[:200],
+                feedback_target="wording",
+            )
+        pr_after_support = generate_personal_response(q, self.db)
+        self.db.record_personal_response_feedback(
+            scenario_snippet=q,
+            prompt_norm_hash=h,
+            rating="wrong",
+            partial_aspect=None,
+            replacement_text="just ignore it and move on",
+            confidence_shown=pr_after_support.confidence,
+            effective_family=pr_after_support.effective_family,
+            evidence_path=pr_after_support.evidence_path.to_storage_dict(),
+            likely_answer_snippet=pr_after_support.likely_answer[:200],
+            feedback_target="wording",
+        )
+        pr_one_contra = generate_personal_response(q, self.db)
+        self.assertLess(pr_one_contra.confidence, pr_after_support.confidence)
+        for _ in range(5):
+            self.db.record_personal_response_feedback(
+                scenario_snippet=q,
+                prompt_norm_hash=h,
+                rating="wrong",
+                partial_aspect=None,
+                replacement_text="just ignore it and move on",
+                confidence_shown=pr_one_contra.confidence,
+                effective_family=pr_one_contra.effective_family,
+                evidence_path=pr_one_contra.evidence_path.to_storage_dict(),
+                likely_answer_snippet=pr_one_contra.likely_answer[:200],
+                feedback_target="wording",
+            )
+        pr_flip = generate_personal_response(q, self.db)
+        low = pr_flip.likely_answer.lower()
+        self.assertTrue(
+            "ignore" in low or "move on" in low,
+            msg=pr_flip.likely_answer,
+        )
 
 if __name__ == "__main__":
     unittest.main()
