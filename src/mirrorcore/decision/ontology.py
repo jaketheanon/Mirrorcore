@@ -983,6 +983,78 @@ def risk_wait_tension_boost(norm_text: str, scores: MutableMapping[str, float]) 
         scores[RISK_TIMING] = scores.get(RISK_TIMING, 0) + 1.45
 
 
+def demote_shallow_timing_for_peer_continuation(
+    norm_text: str, scores: MutableMapping[str, float]
+) -> None:
+    """
+    ``today`` / ``now`` on a peer-continuation line (same/still/again…) is usually
+    scene-setting, not a wait-vs-act decision.  Demote timing only when no strong
+    timing question is present (Phase 44 ask routing).
+    """
+    padded = f" {norm_text} "
+    peer = any(
+        x in padded
+        for x in (
+            " coworker ",
+            " colleague ",
+            " boss ",
+            " teammate ",
+            " manager ",
+        )
+    ) or norm_text.startswith(("coworker ", "colleague "))
+    if not peer:
+        return
+    ref = any(
+        x in padded
+        for x in (
+            " same ",
+            " still ",
+            " again ",
+            " another ",
+            " keeps ",
+            "same coworker",
+            "same person",
+            "still pushing",
+            "still asking",
+            "still trying",
+        )
+    )
+    if not ref:
+        return
+    strong_timing = any(
+        x in padded
+        for x in (
+            " wait or ",
+            " whether to wait ",
+            " whether to ",
+            " act now or ",
+            " hold off ",
+            " know whether ",
+            " dont know whether ",
+            "don't know whether ",
+            " not sure whether ",
+            " too soon ",
+            " too late ",
+            " reversible ",
+            " point of no return ",
+            " real deadline ",
+            " hard deadline ",
+            " wait until ",
+            " until monday",
+            " until next",
+            " worth waiting",
+            "should i wait",
+            "should we wait",
+        )
+    )
+    if strong_timing:
+        return
+    rt = scores.get(RISK_TIMING, 0) or 0.0
+    if rt <= 0.0:
+        return
+    scores[RISK_TIMING] = rt * 0.48
+
+
 def rank_families_full(
     norm_text: str,
 ) -> Tuple[List[Tuple[str, float]], Dict[str, float], Dict[str, float]]:
@@ -1000,6 +1072,7 @@ def rank_families_full(
     adjust_family_scores_for_social_conflict(norm_text, sig.dimensions, raw)
     mom_favor_drained_boost(norm_text, raw)
     risk_wait_tension_boost(norm_text, raw)
+    demote_shallow_timing_for_peer_continuation(norm_text, raw)
     apply_work_obligation_demotion_to_conflict(norm_text, sig.dimensions, raw)
     ordered = order_family_scores(raw)
     return ordered, sig.dimensions, sig.axes

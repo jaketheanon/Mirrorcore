@@ -26,6 +26,7 @@ from mirrorcore.decision.routed_clarification import (
     sanitize_domain_order_for_obligation,
     score_decision_domains,
     score_dimensions,
+    _pin_order_for_phase44_ask_continuation,
 )
 from mirrorcore.router import classify_intent, normalize_input
 
@@ -44,6 +45,47 @@ class TestOntology(unittest.TestCase):
             normalize_input("I don't know whether to wait or act now.")
         )
         self.assertEqual(ordered[0][0], RISK_TIMING)
+
+    def test_peer_continuation_prompt_not_timing_primary(self):
+        """Phase 44: shallow ``today``/``now`` must not beat peer-continuation obligation."""
+        ordered, _ = rank_families(
+            normalize_input(
+                "same coworker is still pushing today what should i do now"
+            )
+        )
+        self.assertEqual(ordered[0][0], OBLIGATION_OVERLOAD)
+        self.assertNotEqual(ordered[0][0], RISK_TIMING)
+
+    def test_coworker_keeps_pushing_after_no_stays_obligation_lane(self):
+        ordered, _ = rank_families(
+            normalize_input("my coworker keeps pushing after i already said no")
+        )
+        self.assertEqual(ordered[0][0], OBLIGATION_OVERLOAD)
+
+    def test_explicit_wait_vs_act_still_timing_primary_with_coworker(self):
+        ordered, _ = rank_families(
+            normalize_input(
+                "i dont know whether to wait or confront my coworker about it today"
+            )
+        )
+        self.assertEqual(ordered[0][0], RISK_TIMING)
+
+    def test_phase44_pin_puts_carried_family_over_shallow_timing_order(self):
+        """When DB carryover is strong, domain order must not leave timing first."""
+        norm = normalize_input(
+            "same coworker is still pushing today what should i do now"
+        )
+        ranked, dims = rank_families(norm)
+        bad_order = [RISK_TIMING, OBLIGATION_OVERLOAD, "general"]
+        carry = {
+            "match": {"id": "x", "effective_family": OBLIGATION_OVERLOAD},
+            "strength": 0.76,
+            "carry_family": OBLIGATION_OVERLOAD,
+        }
+        fixed = _pin_order_for_phase44_ask_continuation(
+            norm, ranked, dims, bad_order, carry
+        )
+        self.assertEqual(fixed[0], OBLIGATION_OVERLOAD)
 
     def test_money_pressure_dimension(self):
         d = score_dimensions(normalize_input("rent is late and I'm broke"))

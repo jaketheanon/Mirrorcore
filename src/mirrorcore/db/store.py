@@ -55,6 +55,7 @@ class DatabaseStore:
         self.ensure_phase38_respond_active_learning()
         self.ensure_phase39_respond_feedback_target()
         self.ensure_phase42_response_examples()
+        self.ensure_phase44_short_term_situation()
 
     def initialize_database(self):
         """Initialize the database with all required tables.
@@ -398,6 +399,166 @@ class DatabaseStore:
             "ON personal_response_examples(example_type, strength)"
         )
         conn.commit()
+
+    def ensure_phase44_short_term_situation(self):
+        """Phase 44: short-term session situation log (carryover, not traits)."""
+        conn = self.get_db_connection()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS short_term_situation_memory (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                prompt_norm_hash TEXT NOT NULL,
+                prompt_norm TEXT NOT NULL,
+                effective_family TEXT NOT NULL,
+                shape_key TEXT NOT NULL,
+                stance_snippet TEXT NOT NULL,
+                state TEXT NOT NULL,
+                source TEXT NOT NULL,
+                asked_slots_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_short_term_situation_updated "
+            "ON short_term_situation_memory(updated_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_short_term_situation_hash "
+            "ON short_term_situation_memory(prompt_norm_hash)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_short_term_situation_state "
+            "ON short_term_situation_memory(state)"
+        )
+        conn.commit()
+
+    def list_recent_short_term_situations(self, limit: int = 36) -> List[Dict[str, Any]]:
+        """Newest-first short-term situation rows (Phase 44)."""
+        conn = self.get_db_connection()
+        lim = max(1, min(80, int(limit)))
+        rows = conn.execute(
+            """
+            SELECT id, created_at, updated_at, prompt_norm_hash, prompt_norm,
+                   effective_family, shape_key, stance_snippet, state, source,
+                   asked_slots_json
+            FROM short_term_situation_memory
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (lim,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_situation_carryover(
+        self,
+        prompt_norm: str,
+        prompt_norm_hash: str,
+        effective_family: str,
+        shape_key: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Best recent unresolved match for continuation (deterministic)."""
+        from ..decision.situation_carryover import pick_best_carryover
+
+        rows = self.list_recent_short_term_situations(limit=40)
+        best, strength = pick_best_carryover(
+            prompt_norm,
+            prompt_norm_hash,
+            effective_family,
+            shape_key,
+            rows,
+        )
+        if not best:
+            return None
+        return {"match": best, "strength": strength}
+
+    def find_situation_carryover_for_ask(
+        self, prompt_norm: str, prompt_norm_hash: str
+    ) -> Optional[Dict[str, Any]]:
+        """Ask flow: best carryover scored per stored row's family (Phase 44)."""
+        from ..decision.situation_carryover import pick_best_carryover_for_ask
+
+        rows = self.list_recent_short_term_situations(limit=40)
+        best, strength, carry_family = pick_best_carryover_for_ask(
+            prompt_norm, prompt_norm_hash, rows
+        )
+        if not best:
+            return None
+        return {
+            "match": best,
+            "strength": strength,
+            "carry_family": carry_family,
+        }
+
+    def record_short_term_situation(
+        self,
+        *,
+        prompt_norm: str,
+        prompt_norm_hash: str,
+        effective_family: str,
+        shape_key: str,
+        stance_snippet: str,
+        source: str,
+        asked_slots_json: Optional[str] = None,
+    ) -> Optional[str]:
+        """Append one situation row; supersede prior continuation match (Phase 44)."""
+        from ..decision.situation_carryover import pick_best_carryover, truncate_prompt_norm
+
+        conn = self.get_db_connection()
+        now = datetime.utcnow().isoformat()
+        pn = truncate_prompt_norm(prompt_norm)
+        h = (prompt_norm_hash or "").strip()
+        fam = (effective_family or "general").strip().lower() or "general"
+        sk = (shape_key or "").strip() or f"{fam}|slots:"
+        stance = (stance_snippet or "").strip()[:220] or "(brief)"
+        src = (source or "unknown").strip().lower()
+        if src not in ("ask", "respond_like_me"):
+            src = "ask"
+        rows = self.list_recent_short_term_situations(limit=48)
+        best, strength = pick_best_carryover(pn, h, fam, sk, rows)
+        if best and strength >= 0.38:
+            oid = str(best.get("id") or "").strip()
+            if oid:
+                conn.execute(
+                    """
+                    UPDATE short_term_situation_memory
+                    SET state = 'superseded', updated_at = ?
+                    WHERE id = ? AND state = 'unresolved'
+                    """,
+                    (now, oid),
+                )
+        eid = str(uuid4())
+        conn.execute(
+            """
+            INSERT INTO short_term_situation_memory
+            (id, created_at, updated_at, prompt_norm_hash, prompt_norm, effective_family,
+             shape_key, stance_snippet, state, source, asked_slots_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unresolved', ?, ?)
+            """,
+            (eid, now, now, h, pn, fam, sk, stance, src, asked_slots_json),
+        )
+        cnt = conn.execute(
+            "SELECT COUNT(*) AS n FROM short_term_situation_memory"
+        ).fetchone()
+        n = int(cnt["n"]) if cnt else 0
+        if n > 96:
+            excess = n - 80
+            old_ids = conn.execute(
+                """
+                SELECT id FROM short_term_situation_memory
+                ORDER BY updated_at ASC
+                LIMIT ?
+                """,
+                (excess,),
+            ).fetchall()
+            for r in old_ids:
+                conn.execute(
+                    "DELETE FROM short_term_situation_memory WHERE id = ?",
+                    (str(r["id"]),),
+                )
+        conn.commit()
+        return eid
 
     def list_personal_response_feedback_for_prompt(
         self, prompt_norm_hash: str, limit: int = 40

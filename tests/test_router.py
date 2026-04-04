@@ -94,6 +94,25 @@ class TestClassifyIntent(unittest.TestCase):
         self.assertFalse(c.weak_input)
         self.assertEqual(c.ordered[0][0], DECISION_HELP)
 
+    def test_coworker_keeps_pushing_after_no_is_decision_not_weak(self):
+        c = classify_intent("my coworker keeps pushing after i already said no")
+        self.assertFalse(c.weak_input)
+        self.assertEqual(c.ordered[0][0], DECISION_HELP)
+        r = resolve_route_after_classification(c)
+        self.assertEqual(r.category, DECISION_HELP)
+
+    def test_same_coworker_still_pushing_with_what_should_i_do(self):
+        c = classify_intent(
+            "same coworker is still pushing today. what should i do now"
+        )
+        self.assertFalse(c.weak_input)
+        self.assertEqual(c.ordered[0][0], DECISION_HELP)
+
+    def test_same_coworker_still_pushing_without_explicit_question(self):
+        c = classify_intent("same coworker is still pushing today")
+        self.assertFalse(c.weak_input)
+        self.assertEqual(c.ordered[0][0], DECISION_HELP)
+
     def test_ambiguous_top_two(self):
         c = classify_intent("help me decide stack trace")
         self.assertTrue(c.needs_intent_disambiguation)
@@ -210,6 +229,56 @@ class TestAskCommand(unittest.TestCase):
         mock_r.assert_called_once()
         call_ns = mock_r.call_args[0][0]
         self.assertIn("probably say", call_ns.scenario.lower())
+
+    @patch("mirrorcore.decision.routed_clarification.run_routed_decision_guidance")
+    @patch("mirrorcore.main.DatabaseStore", MagicMock())
+    @patch("mirrorcore.main.handle_start")
+    def test_handle_ask_coworker_boundary_runs_decision_not_menu(
+        self, mock_start, mock_guidance
+    ):
+        mock_guidance.return_value = "guidance"
+        args = MagicMock(
+            query=[
+                "my",
+                "coworker",
+                "keeps",
+                "pushing",
+                "after",
+                "i",
+                "already",
+                "said",
+                "no",
+            ]
+        )
+        handle_ask(args)
+        mock_guidance.assert_called_once()
+        mock_start.assert_not_called()
+
+    @patch("mirrorcore.decision.routed_clarification.run_routed_decision_guidance")
+    @patch("mirrorcore.main.DatabaseStore", MagicMock())
+    @patch("mirrorcore.main.handle_start")
+    def test_handle_ask_same_coworker_continuation_runs_decision_not_menu(
+        self, mock_start, mock_guidance
+    ):
+        mock_guidance.return_value = "guidance"
+        args = MagicMock(
+            query=[
+                "same",
+                "coworker",
+                "is",
+                "still",
+                "pushing",
+                "today.",
+                "what",
+                "should",
+                "i",
+                "do",
+                "now",
+            ]
+        )
+        handle_ask(args)
+        mock_guidance.assert_called_once()
+        mock_start.assert_not_called()
 
 
 if __name__ == "__main__":

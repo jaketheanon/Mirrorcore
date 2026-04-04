@@ -327,6 +327,23 @@ def initialize_database(conn: sqlite3.Connection):
         )
     """)
 
+    # Phase 44 — short-term situation carryover (not durable tendency memory)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS short_term_situation_memory (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            prompt_norm_hash TEXT NOT NULL,
+            prompt_norm TEXT NOT NULL,
+            effective_family TEXT NOT NULL,
+            shape_key TEXT NOT NULL,
+            stance_snippet TEXT NOT NULL,
+            state TEXT NOT NULL,
+            source TEXT NOT NULL,
+            asked_slots_json TEXT
+        )
+    """)
+
     # Create indexes for performance
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_persona_profile_trait_name ON persona_profile(trait_name)",
@@ -358,6 +375,9 @@ def initialize_database(conn: sqlite3.Connection):
         "CREATE INDEX IF NOT EXISTS idx_personal_response_examples_prompt_hash ON personal_response_examples(prompt_norm_hash)",
         "CREATE INDEX IF NOT EXISTS idx_personal_response_examples_family_shape ON personal_response_examples(effective_family, shape_key)",
         "CREATE INDEX IF NOT EXISTS idx_personal_response_examples_type_strength ON personal_response_examples(example_type, strength)",
+        "CREATE INDEX IF NOT EXISTS idx_short_term_situation_updated ON short_term_situation_memory(updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_short_term_situation_hash ON short_term_situation_memory(prompt_norm_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_short_term_situation_state ON short_term_situation_memory(state)",
     ]
     
     for index_sql in indexes:

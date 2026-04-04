@@ -3,9 +3,12 @@ Tests for Phase 29: unified personal profile aggregation, memory retrieval,
 grounded response generation, and confidence behavior.
 """
 
+import hashlib
+import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,9 +22,18 @@ from mirrorcore.decision.memory_relevance import personal_response_decision_fami
 from mirrorcore.router import normalize_input
 from mirrorcore.decision.cross_system_knowledge import effective_primary_for_cross_filter
 from mirrorcore.decision.memory_relevance import respond_main_decision_passes_shape_gate
-from mirrorcore.decision.routed_clarification import rank_families
+from mirrorcore.decision.routed_clarification import OBLIGATION_OVERLOAD, rank_families
+from mirrorcore.decision.situation_carryover import (
+    carryover_shape_key,
+    pa_issue_carryover_bridge,
+)
 from mirrorcore.persona.respond import (
+    RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN,
     RespondEvidencePath,
+    _phase41_style_realism_pass,
+    _respond_carryover_reasoning_line_audit,
+    _respond_carryover_suppress_avoidance,
+    _respond_repeated_passive_aggressive_escalation_active,
     build_respond_feedback_influence,
     classify_answer_focus,
     generate_personal_response,
@@ -1777,6 +1789,563 @@ class TestPhase43ContradictionConfidence(unittest.TestCase):
             "ignore" in low or "move on" in low,
             msg=pr_flip.likely_answer,
         )
+
+
+class TestPhase44RespondContinuation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = DatabaseStore(Path(self.tmp.name))
+        self.db.initialize_database()
+
+    def tearDown(self):
+        self.db.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_passive_aggressive_same_person_continuation_demotes_avoidance_memory(self):
+        self.db.record_decision_memory(
+            scenario_id="pa_avoid",
+            scenario_text=(
+                "passive aggressive snide colleague remarks at work sideways digs"
+            ),
+            choice_label="Let it go and stay professional",
+            choice_value="a",
+            reasoning_label="Not worth the fight today",
+            reasoning_value="b",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.96,
+            correction_status="accurate",
+        )
+        self.db.record_decision_memory(
+            scenario_id="pa_direct",
+            scenario_text=(
+                "passive aggressive teammate need to address calmly at work"
+            ),
+            choice_label="Address it directly but calmly",
+            choice_value="d",
+            reasoning_label="Stop the sideways pattern",
+            reasoning_value="s",
+            value_tags=["directness"],
+            trait_signals={},
+            confidence_score=0.72,
+            correction_status="accurate",
+        )
+        prev = normalize_input(
+            "what would i say if someone is being passive aggressive at work"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family="conflict",
+            shape_key=carryover_shape_key(prev, "conflict"),
+            stance_snippet="address it directly calmly name what you noticed",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        q2 = "what would i say if this same passive aggressive person keeps doing it"
+        pr = generate_personal_response(q2, self.db)
+        low = pr.likely_answer.lower()
+        self.assertNotIn("let it go", low)
+        self.assertTrue(
+            any(
+                x in low
+                for x in (
+                    "direct",
+                    "address",
+                    "plain",
+                    "name",
+                    "calm",
+                    "noticed",
+                    "sideways",
+                )
+            ),
+            msg=pr.likely_answer,
+        )
+
+    def test_passive_aggressive_continuation_uses_carryover_when_row_is_softer_wording(
+        self,
+    ):
+        """Stored row may say 'jabs' + colleague/work without literal 'passive aggressive'."""
+        prev = normalize_input(
+            "what would i say if a colleague keeps subtle jabs at me at work"
+        )
+        self.assertTrue(
+            pa_issue_carryover_bridge(
+                normalize_input(
+                    "what would i say if this same passive aggressive person keeps doing it"
+                ),
+                prev,
+            )
+        )
+        self.db.record_decision_memory(
+            scenario_id="pa_avoid2",
+            scenario_text="colleague tension let it go professional",
+            choice_label="Let it go and move on",
+            choice_value="a",
+            reasoning_label="Not worth engaging",
+            reasoning_value="b",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.96,
+            correction_status="accurate",
+        )
+        self.db.record_decision_memory(
+            scenario_id="pa_direct2",
+            scenario_text="address colleague jabs calmly at work",
+            choice_label="Address it calmly and directly",
+            choice_value="d",
+            reasoning_label="Name the pattern",
+            reasoning_value="s",
+            value_tags=["directness"],
+            trait_signals={},
+            confidence_score=0.72,
+            correction_status="accurate",
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family="conflict",
+            shape_key=carryover_shape_key(prev, "conflict"),
+            stance_snippet="address it calmly name what you noticed one clear line",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        q2 = "what would i say if this same passive aggressive person keeps doing it"
+        pr = generate_personal_response(q2, self.db)
+        low = pr.likely_answer.lower()
+        self.assertNotIn("let it go", low)
+        self.assertTrue(
+            any(x in low for x in ("direct", "address", "calm", "noticed", "plain", "say")),
+            msg=pr.likely_answer,
+        )
+
+    def test_spending_prompt_does_not_show_conflict_thread_continuity_line(self):
+        prev = normalize_input(
+            "what would i say if someone is passive aggressive at work"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family="conflict",
+            shape_key=carryover_shape_key(prev, "conflict"),
+            stance_snippet="address it directly calmly",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        rent_q = (
+            "i need to pay rent but i am broke what should i cut first "
+            "groceries or going out"
+        )
+        pr = generate_personal_response(rent_q, self.db)
+        self.assertEqual(pr.effective_family, "spending")
+        rb = (pr.reasoning_brief or "").lower()
+        for needle in (
+            "same issue continuing",
+            "recent unresolved situation",
+            "recent similar thread",
+            "just working through",
+        ):
+            self.assertNotIn(needle, rb, msg=pr.reasoning_brief)
+
+    def test_spending_followup_different_prompt_no_continuity_line_with_prior_spending_row(
+        self,
+    ):
+        prev = normalize_input("should i buy a new laptop when my rent is late")
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family="spending",
+            shape_key=carryover_shape_key(prev, "spending"),
+            stance_snippet="cover rent basics before wants",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        q2 = (
+            "i still need to pay rent tomorrow and i only have enough for food "
+            "or fun which comes first"
+        )
+        pr = generate_personal_response(q2, self.db)
+        self.assertEqual(pr.effective_family, "spending")
+        rb = (pr.reasoning_brief or "").lower()
+        for needle in (
+            "same issue continuing",
+            "recent unresolved situation",
+            "recent similar thread",
+            "just working through",
+        ):
+            self.assertNotIn(needle, rb, msg=pr.reasoning_brief)
+
+    def test_repeated_pa_escalation_gate_requires_pa_carryover_align(self):
+        """Unrelated carryover text must not activate narrow repeat+PA escalation."""
+        prev = normalize_input("should i buy a laptop when rent is late")
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        payload = {
+            "strength": 0.55,
+            "carry_family": "spending",
+            "match": {
+                "id": "x",
+                "state": "unresolved",
+                "updated_at": datetime.utcnow().isoformat(),
+                "prompt_norm": prev,
+                "prompt_norm_hash": ph,
+                "shape_key": "spending|slots:",
+                "stance_snippet": "cover rent first",
+            },
+        }
+        q = normalize_input(
+            "what would i say if this same passive aggressive person keeps doing it"
+        )
+        self.assertFalse(
+            _respond_repeated_passive_aggressive_escalation_active(
+                eff_pf="conflict",
+                prompt_norm=q,
+                situation_carryover=payload,
+            ),
+            "spending-shaped row_norm must not PA-align with conflict continuation",
+        )
+
+    def test_phase44_repeated_pa_only_avoidant_saves_avoidant_carryover_stance(self):
+        """
+        Regression: only avoidance-shaped decision rows + avoidant stance_snippet
+        on the active carryover row — still no \"let it go\" echo; carryover stays on.
+        """
+        self.db.record_decision_memory(
+            scenario_id="pa_avoid_only",
+            scenario_text=(
+                "passive aggressive snide colleague remarks at work sideways digs"
+            ),
+            choice_label="Let it go and move on",
+            choice_value="a",
+            reasoning_label="Not worth the fight today",
+            reasoning_value="b",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.96,
+            correction_status="accurate",
+        )
+        prev = normalize_input(
+            "what would i say if someone is being passive aggressive at work"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family="conflict",
+            shape_key=carryover_shape_key(prev, "conflict"),
+            stance_snippet="Let it go and move on.",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        exact_q = (
+            "what would i say if this same passive aggressive person keeps doing it"
+        )
+        pr = generate_personal_response(
+            exact_q, self.db, debug_phase44_carryover=True
+        )
+        dbg = pr.phase44_carryover_debug
+        self.assertTrue(dbg["pick_best_for_ask"]["any_candidate_meets_threshold"])
+        self.assertTrue(dbg["suppress_avoidance_demotion"])
+        self.assertTrue(
+            dbg["repeated_passive_aggressive_escalation"],
+            msg=f"expected escalation gate: {dbg!r}",
+        )
+        self.assertTrue(dbg["strip_avoidance_decision_rows"])
+        self.assertTrue(dbg["reasoning_line_audit"]["allowed"])
+        low = pr.likely_answer.lower()
+        self.assertNotIn("let it go", low, msg=pr.likely_answer)
+        self.assertNotIn("move on", low, msg=pr.likely_answer)
+        self.assertTrue(
+            any(
+                w in low
+                for w in (
+                    "pattern",
+                    "direct",
+                    "plain",
+                    "noticed",
+                    "name",
+                    "calm",
+                    "sideways",
+                    "repeat",
+                    "keeps",
+                )
+            ),
+            msg=pr.likely_answer,
+        )
+
+    def test_phase44_exact_passive_aggressive_continuation_end_to_end_with_debug(self):
+        """
+        Regression: exact manual prompt must keep thread (not avoidance) when a
+        matching conflict short-term row exists — debug shows the carryover path.
+        """
+        self.db.record_decision_memory(
+            scenario_id="pa_avoid_dbg",
+            scenario_text=(
+                "passive aggressive snide colleague remarks at work sideways digs"
+            ),
+            choice_label="Let it go and stay professional",
+            choice_value="a",
+            reasoning_label="Not worth the fight today",
+            reasoning_value="b",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.96,
+            correction_status="accurate",
+        )
+        self.db.record_decision_memory(
+            scenario_id="pa_direct_dbg",
+            scenario_text=(
+                "passive aggressive teammate need to address calmly at work"
+            ),
+            choice_label="Address it directly but calmly",
+            choice_value="d",
+            reasoning_label="Stop the sideways pattern",
+            reasoning_value="s",
+            value_tags=["directness"],
+            trait_signals={},
+            confidence_score=0.72,
+            correction_status="accurate",
+        )
+        prev = normalize_input(
+            "what would i say if someone is being passive aggressive at work"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family="conflict",
+            shape_key=carryover_shape_key(prev, "conflict"),
+            stance_snippet="address it directly calmly name what you noticed",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        exact_q = (
+            "what would i say if this same passive aggressive person keeps doing it"
+        )
+        pr = generate_personal_response(
+            exact_q, self.db, debug_phase44_carryover=True
+        )
+        dbg = pr.phase44_carryover_debug
+        self.assertEqual(
+            dbg["pick_best_for_ask"]["best_row_id"],
+            dbg["active_match_row_id"],
+            msg=f"debug best_row_id should match active carryover row: {dbg!r}",
+        )
+        self.assertIsNotNone(dbg)
+        pick = dbg["pick_best_for_ask"]
+        self.assertTrue(
+            pick["any_candidate_meets_threshold"],
+            msg=f"expected ask carryover pick; got {pick!r}",
+        )
+        self.assertFalse(dbg["family_alignment"]["dropped_by_family_align"])
+        self.assertTrue(dbg["suppress_avoidance_demotion"])
+        self.assertTrue(dbg["repeated_passive_aggressive_escalation"])
+        low = pr.likely_answer.lower()
+        self.assertNotIn("let it go", low, msg=pr.likely_answer)
+
+    def test_phase44_respond_unit_soft_band_suppress_and_audit(self):
+        """Regression: ~0.34 strength + PA bridge must pass respond gates (not 0.52/0.50 walls)."""
+        prev = normalize_input(
+            "at work the person keeps making vague remarks that feel targeted"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        q = normalize_input(
+            "what would i say if this same passive aggressive person keeps doing it"
+        )
+        qh = hashlib.sha256(q.encode("utf-8")).hexdigest()
+        payload = {
+            "strength": 0.345,
+            "carry_family": "conflict",
+            "match": {
+                "id": "row-unit",
+                "state": "unresolved",
+                "updated_at": datetime.utcnow().isoformat(),
+                "prompt_norm": prev,
+                "prompt_norm_hash": ph,
+                "shape_key": "obligation_overload|slots:",
+                "stance_snippet": "probably try not to read into every remark",
+            },
+        }
+        self.assertTrue(
+            _respond_carryover_suppress_avoidance(payload, q),
+            "PA-aligned carryover should demote avoidance at moderate strength",
+        )
+        audit = _respond_carryover_reasoning_line_audit(payload, q, 0.345, qh, "conflict")
+        self.assertTrue(audit["allowed"], msg=audit)
+        self.assertTrue(audit["conflict_pa_soft_continuity_path"])
+        self.assertGreater(0.345, float(RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN))
+
+    def test_phase44_soft_carry_strength_end_to_end_cli_like_row(self):
+        """
+        Realistic row: pick passes with strength below old 0.50 respond walls (shape age),
+        neutral stance text — still suppresses avoidance memory and emits continuity.
+        """
+        self.db.record_decision_memory(
+            scenario_id="pa_avoid_soft",
+            scenario_text=(
+                "passive aggressive snide colleague remarks at work sideways digs"
+            ),
+            choice_label="Let it go and stay professional",
+            choice_value="a",
+            reasoning_label="Not worth the fight today",
+            reasoning_value="b",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.96,
+            correction_status="accurate",
+        )
+        self.db.record_decision_memory(
+            scenario_id="pa_direct_soft",
+            scenario_text=(
+                "passive aggressive teammate need to address calmly at work"
+            ),
+            choice_label="Address it directly but calmly",
+            choice_value="d",
+            reasoning_label="Stop the sideways pattern",
+            reasoning_value="s",
+            value_tags=["directness"],
+            trait_signals={},
+            confidence_score=0.72,
+            correction_status="accurate",
+        )
+        prev = normalize_input(
+            "at work the person keeps making vague remarks that feel targeted"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family="conflict",
+            shape_key=carryover_shape_key(prev, "conflict"),
+            stance_snippet="probably try not to read into every remark",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        conn = self.db.get_db_connection()
+        aged = (datetime.utcnow() - timedelta(hours=34)).isoformat()
+        conn.execute(
+            """
+            UPDATE short_term_situation_memory
+            SET updated_at = ?, shape_key = ?
+            WHERE prompt_norm_hash = ?
+            """,
+            (aged, "obligation_overload|slots:", ph),
+        )
+        conn.commit()
+
+        exact_q = (
+            "what would i say if this same passive aggressive person keeps doing it"
+        )
+        pr = generate_personal_response(
+            exact_q, self.db, debug_phase44_carryover=True
+        )
+        dbg = pr.phase44_carryover_debug
+        self.assertIsNotNone(dbg)
+        self.assertTrue(dbg["pick_best_for_ask"]["any_candidate_meets_threshold"])
+        self.assertLess(
+            float(dbg["strength_after_family_align"]),
+            0.50,
+            msg="test expects sub-0.50 carry strength (old respond wall)",
+        )
+        self.assertTrue(dbg["suppress_avoidance_demotion"])
+        self.assertTrue(dbg["continuity_note_emitted"])
+        self.assertEqual(dbg["continuity_language_tier"], "very_soft_template")
+        self.assertTrue(dbg["reasoning_line_audit"]["conflict_pa_soft_continuity_path"])
+        low = pr.likely_answer.lower()
+        self.assertNotIn("let it go", low, msg=pr.likely_answer)
+
+    def test_phase44_money_pressure_no_continuity_without_spending_carryover_debug(self):
+        """Money-pressure respond must not claim session continuity from a conflict-only row."""
+        prev = normalize_input(
+            "what would i say if someone is passive aggressive at work"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family="conflict",
+            shape_key=carryover_shape_key(prev, "conflict"),
+            stance_snippet="address it directly calmly",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        money_q = (
+            "i need to pay rent tomorrow but i am broke should i skip groceries "
+            "or going out first"
+        )
+        pr = generate_personal_response(
+            money_q, self.db, debug_phase44_carryover=True
+        )
+        self.assertEqual(pr.effective_family, "spending")
+        rb = (pr.reasoning_brief or "").lower()
+        for needle in (
+            "same issue continuing",
+            "recent unresolved situation",
+            "recent similar thread",
+            "just working through",
+        ):
+            self.assertNotIn(needle, rb, msg=pr.reasoning_brief)
+        dbg = pr.phase44_carryover_debug
+        self.assertIsNotNone(dbg)
+        self.assertFalse(dbg["continuity_note_emitted"])
+        self.assertEqual(dbg["continuity_language_tier"], "none")
+        self.assertEqual(
+            dbg["reasoning_line_audit"]["blocked_by"],
+            "no_situation_carryover_match",
+        )
+
+    def test_obligation_coworker_respond_like_me_continuation_keeps_carryover_line(self):
+        prev = normalize_input(
+            "my coworker keeps pushing me to cover shifts when i am burnt out"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet="name your limit without over explaining",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        q2 = "same coworker is still pushing today what would i say to shut it down"
+        pr = generate_personal_response(q2, self.db)
+        self.assertEqual(pr.effective_family, OBLIGATION_OVERLOAD)
+        rb = (pr.reasoning_brief or "").lower()
+        self.assertTrue(
+            any(
+                x in rb
+                for x in (
+                    "same issue continuing",
+                    "recent unresolved situation",
+                    "similar thread",
+                    "just working through",
+                )
+            ),
+            msg=pr.reasoning_brief,
+        )
+
+    def test_spending_realism_pass_no_mixed_pronouns_on_needs_clause(self):
+        raw = (
+            "You'd likely separate what you truly need from what you want right now "
+            "cover the roof first"
+        )
+        out = _phase41_style_realism_pass(raw, answer_focus="both")
+        ol = out.lower()
+        self.assertNotIn("what you truly need", ol)
+
+    def test_coworker_continuation_still_obligation_primary(self):
+        ordered, _ = rank_families(
+            normalize_input(
+                "same coworker is still pushing today what should i do now"
+            )
+        )
+        self.assertEqual(ordered[0][0], OBLIGATION_OVERLOAD)
+
 
 if __name__ == "__main__":
     unittest.main()

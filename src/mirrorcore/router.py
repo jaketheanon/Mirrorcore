@@ -267,6 +267,89 @@ def _apply_shift_obligation_decision_boost(norm: str, padded: str, scores: Mutab
         scores[DECISION_HELP] += 4.25
 
 
+def _apply_peer_boundary_obligation_boost(
+    norm: str, padded: str, scores: MutableMapping[str, float]
+) -> None:
+    """Decision help when a peer keeps pressing / ignores a clear no — avoids false weak_input."""
+    peer = any(
+        s in padded
+        for s in (
+            " coworker ",
+            " colleague ",
+            " boss ",
+            " manager ",
+            " teammate ",
+        )
+    )
+    if norm.startswith("coworker ") or norm.startswith("colleague "):
+        peer = True
+
+    same_peer_thread = (
+        (
+            " same coworker " in padded
+            or " same colleague " in padded
+            or " this coworker " in padded
+            or " this colleague " in padded
+            or norm.startswith("same coworker ")
+            or norm.startswith("same colleague ")
+        )
+        and any(
+            x in padded
+            for x in (
+                " still ",
+                " keeps ",
+                " pushing ",
+                " asking ",
+                " again ",
+            )
+        )
+    )
+
+    boundary_refusal = any(
+        x in padded
+        for x in (
+            " said no ",
+            " i said no ",
+            " already said no ",
+            " already told ",
+            " told them no ",
+            " told her no ",
+            " told him no ",
+            " after i said ",
+            " after i told ",
+        )
+    )
+
+    wont_take_no = any(
+        x in padded
+        for x in (
+            " wont take no ",
+            " won t take no ",
+            " take no for an answer ",
+        )
+    )
+
+    push_pressure = any(
+        x in padded
+        for x in (
+            " keeps pushing ",
+            " keep pushing ",
+            " still pushing ",
+            " pushing after ",
+            " keeps asking ",
+            " keep asking ",
+            " won t stop ",
+            " wont stop ",
+            " not taking no ",
+        )
+    )
+
+    if same_peer_thread:
+        scores[DECISION_HELP] += 4.75
+    if peer and (boundary_refusal or wont_take_no or push_pressure):
+        scores[DECISION_HELP] += 5.25
+
+
 def _apply_multiline_debug_boost(raw: str, norm: str, scores: Dict[str, float]) -> None:
     lines = [ln for ln in raw.splitlines() if ln.strip()]
     if len(lines) >= 3 and any(
@@ -315,6 +398,7 @@ def classify_intent(text: str) -> IntentClassification:
 
     _apply_multiline_debug_boost(raw, norm, scores)
     _apply_shift_obligation_decision_boost(norm, padded, scores)
+    _apply_peer_boundary_obligation_boost(norm, padded, scores)
 
     if norm in _ONBOARDING_EXACT:
         scores[ONBOARDING_OR_HELP] += 4.0

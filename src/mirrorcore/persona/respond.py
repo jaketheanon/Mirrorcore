@@ -35,6 +35,7 @@ from ..decision.memory_relevance import (
 )
 from ..decision.ontology import (
     CONFLICT_FAMILY,
+    GENERAL,
     OBLIGATION_OVERLOAD,
     SPENDING,
     interpersonal_conflict_markers_present,
@@ -42,10 +43,24 @@ from ..decision.ontology import (
     score_dimensions,
 )
 from ..decision.routed_clarification import rank_families
+from ..decision.situation_carryover import (
+    carryover_shape_key,
+    carryover_slots_prefix,
+    combined_shape_key,
+    diagnose_ask_carryover_candidates,
+    pa_carryover_aligned,
+    reference_continuation_cues,
+    short_term_row_recent_enough,
+)
 from ..router import normalize_input
 from .profile import PersonalProfile, build_personal_profile_from_rows
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+", re.I)
+
+# Phase 44: ask pick threshold is 0.25; respond *influence* uses stricter floors below.
+RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN = 0.28
+RESPOND_CARRYOVER_NOTE_HIGH_MIN = 0.58
+RESPOND_CARRYOVER_NOTE_SOFT_MIN = 0.50
 
 
 def _respond_path_multipliers(
@@ -443,6 +458,264 @@ def _memory_blob_avoidance_hit(blob: str) -> bool:
         "let it ride",
     )
     return any(n in b for n in needles)
+
+
+def _stance_favors_engagement_over_avoidance(snippet: str) -> bool:
+    """Recent stance line leans direct/calm vs passive-avoid (Phase 44 respond)."""
+    low = (snippet or "").lower()
+    avoid = (
+        "let it go",
+        "let it slide",
+        "move on",
+        "ignore it",
+        "just ignore",
+        "drop it",
+        "let it ride",
+        "walk away",
+        "rise above",
+    )
+    if any(a in low for a in avoid):
+        return False
+    direct = (
+        "direct",
+        "address",
+        "name ",
+        "plain",
+        "boundary",
+        "straight",
+        "calm",
+        "clear",
+        "conversation",
+        "honest",
+        "steady",
+        "spoken",
+    )
+    return any(d in low for d in direct)
+
+
+def _respond_situation_carryover_effective_family_aligned(
+    eff_pf: str,
+    situation_carryover: Optional[Dict[str, Any]],
+    *,
+    prompt_norm: str,
+    carry_strength: float,
+) -> Optional[Dict[str, Any]]:
+    """
+    Respond-like-me: only reuse short-term rows that match the routed decision family.
+
+    Prevents a conflict-thread carryover from affecting spending-shaped answers (and
+    the continuity note) while allowing a narrow escape when routing stays GENERAL
+    but continuation phrasing + strong conflict carry clearly match.
+    """
+    if not situation_carryover or not situation_carryover.get("match"):
+        return None
+    cfam = str(situation_carryover.get("carry_family") or "").strip().lower()
+    if not cfam:
+        cfam = (
+            str(situation_carryover["match"].get("effective_family") or "")
+            .strip()
+            .lower()
+        )
+    eff = str(eff_pf or "general").strip().lower()
+    if cfam == eff:
+        return situation_carryover
+    if (
+        eff == GENERAL
+        and cfam == CONFLICT_FAMILY
+        and carry_strength >= 0.45
+        and reference_continuation_cues(prompt_norm)
+    ):
+        return situation_carryover
+    return None
+
+
+def _respond_carryover_reasoning_line_audit(
+    situation_carryover: Optional[Dict[str, Any]],
+    prompt_norm: str,
+    carry_strength: float,
+    prompt_norm_hash: str,
+    eff_pf: str,
+) -> Dict[str, Any]:
+    """Structured gate trace for Phase 44 continuity wording (deterministic)."""
+    soft_min = float(RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN)
+    audit: Dict[str, Any] = {
+        "allowed": False,
+        "blocked_by": "",
+        "carry_strength": round(float(carry_strength), 4),
+        "same_prompt_hash": False,
+        "shape_core_match": False,
+        "explicit_continuation_cues": False,
+        "pa_carryover_aligned": False,
+        "conflict_pa_soft_continuity_path": False,
+        "cur_core": "",
+        "row_core": "",
+        "eff_family": str(eff_pf or "general").strip().lower(),
+    }
+    if not situation_carryover or not situation_carryover.get("match"):
+        audit["blocked_by"] = "no_situation_carryover_match"
+        return audit
+    match = situation_carryover["match"]
+    if str(match.get("state") or "").strip().lower() != "unresolved":
+        audit["blocked_by"] = "match_state_not_unresolved"
+        return audit
+    if not short_term_row_recent_enough(match):
+        audit["blocked_by"] = "match_not_recent_enough_42h"
+        return audit
+
+    eff = audit["eff_family"]
+    row_hash = str(match.get("prompt_norm_hash") or "").strip()
+    row_shape = str(match.get("shape_key") or "")
+    row_prompt_norm = str(match.get("prompt_norm") or "")
+    cur_core = carryover_slots_prefix(
+        carryover_shape_key(prompt_norm, str(eff_pf or "general"))
+    )
+    row_core = carryover_slots_prefix(row_shape)
+    shape_core_match = bool(cur_core) and cur_core == row_core
+    explicit = reference_continuation_cues(prompt_norm)
+    same_prompt = bool(row_hash and prompt_norm_hash and row_hash == prompt_norm_hash)
+    pa_row_align = pa_carryover_aligned(prompt_norm, row_prompt_norm)
+    audit["same_prompt_hash"] = same_prompt
+    audit["shape_core_match"] = shape_core_match
+    audit["explicit_continuation_cues"] = explicit
+    audit["pa_carryover_aligned"] = pa_row_align
+    audit["cur_core"] = cur_core
+    audit["row_core"] = row_core
+
+    if eff == SPENDING:
+        if carry_strength < 0.50:
+            audit["blocked_by"] = "spending_carry_strength_below_0_50"
+            return audit
+        if not same_prompt:
+            audit["blocked_by"] = "spending_requires_same_prompt_hash"
+            return audit
+        audit["allowed"] = True
+        audit["blocked_by"] = ""
+        return audit
+
+    if carry_strength < soft_min:
+        audit["blocked_by"] = "carry_strength_below_influence_soft_min"
+        return audit
+
+    if same_prompt:
+        audit["allowed"] = True
+        audit["blocked_by"] = ""
+        return audit
+
+    if carry_strength >= 0.50:
+        if carry_strength >= 0.62 and shape_core_match:
+            audit["allowed"] = True
+            audit["blocked_by"] = ""
+            return audit
+        if explicit and carry_strength >= 0.56 and shape_core_match:
+            audit["allowed"] = True
+            audit["blocked_by"] = ""
+            return audit
+        if explicit and carry_strength >= 0.58:
+            audit["allowed"] = True
+            audit["blocked_by"] = ""
+            return audit
+        audit["blocked_by"] = "continuity_branch_gates_failed"
+        return audit
+
+    # Narrow soft band [soft_min, 0.50): conflict + explicit continuation + PA thread
+    # alignment only (real CLI scores ~0.33–0.36; spending/general leaks stay out).
+    if eff != CONFLICT_FAMILY:
+        audit["blocked_by"] = "soft_band_requires_conflict_family"
+        return audit
+    if not explicit:
+        audit["blocked_by"] = "soft_band_requires_explicit_continuation_cues"
+        return audit
+    if not pa_row_align:
+        audit["blocked_by"] = "soft_band_requires_pa_carryover_aligned"
+        return audit
+    audit["allowed"] = True
+    audit["blocked_by"] = ""
+    audit["conflict_pa_soft_continuity_path"] = True
+    return audit
+
+
+def _respond_carryover_reasoning_line_allowed(
+    situation_carryover: Optional[Dict[str, Any]],
+    prompt_norm: str,
+    carry_strength: float,
+    prompt_norm_hash: str,
+    eff_pf: str,
+) -> bool:
+    """Continuity in Why (brief) only for a fresh, unresolved, well-matched short-term row."""
+    return bool(
+        _respond_carryover_reasoning_line_audit(
+            situation_carryover,
+            prompt_norm,
+            carry_strength,
+            prompt_norm_hash,
+            eff_pf,
+        )["allowed"]
+    )
+
+
+def _respond_carryover_suppress_avoidance(
+    carry_payload: Optional[Dict[str, Any]],
+    prompt_norm: str,
+) -> bool:
+    """
+    Strong unresolved conflict carryover + passive-aggressive continuation:
+    demote avoidance-shaped decision/style saves so recent engaged stance wins.
+    """
+    if not carry_payload or not carry_payload.get("match"):
+        return False
+    strength = float(carry_payload.get("strength") or 0.0)
+    stance = str(carry_payload["match"].get("stance_snippet") or "")
+    row_pn = str(carry_payload["match"].get("prompt_norm") or "")
+    pa_align = pa_carryover_aligned(prompt_norm, row_pn)
+    soft_min = float(RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN)
+    if _stance_favors_engagement_over_avoidance(stance) or pa_align:
+        min_s = soft_min
+    else:
+        min_s = 0.41
+    if strength < min_s:
+        return False
+    fam = str(carry_payload.get("carry_family") or "").strip().lower()
+    if "conflict" not in fam:
+        return False
+    if not reference_continuation_cues(prompt_norm):
+        return False
+    cues = conflict_situational_cues(prompt_norm)
+    if not (
+        cues.get("passive_slight")
+        or (cues.get("repeat_pattern") and reference_continuation_cues(prompt_norm))
+    ):
+        return False
+    if _stance_favors_engagement_over_avoidance(stance):
+        return True
+    if pa_align:
+        return strength >= soft_min
+    return strength >= 0.52
+
+
+def _respond_repeated_passive_aggressive_escalation_active(
+    *,
+    eff_pf: str,
+    prompt_norm: str,
+    situation_carryover: Optional[Dict[str, Any]],
+) -> bool:
+    """
+    Narrow Phase 44+ escalation gate: same-thread passive-aggressive continuation
+    where the prompt signals repetition (not a one-off slight).
+
+    Used to strip avoidance-shaped decision/style retrieval when carryover is
+    aligned but stored rows still echo \"let it go\" style answers.
+    """
+    if str(eff_pf or "").strip().lower() != CONFLICT_FAMILY:
+        return False
+    if not situation_carryover or not situation_carryover.get("match"):
+        return False
+    if not reference_continuation_cues(prompt_norm):
+        return False
+    row_pn = str(situation_carryover["match"].get("prompt_norm") or "")
+    if not pa_carryover_aligned(prompt_norm, row_pn):
+        return False
+    cues = conflict_situational_cues(prompt_norm)
+    return bool(cues.get("passive_slight") and cues.get("repeat_pattern"))
 
 
 def _normalize_replacement_direction(text: str) -> str:
@@ -1246,6 +1519,10 @@ def _phase41_style_realism_pass(text: str, *, answer_focus: str) -> str:
 
     # Likely-you voice is first-person: fix self-reference (I'd + your → my).
     for old, new in (
+        ("what you truly need", "what I truly need"),
+        ("What you truly need", "What I truly need"),
+        ("what you actually need", "what I actually need"),
+        ("What you actually need", "What I actually need"),
         ("what you heard", "what I heard"),
         ("What you heard", "What I heard"),
         ("protect your energy", "protect my energy"),
@@ -1576,6 +1853,7 @@ def _strict_conflict_shape_evidence_fallback(
     store: DatabaseStore,
     answer_focus: str = "both",
     feedback_influence: Optional[RespondFeedbackInfluence] = None,
+    skip_avoidance_style_memory: bool = False,
 ) -> Tuple[str, str, float, List[str], Tuple[str, ...]]:
     """Cautious likely-you line when strict conflict gating finds no decision row.
 
@@ -1592,6 +1870,10 @@ def _strict_conflict_shape_evidence_fallback(
         if (row.get("correction_status") or "") == "not_really":
             continue
         if sc < 0.28:
+            continue
+        if skip_avoidance_style_memory and _memory_blob_avoidance_hit(
+            style_row_text_blob(row)
+        ):
             continue
         if (
             feedback_influence
@@ -1683,6 +1965,38 @@ def _strict_conflict_shape_evidence_fallback(
         )
         return answer, reasoning, 0.37, extra_basis, ()
 
+    cues = conflict_situational_cues(prompt_norm)
+    if (
+        cues["passive_slight"]
+        and cues["repeat_pattern"]
+        and not gossip
+    ):
+        if af == "action":
+            opts = (
+                "You'd probably treat the repeat as the real issue — name the pattern calmly, one clear example, and say you need it to change.",
+                "My read is you'd stop giving the sideways shots a pass now that they keep landing — short, steady, and pointed at the behavior, not a character attack.",
+            )
+        else:
+            opts = (
+                "You'd probably say you've noticed it more than once, name what they're doing in plain words, and ask for direct talk instead of digs.",
+                "My read is you'd keep your voice calm but flat — the point is this keeps happening, not one ambiguous moment.",
+            )
+        answer = opts[_stable_index(f"{phrase_seed}:parep", len(opts))]
+        if af == "both":
+            act_m = (
+                "You'd probably pick one recent instance, say how it lands, and set that you won't keep absorbing the same sideways move.",
+                "My read is you'd keep it work-appropriate but unmistakable — pattern, not mood-reading.",
+            )
+            answer = _merge_action_wording_paragraphs(
+                act_m[_stable_index(f"{phrase_seed}:parep_a", len(act_m))],
+                answer,
+                seed=f"{phrase_seed}:parep_m",
+            )
+        reasoning = (
+            "No tight conflict save on file; passive-aggressive + repeat cues push away from one-off \"let it go\" reads — still a guess, not a quote from your saves."
+        )
+        return answer, reasoning, 0.36, extra_basis, ()
+
     peace = float(tmap.get("tendency_peace_over_confrontation", 0) or 0)
     clar = float(tmap.get("tendency_clarity_priority", 0) or 0)
     if max(peace, clar) >= 0.48:
@@ -1732,7 +2046,6 @@ def _strict_conflict_shape_evidence_fallback(
         )
         return answer, reasoning, 0.37, extra_basis, ()
 
-    cues = conflict_situational_cues(prompt_norm)
     if (
         cues["passive_slight"]
         and not gossip
@@ -1978,7 +2291,7 @@ def _strict_spending_pressure_evidence_fallback(
     ]
     if nv >= 0.52:
         opts_core.append(
-            "You'd likely separate what you truly need from what you want right now — cover the roof first, then see if a cheaper option "
+            "You'd likely split true needs from wants for right now — cover the roof first, then see if a cheaper option "
             "or more time still works once rent is back on track."
         )
     idx = _stable_index(f"{phrase_seed}:spendfb", len(opts_core))
@@ -2198,6 +2511,8 @@ class PersonalResponse:
     prompt_norm_hash: str = ""
     effective_family: str = "general"
     answer_focus: str = "both"
+    # Temporary Phase 44 observability (set only when ``debug_phase44_carryover``).
+    phase44_carryover_debug: Optional[Dict[str, Any]] = None
 
 
 def generate_personal_response(
@@ -2205,6 +2520,8 @@ def generate_personal_response(
     store: DatabaseStore,
     decision_fetch_limit: int = 800,
     style_fetch_limit: int = 800,
+    *,
+    debug_phase44_carryover: bool = False,
 ) -> PersonalResponse:
     """Build a likely-you answer using stored memory and aggregated profile."""
     text = (scenario_text or "").strip()
@@ -2223,6 +2540,48 @@ def generate_personal_response(
     strict_shape = _respond_strict_decision_shape_prompt(prompt_norm, eff_pf)
     dims_for_prompt = score_dimensions(prompt_norm)
     money_pressure_prompt = _spending_pressure_prompt(dims_for_prompt, prompt_norm)
+
+    situation_carryover: Optional[Dict[str, Any]] = None
+    try:
+        fn_best = getattr(store, "find_situation_carryover_for_ask", None)
+        if callable(fn_best):
+            situation_carryover = fn_best(prompt_norm, prompt_norm_hash)
+        elif hasattr(store, "find_situation_carryover"):
+            carry_shape_lookup = carryover_shape_key(
+                prompt_norm, str(eff_pf or "general")
+            )
+            situation_carryover = store.find_situation_carryover(
+                prompt_norm,
+                prompt_norm_hash,
+                str(eff_pf or "general"),
+                carry_shape_lookup,
+            )
+    except Exception:
+        situation_carryover = None
+    carry_pre = situation_carryover
+    carry_strength_pre = (
+        float(carry_pre["strength"]) if carry_pre else 0.0
+    )
+    situation_carryover = _respond_situation_carryover_effective_family_aligned(
+        str(eff_pf or "general"),
+        situation_carryover,
+        prompt_norm=prompt_norm,
+        carry_strength=carry_strength_pre,
+    )
+    carry_strength = (
+        float(situation_carryover["strength"])
+        if situation_carryover
+        else 0.0
+    )
+    carry_suppress_avoidance = _respond_carryover_suppress_avoidance(
+        situation_carryover, prompt_norm
+    )
+    repeated_pa_escalation = _respond_repeated_passive_aggressive_escalation_active(
+        eff_pf=str(eff_pf or "general"),
+        prompt_norm=prompt_norm,
+        situation_carryover=situation_carryover,
+    )
+    carry_boost = min(0.11, carry_strength * 0.086) if carry_strength >= 0.38 else 0.0
 
     try:
         mmap: Mapping[str, float] = store.get_respond_evidence_multiplier_map()
@@ -2279,6 +2638,19 @@ def generate_personal_response(
             for r, s, rs in d_gated
             if not _memory_blob_avoidance_hit(decision_row_text_blob(r))
         ]
+    strip_avoidance_decisions = carry_suppress_avoidance or repeated_pa_escalation
+    if strip_avoidance_decisions:
+        kept_av = [
+            (r, s, rs)
+            for r, s, rs in d_gated
+            if not _memory_blob_avoidance_hit(decision_row_text_blob(r))
+        ]
+        if kept_av:
+            d_gated = kept_av
+        else:
+            # Do not keep a lone avoidance-shaped save when Phase 44 cues demand
+            # demotion but no non-avoidance row survives filtering.
+            d_gated = []
     top_d = d_gated[0] if d_gated else None
     top_score = top_d[1] if top_d else 0.0
     top_family_aligned = (
@@ -2327,6 +2699,8 @@ def generate_personal_response(
         cross_boost *= 0.52
     if cross_boost > 0:
         agreement_boost = min(1.0, agreement_boost + cross_boost)
+    if carry_boost > 0:
+        agreement_boost = min(1.0, agreement_boost + carry_boost)
 
     conf_pre = _compute_response_confidence(
         profile,
@@ -2662,6 +3036,7 @@ def generate_personal_response(
             answer_focus=answer_focus,
         )
     elif strict_shape and not top_d and eff_pf == CONFLICT_FAMILY:
+        skip_style_avoid = carry_suppress_avoidance or repeated_pa_escalation
         ans, reas, ccap, extra_mb, style_ids_fb = _strict_conflict_shape_evidence_fallback(
             prompt_norm=prompt_norm,
             phrase_seed=phrase_seed,
@@ -2674,6 +3049,7 @@ def generate_personal_response(
             store=store,
             answer_focus=answer_focus,
             feedback_influence=feedback_influence,
+            skip_avoidance_style_memory=skip_style_avoid,
         )
         answer = ans
         reasoning = reas
@@ -2890,6 +3266,42 @@ def generate_personal_response(
         reasoning += " Repeated corrections in the same shape point in one direction."
     answer = _phase41_style_realism_pass(answer, answer_focus=answer_focus)
 
+    continuity_note = ""
+    reasoning_line_audit = _respond_carryover_reasoning_line_audit(
+        situation_carryover,
+        prompt_norm,
+        carry_strength,
+        prompt_norm_hash,
+        str(eff_pf or "general"),
+    )
+    allow_carry_line = bool(reasoning_line_audit["allowed"])
+    if allow_carry_line and situation_carryover and carry_strength >= float(
+        RESPOND_CARRYOVER_NOTE_HIGH_MIN
+    ):
+        cvars = (
+            " This looks like the same issue continuing from a recent thread.",
+            " This lines up with a recent unresolved situation you were in.",
+        )
+        continuity_note = cvars[_stable_index(phrase_seed + ":p44c", len(cvars))]
+    elif allow_carry_line and situation_carryover and carry_strength >= float(
+        RESPOND_CARRYOVER_NOTE_SOFT_MIN
+    ):
+        cvars2 = (
+            " A recent similar thread may still be open for you.",
+            " This may connect to something you were just working through.",
+        )
+        continuity_note = cvars2[_stable_index(phrase_seed + ":p44d", len(cvars2))]
+    elif allow_carry_line and situation_carryover and carry_strength >= float(
+        RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN
+    ):
+        cvars3 = (
+            " This still looks connected to a recent situation for you.",
+            " There is some recent thread context that still applies here.",
+        )
+        continuity_note = cvars3[_stable_index(phrase_seed + ":p44e", len(cvars3))]
+    if continuity_note:
+        reasoning = (reasoning or "").rstrip() + continuity_note
+
     path_m = _respond_path_multipliers(evidence_path, mmap)
     conf = _compute_response_confidence(
         profile,
@@ -2919,7 +3331,88 @@ def generate_personal_response(
         conf = min(0.86, conf + 0.03)
     for cap in conf_caps:
         conf = min(conf, cap)
+    phase44_carryover_debug: Optional[Dict[str, Any]] = None
+    if debug_phase44_carryover:
+        rows_dbg: List[Dict[str, Any]] = []
+        try:
+            if hasattr(store, "list_recent_short_term_situations"):
+                rows_dbg = store.list_recent_short_term_situations(limit=40)
+        except Exception:
+            rows_dbg = []
+        ask_diag = diagnose_ask_carryover_candidates(
+            prompt_norm, prompt_norm_hash, rows_dbg
+        )
+        cfam_pre = ""
+        if carry_pre and carry_pre.get("match"):
+            cfam_pre = str(
+                carry_pre.get("carry_family")
+                or carry_pre["match"].get("effective_family")
+                or ""
+            ).strip().lower()
+        cont_tier = "none"
+        if allow_carry_line and situation_carryover and carry_strength >= float(
+            RESPOND_CARRYOVER_NOTE_HIGH_MIN
+        ):
+            cont_tier = "high_template"
+        elif allow_carry_line and situation_carryover and carry_strength >= float(
+            RESPOND_CARRYOVER_NOTE_SOFT_MIN
+        ):
+            cont_tier = "soft_template"
+        elif allow_carry_line and situation_carryover and carry_strength >= float(
+            RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN
+        ):
+            cont_tier = "very_soft_template"
+        mid = ""
+        if situation_carryover and situation_carryover.get("match"):
+            mid = str(situation_carryover["match"].get("id") or "")
+            
+        phase44_carryover_debug = {
+                "prompt_norm_prefix": (prompt_norm or "")[:160],
+                "pick_best_for_ask": ask_diag,
+                "family_alignment": {
+                "routed_effective_family": str(eff_pf or "general").strip().lower(),
+                "carry_family_from_pick": cfam_pre,
+                "had_carry_pre_align": carry_pre is not None,
+                "kept_after_family_gate": situation_carryover is not None,
+                "dropped_by_family_align": bool(
+                    carry_pre is not None and situation_carryover is None
+                ),
+            },
+            "strength_after_family_align": round(float(carry_strength), 4),
+            "active_match_row_id": mid,
+            "suppress_avoidance_demotion": carry_suppress_avoidance,
+            "repeated_passive_aggressive_escalation": repeated_pa_escalation,
+            "strip_avoidance_decision_rows": strip_avoidance_decisions,
+            "reasoning_line_audit": reasoning_line_audit,
+            "continuity_language_tier": cont_tier,
+            "continuity_note_emitted": bool((continuity_note or "").strip()),
+            "continuity_note_text": (continuity_note or "").strip(),
+        }
 
+    try:
+        rec = getattr(store, "record_short_term_situation", None)
+        if callable(rec):
+            sk_rec = combined_shape_key(
+                prompt_norm,
+                str(eff_pf or "general"),
+                evidence_path.to_storage_dict(),
+            )
+            la0 = (answer or "").strip().split("\n")[0].strip()
+            st_snip = la0[:200] if len(la0) > 20 else (reasoning or "")[:200]
+            rec(
+                prompt_norm=prompt_norm,
+                prompt_norm_hash=prompt_norm_hash,
+                effective_family=str(eff_pf or "general"),
+                shape_key=sk_rec,
+                stance_snippet=st_snip,
+                source="respond_like_me",
+            )
+    except Exception:
+        pass
+
+
+        
+        
     label = _confidence_bucket(conf)
     return PersonalResponse(
         likely_answer=answer,
@@ -2932,5 +3425,6 @@ def generate_personal_response(
         prompt_norm_hash=prompt_norm_hash,
         effective_family=str(eff_pf or "general"),
         answer_focus=answer_focus,
+        phase44_carryover_debug=phase44_carryover_debug,
     )
 

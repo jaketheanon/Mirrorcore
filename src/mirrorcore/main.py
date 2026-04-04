@@ -225,6 +225,11 @@ Examples:
         action="store_true",
         help="Skip the short after-response rating prompt",
     )
+    respond_like_me_parser.add_argument(
+        "--debug-carryover",
+        action="store_true",
+        help="Print Phase 44 short-term carryover diagnostics (temporary; JSON)",
+    )
 
     respond_feedback_parser = subparsers.add_parser(
         "respond-feedback",
@@ -1958,6 +1963,7 @@ def handle_interview(args):
 
 def handle_respond_like_me(args):
     """Handle respond-like-me — grounded likely-you reply from stored memory."""
+    import os
     from pathlib import Path
     from .db.store import DatabaseStore
     from .persona.respond import generate_personal_response
@@ -1988,7 +1994,12 @@ def handle_respond_like_me(args):
         print("No scenario text — nothing to respond to.")
         return
 
-    pr = generate_personal_response(scenario, db_store)
+    debug_carry = bool(getattr(args, "debug_carryover", False)) or (
+        os.environ.get("MIRRORCORE_DEBUG_PHASE44_CARRYOVER", "").strip() == "1"
+    )
+    pr = generate_personal_response(
+        scenario, db_store, debug_phase44_carryover=debug_carry
+    )
     print()
     print("Likely response")
     print("-" * min(48, max(24, len(scenario) // 2 + 24)))
@@ -2010,6 +2021,10 @@ def handle_respond_like_me(args):
     else:
         print("Grounded in: little or no matching stored memory — see confidence above.")
     print()
+    if debug_carry and getattr(pr, "phase44_carryover_debug", None):
+        print("--- Phase 44 carryover (debug) ---")
+        print(json.dumps(pr.phase44_carryover_debug, indent=2, sort_keys=True))
+        print()
 
     from .persona.respond_feedback import maybe_prompt_respond_feedback, stdin_is_interactive
 

@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import re
+import shlex
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+
+OUTDIR = Path("archives/checks")
+OUTDIR.mkdir(parents=True, exist_ok=True)
+
+
+def run_capture(cmd: list[str], cwd: Path) -> tuple[int, str]:
+    proc = subprocess.run(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return proc.returncode, proc.stdout
+
+
+def append_section(outfile: Path, title: str) -> None:
+    with outfile.open("a", encoding="utf-8") as f:
+        f.write("\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"{title}\n")
+        f.write("=" * 60 + "\n")
+
+
+def append_command(outfile: Path, cwd: Path, cmd: list[str]) -> tuple[int, str]:
+    append_section(outfile, f"COMMAND: {' '.join(shlex.quote(x) for x in cmd)}")
+    rc, out = run_capture(cmd, cwd)
+    with outfile.open("a", encoding="utf-8") as f:
+        f.write(f"$ {' '.join(shlex.quote(x) for x in cmd)}\n")
+        f.write(out)
+        if out and not out.endswith("\n"):
+            f.write("\n")
+        f.write(f"\n[exit_code={rc}]\n")
+    return rc, out
+
+
+def git_branch(cwd: Path) -> str:
+    rc, out = run_capture(["git", "branch", "--show-current"], cwd)
+    branch = out.strip()
+    return branch if rc == 0 and branch else "detached-head"
+
+
+def phase_tag_from_branch(branch: str) -> str:
+    match = re.match(r"^(phase\d+(?:[.-]\d+)?)", branch)
+    tag = match.group(1) if match else branch
+    return tag.replace(".", "_").replace("-", "_")
+
+
+def safe_branch_name(branch: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", branch.replace("/", "_").replace(" ", "_"))
+    return safe or "unknown-branch"
+
+
+def get_untracked_files(cwd: Path) -> list[str]:
+    rc, out = run_capture(["git", "ls-files", "--others", "--exclude-standard"], cwd)
+    if rc != 0:
+        return []
+    return sorted({line.strip() for line in out.splitlines() if line.strip()})
+
+
+def get_changed_files_worktree(cwd: Path) -> list[str]:
+    files: set[str] = set()
+
+    commands = [
+        ["git", "diff", "--name-only"],
+        ["git", "diff", "--cached", "--name-only"],
+        ["git", "ls-files", "--others", "--exclude-standard"],
+    ]
+
+    for cmd in commands:
+        rc, out = run_capture(cmd, cwd)
+        if rc == 0:
+            for line in out.splitlines():
+                line = line.strip()
+                if line:
+                    files.add(line)
+
+    return sorted(files)
+
+
+def get_changed_files_head(cwd: Path) -> list[str]:
+    rc, out = run_capture(["git", "show", "--name-only", "--pretty=", "HEAD"], cwd)
+    if rc != 0:
+        return []
+    return sorted({line.strip() for line in out.splitlines() if line.strip()})
+
+
+def file_exists_relative(cwd: Path, rel_path: str) -> bool:
+    return (cwd / rel_path).is_file()
+
+
+def main() -> int:
+    cwd = Path.cwd()
+    branch = git_branch(cwd)
+    phase_tag = phase_tag_from_branch(branch)
+    safe_branch = safe_branch_name(branch)
+
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    outfile = OUTDIR / f"{phase_tag}_{safe_branch}_check_{stamp}.txt"
+
+    with outfile.open("w", encoding="utf-8") as f:
+        f.write("MirrorCore Phase Check Report\n")
+        f.write(f"Generated: {datetime.now().isoformat(sep=' ', timespec='seconds')}\n")
+        f.write(f"Working directory: {cwd}\n")
+        f.write(f"Branch: {branch}\n")
+        f.write(f"Phase tag: {phase_tag}\n\n")
+
+    append_section(outfile, "GIT OVERVIEW")
+    append_command(outfile, cwd, ["git", "branch", "--show-current"])
+    append_command(outfile, cwd, ["git", "status"])
+    append_command(outfile, cwd, ["git", "log", "-1"])
+
+    diff_rc, _ = run_capture(["git", "diff", "--quiet"], cwd)
+    cached_rc, _ = run_capture(["git", "diff", "--cached", "--quiet"], cwd)
+    untracked = get_untracked_files(cwd)
+
+    has_changes = (diff_rc != 0) or (cached_rc != 0) or bool(untracked)
+
+    if has_changes:
+        append_section(outfile, "UNCOMMITTED / STAGED / UNTRACKED CHANGES DETECTED")
+        append_command(outfile, cwd, ["git", "diff", "--stat"])
+        append_command(outfile, cwd, ["git", "diff", "--name-only"])
+        append_command(outfile, cwd, ["git", "diff", "--cached", "--stat"])
+        append_command(outfile, cwd, ["git", "diff", "--cached", "--name-only"])
+
+        append_section(outfile, "UNTRACKED FILES")
+        with outfile.open("a", encoding="utf-8") as f:
+            if untracked:
+                f.write("\n".join(untracked) + "\n")
+            else:
+                f.write("No untracked files.\n")
+
+        append_command(outfile, cwd, ["git", "diff"])
+        append_command(outfile, cwd, ["git", "diff", "--cached"])
+
+        changed_files = get_changed_files_worktree(cwd)
+    else:
+        append_section(outfile, "WORKTREE CLEAN - USING LAST COMMIT")
+        append_command(outfile, cwd, ["git", "show", "--stat", "--summary", "HEAD"])
+        append_command(outfile, cwd, ["git", "show", "--name-only", "--pretty=medium", "HEAD"])
+
+        changed_files = get_changed_files_head(cwd)
+
+    append_section(outfile, "CHANGED FILES (DETECTED)")
+    with outfile.open("a", encoding="utf-8") as f:
+        if changed_files:
+            f.write("\n".join(changed_files) + "\n")
+        else:
+            f.write("No changed files detected.\n")
+
+    py_files = [f for f in changed_files if f.endswith(".py") and file_exists_relative(cwd, f)]
+
+    append_section(outfile, "TARGETED PYTHON FILES FOR py_compile")
+    with outfile.open("a", encoding="utf-8") as f:
+        if py_files:
+            f.write("\n".join(py_files) + "\n")
+        else:
+            f.write("No Python files detected for py_compile.\n")
+
+    append_section(outfile, "TESTS")
+    append_command(outfile, cwd, ["pytest", "-q"])
+
+    append_section(outfile, "PY_COMPILE")
+    if py_files:
+        for fpath in py_files:
+            append_command(outfile, cwd, ["python", "-m", "py_compile", fpath])
+    else:
+        with outfile.open("a", encoding="utf-8") as f:
+            f.write("No Python files to compile.\n")
+
+    append_section(outfile, "DONE")
+    with outfile.open("a", encoding="utf-8") as f:
+        f.write(f"Saved report to: {outfile}\n")
+
+    print(f"Saved report to: {outfile}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

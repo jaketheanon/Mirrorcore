@@ -8,6 +8,7 @@ Deterministic, inspectable, one question at a time. Used from ``mirrorcore ask``
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
@@ -38,6 +39,7 @@ from .ontology import (
     slot_ids_covered_by_context,
     work_obligation_peer_shape,
 )
+from .situation_carryover import carryover_shape_key
 
 # Phase 31 API alias (same as ontology.MONEY)
 MONEY = SPENDING
@@ -370,9 +372,11 @@ def pick_next_question(
     asked_ids: Sequence[str],
     domain_order: Sequence[str],
     dimensions: Optional[Dict[str, float]] = None,
+    deprioritize_slot_ids: Sequence[str] = (),
 ) -> Optional[ClarificationSlot]:
     """Pick the next single slot: family order × priority × missing markers × dimension boosts."""
     asked = set(asked_ids)
+    deprioritize = frozenset(deprioritize_slot_ids)
     ctx = _padded_ctx(context_parts)
     merged_norm = normalize_input(" ".join(context_parts))
     covered = slot_ids_covered_by_context(merged_norm)
@@ -380,7 +384,13 @@ def pick_next_question(
     slots = _slots_tuple()
     for fam in domain_order:
         tier = [s for s in slots if fam in s.families]
-        tier.sort(key=lambda s: (_effective_priority(s, dims), s.slot_id))
+        tier.sort(
+            key=lambda s: (
+                _effective_priority(s, dims)
+                + (8.0 if s.slot_id in deprioritize else 0.0),
+                s.slot_id,
+            )
+        )
         for slot in tier:
             if slot.slot_id in asked:
                 continue
@@ -536,6 +546,81 @@ def _situation_counts_recent(store, limit: int = 30) -> Dict[str, int]:
 
 
 # --- Guidance (data-driven checks on merged context + memory) ---
+
+def _shallow_timing_primary(norm_text: str, top_family: str) -> bool:
+    """Timing won lexically but without an explicit wait/act or deadline frame (ask continuation)."""
+    if top_family != RISK_TIMING:
+        return False
+    padded = f" {norm_text} "
+    strong_phrases = (
+        " wait or ",
+        " whether to wait ",
+        " whether to ",
+        " act now or ",
+        " hold off ",
+        " know whether ",
+        " dont know whether ",
+        "don't know whether ",
+        " not sure whether ",
+        " too soon ",
+        " too late ",
+        " reversible ",
+        " point of no return ",
+        " real deadline ",
+        " hard deadline ",
+        " worth waiting",
+        " wait until ",
+        " until monday",
+        " until next",
+        "should i wait",
+        "should we wait",
+    )
+    return not any(p in padded for p in strong_phrases)
+
+
+def _pin_order_for_phase44_ask_continuation(
+    norm_text: str,
+    ranked: List[Tuple[str, float]],
+    dimensions: Dict[str, float],
+    order: List[str],
+    carry_payload: Optional[Dict[str, Any]],
+) -> List[str]:
+    """
+    When a strong unresolved situation matches but shallow ``today``/``now`` wording
+    top-ranks timing, put the carried family first for clarification (Phase 44).
+    """
+    if not carry_payload or not carry_payload.get("match"):
+        return order
+    strength = float(carry_payload.get("strength") or 0.0)
+    fam = str(carry_payload.get("carry_family") or "").strip().lower() or GENERAL
+    if strength < 0.38 or fam == GENERAL:
+        return order
+    top = order[0] if order else GENERAL
+    if fam == top:
+        return order
+    if (
+        top == SPENDING
+        and ranked
+        and ranked[0][0] == SPENDING
+        and ranked[0][1] >= 2.35
+    ):
+        return order
+    if top == RISK_TIMING and fam != RISK_TIMING:
+        shallow = _shallow_timing_primary(norm_text, top)
+        if strength >= 0.52:
+            pass
+        elif strength >= 0.42 and shallow:
+            pass
+        else:
+            return order
+    else:
+        return order
+    seq = list(order)
+    if fam not in seq:
+        seq.append(fam)
+    out = [fam] + [x for x in seq if x != fam]
+    return sanitize_domain_order_for_obligation(norm_text, dimensions, out)
+
 
 def sanitize_domain_order_for_obligation(
     norm_text: str,
@@ -1409,6 +1494,33 @@ def run_routed_decision_guidance(
 
     order = sanitize_domain_order_for_obligation(norm, dimensions, order)
 
+    carry_payload: Optional[Dict[str, Any]] = None
+    try:
+        fn_ask = getattr(db_store, "find_situation_carryover_for_ask", None)
+        if callable(fn_ask):
+            ph0 = hashlib.sha256(norm.encode("utf-8")).hexdigest()
+            carry_payload = fn_ask(norm, ph0)
+    except Exception:
+        carry_payload = None
+
+    order = _pin_order_for_phase44_ask_continuation(
+        norm, ranked, dimensions, order, carry_payload
+    )
+
+    dep_slots: List[str] = []
+    try:
+        if carry_payload and carry_payload.get("match"):
+            raw = carry_payload["match"].get("asked_slots_json")
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        dep_slots = [str(x) for x in parsed if str(x).strip()]
+                except (json.JSONDecodeError, TypeError):
+                    dep_slots = []
+    except Exception:
+        dep_slots = []
+
     try:
         profile = build_personal_profile(db_store)
         if profile.total_evidence_weight < 0.85:
@@ -1435,6 +1547,7 @@ def run_routed_decision_guidance(
             asked_ids=asked_ids,
             domain_order=order,
             dimensions=dimensions,
+            deprioritize_slot_ids=dep_slots,
         )
         if slot is None:
             break
@@ -1489,7 +1602,7 @@ def run_routed_decision_guidance(
     except Exception:
         interview_cands = []
 
-    return build_routed_decision_guidance(
+    guidance_text = build_routed_decision_guidance(
         original_question=initial_text,
         qa_pairs=qa_pairs,
         domain_order=order,
@@ -1499,6 +1612,26 @@ def run_routed_decision_guidance(
         surface_store=db_store,
         interview_memory_candidates=interview_cands,
     )
+
+    rec_shape = carryover_shape_key(merged_norm, order[0] if order else GENERAL)
+    try:
+        rec = getattr(db_store, "record_short_term_situation", None)
+        if callable(rec):
+            ph = hashlib.sha256(norm.encode("utf-8")).hexdigest()
+            stance_head = guidance_text.split("\n\n")[0].strip()[:220]
+            rec(
+                prompt_norm=norm,
+                prompt_norm_hash=ph,
+                effective_family=order[0] if order else GENERAL,
+                shape_key=rec_shape,
+                stance_snippet=stance_head,
+                source="ask",
+                asked_slots_json=json.dumps(asked_ids),
+            )
+    except Exception:
+        pass
+
+    return guidance_text
 
 
 LEGACY_GENERIC_PHRASES = (
