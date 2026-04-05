@@ -21,6 +21,7 @@ from mirrorcore.decision.situation_carryover import (
     conflict_escalation_carryover_thread_ok,
     continuation_strength,
     diagnose_ask_carryover_candidates,
+    feedback_replacement_same_thread_gate,
     low_information_carryover_row_exclusion_reason,
     pick_best_carryover,
     pick_best_carryover_for_ask,
@@ -328,6 +329,92 @@ class TestSituationCarryover(unittest.TestCase):
             "my coworker is pushing me to cover shifts what would i say"
         )
         self.assertFalse(boundary_carryover_aligned(cur, prev))
+
+    def test_feedback_replacement_same_thread_gate_same_hash(self):
+        prev = normalize_input("coworker cover shifts after i said no")
+        h = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        row = {
+            "state": "unresolved",
+            "updated_at": "2026-04-05T12:00:00",
+            "effective_family": "obligation_overload",
+            "prompt_norm": prev,
+            "prompt_norm_hash": h,
+            "shape_key": carryover_shape_key(prev, "obligation_overload"),
+            "stance_snippet": "x",
+        }
+        ok, reason = feedback_replacement_same_thread_gate(
+            prev,
+            prev,
+            h,
+            h,
+            carryover_shape_key(prev, "obligation_overload"),
+            row["shape_key"],
+            row,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "same_prompt_hash")
+
+    def test_feedback_replacement_same_thread_gate_false_without_continuation(self):
+        prev = normalize_input(
+            "what would i say when my coworker keeps asking me to cover shifts after i said no"
+        )
+        cur = normalize_input(
+            "my coworker is pushing me to cover shifts what would i say"
+        )
+        h_prev = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        h_cur = hashlib.sha256(cur.encode("utf-8")).hexdigest()
+        row = {
+            "state": "unresolved",
+            "updated_at": "2026-04-05T12:00:00",
+            "effective_family": "obligation_overload",
+            "prompt_norm": prev,
+            "prompt_norm_hash": h_prev,
+            "shape_key": carryover_shape_key(prev, "obligation_overload"),
+            "stance_snippet": "y",
+        }
+        ok, reason = feedback_replacement_same_thread_gate(
+            cur,
+            prev,
+            h_cur,
+            h_prev,
+            carryover_shape_key(cur, "obligation_overload"),
+            row["shape_key"],
+            row,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "no_continuation_cues")
+
+    def test_feedback_replacement_same_thread_gate_true_for_close_obligation_thread(
+        self,
+    ):
+        prev = normalize_input(
+            "what would i say when my coworker keeps asking me to cover shifts after i said no"
+        )
+        cur = normalize_input(
+            "same coworker is still pushing after i already said no what would i say"
+        )
+        h_prev = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        h_cur = hashlib.sha256(cur.encode("utf-8")).hexdigest()
+        row = {
+            "state": "unresolved",
+            "updated_at": "2026-04-05T12:00:00",
+            "effective_family": "obligation_overload",
+            "prompt_norm": prev,
+            "prompt_norm_hash": h_prev,
+            "shape_key": carryover_shape_key(prev, "obligation_overload"),
+            "stance_snippet": "z",
+        }
+        ok, reason = feedback_replacement_same_thread_gate(
+            cur,
+            prev,
+            h_cur,
+            h_prev,
+            carryover_shape_key(cur, "obligation_overload"),
+            row["shape_key"],
+            row,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "thread_gate_escalation_ok")
 
     def test_conflict_escalation_thread_ok_false_across_unrelated_domains(self):
         prev = normalize_input("should i buy a laptop when rent is late")

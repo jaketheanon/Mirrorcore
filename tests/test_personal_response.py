@@ -2656,6 +2656,174 @@ class TestPhase44RespondContinuation(unittest.TestCase):
         self.assertTrue(
             dbg["surfaced_answer_used_carryover_replacement_stance"]
         )
+        self.assertTrue(dbg["feedback_replacement_available"])
+        self.assertTrue(dbg["feedback_replacement_same_thread_relevant"])
+        self.assertTrue(dbg["feedback_replacement_selected_for_surface"])
+        self.assertEqual(dbg["feedback_replacement_block_reason"], "")
+        self.assertTrue(
+            dbg.get("older_phrasing_demoted_due_to_feedback"),
+            msg=repr(dbg),
+        )
+
+    def test_phase46_close_same_thread_variant_prefers_replacement(self):
+        """Near same-thread wording (not identical hash) still surfaces approved line."""
+        prev = normalize_input(
+            "what would i say coworker keeps asking me to cover shifts after i said no"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        replacement = "I already told you no. I can't take that on right now."
+        awkward = "I was already overloaded. I'd hold the line on what I already said."
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet=awkward,
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        self.db.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text=replacement,
+            confidence_shown=0.55,
+            effective_family=OBLIGATION_OVERLOAD,
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet=awkward[:200],
+            feedback_target="wording",
+        )
+        q2 = "same coworker keeps pushing after i already said no"
+        pr = generate_personal_response(
+            q2, self.db, debug_phase44_carryover=True
+        )
+        la = (pr.likely_answer or "").strip().lower()
+        self.assertIn("already told you no", la)
+        self.assertNotIn("already overloaded", la)
+        dbg = pr.phase44_carryover_debug
+        self.assertIsNotNone(dbg)
+        self.assertTrue(dbg["phase46_feedback_merge"]["merge_applied"])
+
+    def test_phase46_unrelated_obligation_prompt_does_not_force_replacement(self):
+        """Same family but no continuation cues: do not inject prior thread replacement."""
+        prev = normalize_input(
+            "what would i say coworker keeps asking me to cover shifts after i said no"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        replacement = "I already told you no. I can't take that on right now."
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet="say you cannot cover and keep it short",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        self.db.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text=replacement,
+            confidence_shown=0.55,
+            effective_family=OBLIGATION_OVERLOAD,
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet="x",
+            feedback_target="wording",
+        )
+        q2 = "my coworker is pushing me to cover shifts what would i say"
+        pr = generate_personal_response(
+            q2, self.db, debug_phase44_carryover=True
+        )
+        la = (pr.likely_answer or "").strip().lower()
+        self.assertNotIn("already told you no", la)
+        dbg = pr.phase44_carryover_debug
+        self.assertIsNotNone(dbg)
+        self.assertFalse(dbg["phase46_feedback_merge"]["merge_applied"])
+
+    def test_phase46_obligation_replacement_does_not_bleed_into_conflict_prompt(self):
+        prev = normalize_input(
+            "what would i say coworker keeps asking me to cover shifts after i said no"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        replacement = "I already told you no. I can't take that on right now."
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet="say you cannot cover",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        self.db.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text=replacement,
+            confidence_shown=0.55,
+            effective_family=OBLIGATION_OVERLOAD,
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet="x",
+            feedback_target="wording",
+        )
+        q_conflict = (
+            "what would i say if someone is being passive aggressive at work "
+            "and keeps making digs"
+        )
+        pr = generate_personal_response(
+            q_conflict, self.db, debug_phase44_carryover=True
+        )
+        la = (pr.likely_answer or "").strip().lower()
+        self.assertNotIn("already told you no", la)
+        self.assertNotIn("can't take that on right now", la)
+
+    def test_phase46_newer_approved_replacement_beats_older_feedback_row(self):
+        prev = normalize_input(
+            "coworker keeps asking cover shifts after i said no what would i say"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet="stale awkward carryover stance line here",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        self.db.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text="older replacement line should not win",
+            confidence_shown=0.5,
+            effective_family=OBLIGATION_OVERLOAD,
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet="a",
+            feedback_target="wording",
+        )
+        self.db.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text="newer approved replacement line wins here",
+            confidence_shown=0.5,
+            effective_family=OBLIGATION_OVERLOAD,
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet="b",
+            feedback_target="wording",
+        )
+        q2 = "same coworker still pushing after i said no what would i say"
+        pr = generate_personal_response(q2, self.db)
+        low = (pr.likely_answer or "").lower()
+        self.assertIn("newer approved replacement line wins here", low)
+        self.assertNotIn("older replacement line should not win", low)
 
     def test_spending_realism_pass_no_mixed_pronouns_on_needs_clause(self):
         raw = (

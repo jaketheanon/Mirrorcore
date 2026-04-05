@@ -48,6 +48,11 @@ JACCARD_INTER_SOFT_MIN = 0.34
 INTER_MIN_FOR_REF_GATE = 2
 INTER_STRICT_WITHOUT_REF = 3
 
+# --- Phase 46: replacement feedback may follow carryover row hash (narrow same-thread only) ---
+PHASE46_REPLACEMENT_FEEDBACK_MERGE_STRENGTH_MIN = 0.28  # align with respond influence soft floor
+PHASE46_REPLACEMENT_THREAD_OVERLAP_MIN = INTER_STRICT_WITHOUT_REF
+PHASE46_REPLACEMENT_THREAD_JACCARD_MIN = JACCARD_INTER_SOFT_MIN
+
 STOPWORDS = frozenset(
     {
         "a",
@@ -486,6 +491,48 @@ def conflict_escalation_carryover_thread_ok(
     if same_person_conflict_thread_carryover_aligned(cur_norm, row_norm):
         return True
     return False
+
+
+def feedback_replacement_same_thread_gate(
+    cur_norm: str,
+    row_norm: str,
+    cur_hash: str,
+    row_hash: str,
+    cur_shape_key: str,
+    row_shape_key: str,
+    row: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """
+    Phase 46: when the current prompt hash differs from the carryover row hash,
+    allow reading wording-off replacement feedback from the row only under a
+    narrow same-thread + same-shape-core test (deterministic).
+    """
+    ch = (cur_hash or "").strip()
+    rh = (row_hash or "").strip()
+    if ch and rh and ch == rh:
+        return True, "same_prompt_hash"
+    if not short_term_row_recent_enough(row):
+        return False, "carryover_row_not_recent_enough"
+    cur_core = carryover_slots_prefix(cur_shape_key)
+    row_core = carryover_slots_prefix(row_shape_key)
+    if not cur_core or cur_core != row_core:
+        return False, "shape_core_mismatch"
+    if conflict_escalation_carryover_thread_ok(cur_norm, row_norm, ch, rh):
+        return True, "thread_gate_escalation_ok"
+    cur_t = significant_tokens(cur_norm)
+    row_t = significant_tokens(row_norm)
+    inter = len(cur_t & row_t)
+    if not reference_continuation_cues(cur_norm):
+        return False, "no_continuation_cues"
+    if inter < PHASE46_REPLACEMENT_THREAD_OVERLAP_MIN:
+        return False, "token_overlap_below_phase46_min"
+    uni = len(cur_t | row_t)
+    jacc = inter / uni if uni else 0.0
+    if jacc < PHASE46_REPLACEMENT_THREAD_JACCARD_MIN and not pa_carryover_aligned(
+        cur_norm, row_norm
+    ):
+        return False, "jaccard_below_phase46_min"
+    return True, "continuation_overlap_phase46_ok"
 
 
 def carryover_shape_key(prompt_norm: str, effective_family: str) -> str:

@@ -44,6 +44,7 @@ from ..decision.ontology import (
 )
 from ..decision.routed_clarification import rank_families
 from ..decision.situation_carryover import (
+    PHASE46_REPLACEMENT_FEEDBACK_MERGE_STRENGTH_MIN,
     boundary_carryover_aligned,
     carryover_safe_stance_fallback,
     carryover_shape_key,
@@ -51,6 +52,7 @@ from ..decision.situation_carryover import (
     combined_shape_key,
     conflict_escalation_carryover_thread_ok,
     diagnose_ask_carryover_candidates,
+    feedback_replacement_same_thread_gate,
     pa_carryover_aligned,
     persistence_after_declined_shaped,
     reference_continuation_cues,
@@ -68,6 +70,8 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+", re.I)
 RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN = 0.28
 RESPOND_CARRYOVER_NOTE_HIGH_MIN = 0.58
 RESPOND_CARRYOVER_NOTE_SOFT_MIN = 0.50
+# Phase 46: deterministic lexical nudge when adopting carryover-thread replacement wording
+RESPOND_PHASE46_REPLACEMENT_PREF_TOKEN_SEED = 0.18
 # Phase 44/45: GENERAL routing escape when conflict carryover is very strong + continuation cues.
 RESPOND_CONFLICT_GENERAL_ESCAPE_CARRY_STRENGTH_MIN = 0.45
 # Phase 45: gentle retrieval tilt toward direct/boundary-shaped saves (deterministic cap).
@@ -368,6 +372,8 @@ class RespondFeedbackInfluence:
     action_ok_wording_off: bool = False
     # Newest-first replacement from partly + action_ok_word_bad (not the wrong-only inject path).
     action_ok_wording_replacement_line: str = ""
+    # Phase 46: action-ok wording line was merged from carryover row prompt hash (narrow gate).
+    phase46_merged_carryover_feedback: bool = False
 
 
 @dataclass(frozen=True)
@@ -1042,6 +1048,125 @@ def build_respond_feedback_influence(
     )
 
 
+def _phase46_has_action_ok_replacement_line(infl: RespondFeedbackInfluence) -> bool:
+    return bool(
+        infl.action_ok_wording_off
+        and len((infl.action_ok_wording_replacement_line or "").strip()) >= 8
+    )
+
+
+def _phase46_resolved_replacement_line(infl: RespondFeedbackInfluence) -> str:
+    if infl.action_ok_wording_off:
+        w = (infl.action_ok_wording_replacement_line or "").strip()
+        if len(w) >= 8:
+            return w
+    w2 = (infl.replacement_inject_line or "").strip()
+    if len(w2) >= 8:
+        return w2
+    return ""
+
+
+def phase46_merge_carryover_feedback_influence(
+    store: DatabaseStore,
+    base: RespondFeedbackInfluence,
+    *,
+    prompt_norm: str,
+    prompt_norm_hash: str,
+    eff_pf: str,
+    situation_carryover: Optional[Dict[str, Any]],
+    carry_strength: float,
+) -> Tuple[RespondFeedbackInfluence, Dict[str, Any]]:
+    """
+    When the current prompt hash has no usable action-ok replacement line, pull
+    wording-off replacement feedback from the active carryover row's hash only
+    under Phase 46 same-thread gates (deterministic, narrow).
+    """
+    info: Dict[str, Any] = {
+        "merge_attempted": False,
+        "merge_applied": False,
+        "merge_block_reason": "",
+        "carryover_row_hash": "",
+    }
+    if _phase46_has_action_ok_replacement_line(base):
+        info["merge_block_reason"] = "current_prompt_has_action_ok_replacement"
+        return base, info
+    if not situation_carryover or not situation_carryover.get("match"):
+        info["merge_block_reason"] = "no_situation_carryover_match"
+        return base, info
+    if carry_strength < float(PHASE46_REPLACEMENT_FEEDBACK_MERGE_STRENGTH_MIN):
+        info["merge_block_reason"] = "carry_strength_below_phase46_merge_min"
+        return base, info
+    match = situation_carryover["match"]
+    row_hash = str(match.get("prompt_norm_hash") or "").strip()
+    info["carryover_row_hash"] = row_hash
+    if not row_hash:
+        info["merge_block_reason"] = "empty_carryover_row_hash"
+        return base, info
+    cur_h = (prompt_norm_hash or "").strip()
+    if row_hash == cur_h:
+        info["merge_block_reason"] = "same_prompt_hash_no_carryover_merge"
+        return base, info
+    info["merge_attempted"] = True
+    row_norm = str(match.get("prompt_norm") or "")
+    row_shape = str(match.get("shape_key") or "")
+    cur_shape = carryover_shape_key(prompt_norm, str(eff_pf or "general"))
+    ok, reason = feedback_replacement_same_thread_gate(
+        prompt_norm,
+        row_norm,
+        cur_h,
+        row_hash,
+        cur_shape,
+        row_shape,
+        match,
+    )
+    if not ok:
+        info["merge_block_reason"] = reason
+        return base, info
+    alt = build_respond_feedback_influence(store, row_hash, str(eff_pf or "general"))
+    if not alt.action_ok_wording_off:
+        info["merge_block_reason"] = "carryover_prompt_no_action_ok_wording_feedback"
+        return base, info
+    rep = (alt.action_ok_wording_replacement_line or "").strip()
+    if len(rep) < 8:
+        info["merge_block_reason"] = "carryover_replacement_text_too_short"
+        return base, info
+    info["merge_applied"] = True
+    new_pref = dict(base.pref_token_weight)
+    seed = float(RESPOND_PHASE46_REPLACEMENT_PREF_TOKEN_SEED)
+    for tok in _tokenize_feedback_phrase(rep):
+        new_pref[tok] = min(0.62, new_pref.get(tok, 0.0) + seed)
+    merged = RespondFeedbackInfluence(
+        pref_token_weight=new_pref,
+        avoidance_demote=max(base.avoidance_demote, alt.avoidance_demote),
+        direct_calm_signal=max(base.direct_calm_signal, alt.direct_calm_signal),
+        wrong_replacement_count=base.wrong_replacement_count,
+        replacement_inject_line=base.replacement_inject_line,
+        replacement_direction_mixed=max(
+            base.replacement_direction_mixed,
+            alt.replacement_direction_mixed,
+        ),
+        action_ok_wording_off=True,
+        action_ok_wording_replacement_line=rep[:400],
+        phase46_merged_carryover_feedback=True,
+    )
+    return merged, info
+
+
+def _phase46_feedback_same_thread_relevant(
+    feedback_influence: RespondFeedbackInfluence,
+    merge_info: Dict[str, Any],
+) -> bool:
+    if merge_info.get("merge_applied"):
+        return True
+    if _phase46_has_action_ok_replacement_line(feedback_influence):
+        return True
+    wr = int(feedback_influence.wrong_replacement_count or 0)
+    inj = (feedback_influence.replacement_inject_line or "").strip()
+    if wr >= 1 and len(inj) >= 8:
+        return True
+    return False
+
+
 def _apply_feedback_influence_to_score(
     s: float,
     *,
@@ -1232,15 +1357,31 @@ def _apply_feedback_replacement_overlay(
     answer_focus: str,
     eff_pf: str,
 ) -> Tuple[str, str]:
-    """Bias final text toward stored replacement lines after repeated wrong + replacement (Phase 40)."""
-    if "conflict" not in (eff_pf or "").lower():
-        return answer, reasoning
+    """
+    Bias final text toward stored replacement lines.
+
+    Phase 40: repeated wrong + replacement on conflict-shaped prompts.
+    Phase 46: action-ok / wording-off replacement applies in one shot for any
+    routed family (not only conflict), using the user-approved line directly.
+    """
+    inj_ao = ""
+    if feedback_influence.action_ok_wording_off:
+        inj_ao = _sanitize_replacement_for_overlay(
+            feedback_influence.action_ok_wording_replacement_line or ""
+        )
     n_wr = int(feedback_influence.wrong_replacement_count or 0)
-    inj = _sanitize_replacement_for_overlay(
+    inj_wr = _sanitize_replacement_for_overlay(
         feedback_influence.replacement_inject_line or ""
     )
-    if n_wr < 2 or len(inj) < 8:
-        return answer, reasoning
+    action_ok_inj = len(inj_ao) >= 8
+    if action_ok_inj:
+        inj = inj_ao
+    else:
+        inj = inj_wr
+        if "conflict" not in (eff_pf or "").lower():
+            return answer, reasoning
+        if n_wr < 2 or len(inj) < 8:
+            return answer, reasoning
     a = (answer or "").strip()
     low = a.lower()
     covered = _answer_covers_injection_tokens(a, inj)
@@ -1248,7 +1389,11 @@ def _apply_feedback_replacement_overlay(
     af = (answer_focus or "both").strip().lower()
     fb_mix = max(0.0, min(1.0, float(feedback_influence.replacement_direction_mixed or 0.0)))
     cautious_fb = fb_mix >= 0.36
-    if not covered and (avoidance_ans or n_wr >= 3):
+    if action_ok_inj and not covered and af == "wording":
+        tail = " Wording pulled from your recent same-thread correction."
+        rs = (reasoning or "").rstrip()
+        return inj, (rs + tail) if rs else tail.strip()
+    if not covered and (avoidance_ans or n_wr >= 3 or action_ok_inj):
         if af == "both":
             if cautious_fb:
                 act_opts = (
@@ -1263,7 +1408,11 @@ def _apply_feedback_replacement_overlay(
                     "I'd step in calmer but clearer — closer to what I've been asking for on this kind of prompt.",
                     "I'd handle it more directly after the corrections I've stacked on this one.",
                 )
-                tail = " Recent feedback nudged the say-line that way."
+                tail = (
+                    " Recent feedback nudged the say-line that way."
+                    if not action_ok_inj
+                    else " Same-thread wording correction applied."
+                )
             act_line = act_opts[
                 _stable_index(f"{phrase_seed}:fbinj_both_act", len(act_opts))
             ]
@@ -1287,7 +1436,11 @@ def _apply_feedback_replacement_overlay(
                 f"I'd land here after the corrections I've given on this: {inj}",
                 f"I'm pushing toward something closer to: {inj}",
             )
-            tail = " Recent feedback on this prompt nudges the line that way."
+            tail = (
+                " Recent feedback on this prompt nudges the line that way."
+                if not action_ok_inj
+                else " Same-thread wording correction applied."
+            )
         new_a = pool[_stable_index(f"{phrase_seed}:fbinj", len(pool))]
         rs = (reasoning or "").rstrip()
         return new_a, (rs + tail) if rs else tail.strip()
@@ -2859,6 +3012,17 @@ def generate_personal_response(
     feedback_influence = build_respond_feedback_influence(
         store, prompt_norm_hash, str(eff_pf or "general")
     )
+    feedback_influence, phase46_feedback_merge_info = (
+        phase46_merge_carryover_feedback_influence(
+            store,
+            feedback_influence,
+            prompt_norm=prompt_norm,
+            prompt_norm_hash=prompt_norm_hash,
+            eff_pf=str(eff_pf or "general"),
+            situation_carryover=situation_carryover,
+            carry_strength=carry_strength,
+        )
+    )
     ex_route_hints: List[str] = ["strong_decision", "medium_decision"]
     if strict_shape and eff_pf == CONFLICT_FAMILY:
         ex_route_hints.append("strict_conflict_fallback")
@@ -3511,6 +3675,7 @@ def generate_personal_response(
             answer_focus=answer_focus,
         )
 
+    answer_pre_feedback_overlay = (answer or "").strip()
     answer, reasoning = _apply_feedback_replacement_overlay(
         answer,
         reasoning,
@@ -3533,6 +3698,34 @@ def generate_personal_response(
         example_influence=example_influence,
         answer_focus=answer_focus,
         phrase_seed=phrase_seed,
+    )
+    # Phase 46: promoted examples run after Phase 40 wrong+replacement overlay;
+    # re-apply action-ok wording replacement so user-approved lines win examples.
+    answer_pre_phase46_example_win = (answer or "").strip()
+    if _phase46_has_action_ok_replacement_line(feedback_influence):
+        answer, reasoning = _apply_feedback_replacement_overlay(
+            answer,
+            reasoning,
+            feedback_influence=feedback_influence,
+            phrase_seed=phrase_seed + ":p46ex",
+            answer_focus=answer_focus,
+            eff_pf=str(eff_pf or "general"),
+        )
+    phase46_rep_line = _phase46_resolved_replacement_line(feedback_influence)
+    phase46_overlay_demoted = bool(
+        phase46_rep_line
+        and answer_pre_feedback_overlay
+        and answer.strip() != answer_pre_feedback_overlay
+        and not _answer_covers_injection_tokens(
+            answer_pre_feedback_overlay, phase46_rep_line
+        )
+    ) or bool(
+        phase46_rep_line
+        and answer_pre_phase46_example_win
+        and answer.strip() != answer_pre_phase46_example_win
+        and not _answer_covers_injection_tokens(
+            answer_pre_phase46_example_win, phase46_rep_line
+        )
     )
     if used_example_overlay:
         rks = tuple(list(evidence_path.route_keys) + ["example_memory_overlay"])
@@ -3572,6 +3765,7 @@ def generate_personal_response(
     answer = _phase41_style_realism_pass(answer, answer_focus=answer_focus)
 
     _carry_used_replacement_stance = False
+    answer_pre_carryover_replace = (answer or "").strip()
     if (
         situation_carryover
         and carry_strength >= float(RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN)
@@ -3586,15 +3780,35 @@ def generate_personal_response(
         )
         if _ch and len(_cs) >= 12:
             _cfb = build_respond_feedback_influence(store, _ch, _cfam)
-            if (
-                _cfb.action_ok_wording_off
-                and len(
-                    (_cfb.action_ok_wording_replacement_line or "").strip()
+            _rep_line = (_cfb.action_ok_wording_replacement_line or "").strip()
+            if _cfb.action_ok_wording_off and len(_rep_line) >= 8:
+                row_shape = str(_cm.get("shape_key") or "")
+                cur_shape = carryover_shape_key(
+                    prompt_norm, str(eff_pf or "general")
                 )
-                >= 8
-            ):
-                answer = _cs
-                _carry_used_replacement_stance = True
+                _gate_ok, _ = feedback_replacement_same_thread_gate(
+                    prompt_norm,
+                    str(_cm.get("prompt_norm") or ""),
+                    prompt_norm_hash,
+                    _ch,
+                    cur_shape,
+                    row_shape,
+                    _cm,
+                )
+                if _gate_ok:
+                    # Prefer explicit DB replacement text over stance snippet when the
+                    # short-term row did not get rewritten for that hash.
+                    answer = _rep_line
+                    _carry_used_replacement_stance = True
+
+    phase46_carryover_demoted = bool(
+        phase46_rep_line
+        and answer_pre_carryover_replace
+        and (answer or "").strip() != answer_pre_carryover_replace
+        and not _answer_covers_injection_tokens(
+            answer_pre_carryover_replace, phase46_rep_line
+        )
+    )
 
     continuity_note = ""
     reasoning_line_audit = _respond_carryover_reasoning_line_audit(
@@ -3716,7 +3930,28 @@ def generate_personal_response(
         mid = ""
         if situation_carryover and situation_carryover.get("match"):
             mid = str(situation_carryover["match"].get("id") or "")
-            
+        p46_rep_dbg = _phase46_resolved_replacement_line(feedback_influence)
+        p46_same_thr = _phase46_feedback_same_thread_relevant(
+            feedback_influence, phase46_feedback_merge_info
+        )
+        fa_dbg = (answer or "").strip().lower()
+        p46_sel_dbg = bool(
+            p46_rep_dbg
+            and (
+                p46_rep_dbg.lower() in fa_dbg
+                or _answer_covers_injection_tokens(answer or "", p46_rep_dbg)
+            )
+        )
+        if p46_rep_dbg:
+            if p46_sel_dbg:
+                p46_block_dbg = ""
+            elif not p46_same_thr:
+                p46_block_dbg = "replacement_not_same_thread_relevant"
+            else:
+                p46_block_dbg = "surface_missing_replacement_tokens_after_passes"
+        else:
+            p46_block_dbg = "no_user_replacement_line_available"
+
         phase44_carryover_debug = {
                 "prompt_norm_prefix": (prompt_norm or "")[:160],
                 "pick_best_for_ask": ask_diag,
@@ -3772,6 +4007,14 @@ def generate_personal_response(
                 feedback_influence.action_ok_wording_off
             ),
             "surfaced_answer_used_carryover_replacement_stance": _carry_used_replacement_stance,
+            "phase46_feedback_merge": dict(phase46_feedback_merge_info),
+            "feedback_replacement_available": bool(len(p46_rep_dbg) >= 8),
+            "feedback_replacement_same_thread_relevant": p46_same_thr,
+            "feedback_replacement_selected_for_surface": p46_sel_dbg,
+            "feedback_replacement_block_reason": p46_block_dbg,
+            "older_phrasing_demoted_due_to_feedback": bool(
+                phase46_overlay_demoted or phase46_carryover_demoted
+            ),
         }
 
     try:
