@@ -25,6 +25,7 @@ from mirrorcore.decision.memory_relevance import respond_main_decision_passes_sh
 from mirrorcore.decision.routed_clarification import OBLIGATION_OVERLOAD, rank_families
 from mirrorcore.decision.situation_carryover import (
     carryover_shape_key,
+    combined_shape_key,
     pa_issue_carryover_bridge,
 )
 from mirrorcore.persona.respond import (
@@ -32,6 +33,7 @@ from mirrorcore.persona.respond import (
     RespondEvidencePath,
     _phase41_style_realism_pass,
     _respond_carryover_reasoning_line_audit,
+    _evaluate_phase45_conflict_escalation,
     _respond_carryover_suppress_avoidance,
     _respond_repeated_passive_aggressive_escalation_active,
     build_respond_feedback_influence,
@@ -2000,11 +2002,14 @@ class TestPhase44RespondContinuation(unittest.TestCase):
         q = normalize_input(
             "what would i say if this same passive aggressive person keeps doing it"
         )
+        qh = hashlib.sha256(q.encode("utf-8")).hexdigest()
         self.assertFalse(
             _respond_repeated_passive_aggressive_escalation_active(
                 eff_pf="conflict",
                 prompt_norm=q,
+                prompt_norm_hash=qh,
                 situation_carryover=payload,
+                carry_strength=0.55,
             ),
             "spending-shaped row_norm must not PA-align with conflict continuation",
         )
@@ -2144,8 +2149,283 @@ class TestPhase44RespondContinuation(unittest.TestCase):
         self.assertFalse(dbg["family_alignment"]["dropped_by_family_align"])
         self.assertTrue(dbg["suppress_avoidance_demotion"])
         self.assertTrue(dbg["repeated_passive_aggressive_escalation"])
+        self.assertTrue(dbg["phase45_escalation_evaluated"])
+        self.assertTrue(dbg["phase45_escalation_active"])
+        self.assertEqual(
+            dbg["phase45_escalation_subtype"],
+            "passive_aggressive_repeat",
+        )
+        self.assertEqual(dbg["phase45_escalation_reject_reasons"], [])
+        self.assertTrue(dbg["phase45_demote_avoidance_due_to_escalation"])
+        self.assertTrue(dbg["phase45_boost_direct_boundary_retrieval"])
         low = pr.likely_answer.lower()
         self.assertNotIn("let it go", low, msg=pr.likely_answer)
+
+    def test_phase45_boundary_push_obligation_routes_escalation(self):
+        """Regression B: same-coworker boundary persistence routes obligation; escalation fires."""
+        self.db.record_decision_memory(
+            scenario_id="ob_push_avoid",
+            scenario_text="coworker asking to cover shifts after you said no let it slide",
+            choice_label="Just let it go",
+            choice_value="a",
+            reasoning_label="Not worth the drama",
+            reasoning_value="b",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.96,
+            correction_status="accurate",
+        )
+        self.db.record_decision_memory(
+            scenario_id="ob_push_direct",
+            scenario_text="coworker keeps asking after no hold boundary firm",
+            choice_label="Hold the line clearly",
+            choice_value="d",
+            reasoning_label="Restate your no calmly",
+            reasoning_value="s",
+            value_tags=["directness"],
+            trait_signals={},
+            confidence_score=0.85,
+            correction_status="accurate",
+        )
+        prev = normalize_input(
+            "what would i say when my coworker keeps asking me to cover shifts after i said no"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet="say you cannot cover and keep it short",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        q2 = "same coworker is still pushing after i already said no what would i say"
+        pr = generate_personal_response(q2, self.db, debug_phase44_carryover=True)
+        dbg = pr.phase44_carryover_debug
+        self.assertEqual(pr.effective_family, OBLIGATION_OVERLOAD)
+        self.assertTrue(dbg["phase45_escalation_evaluated"])
+        self.assertTrue(dbg["phase45_escalation_active"], msg=f"dbg={dbg!r}")
+        self.assertEqual(dbg["phase45_escalation_subtype"], "boundary_push_repeat")
+        low = pr.likely_answer.lower()
+        self.assertNotIn("let it go", low, msg=pr.likely_answer)
+        self.assertTrue(
+            any(
+                x in low
+                for x in (
+                    "no",
+                    "boundary",
+                    "line",
+                    "direct",
+                    "clear",
+                    "say",
+                    "hold",
+                    "stop",
+                )
+            ),
+            msg=pr.likely_answer,
+        )
+
+    def test_phase45_boundary_push_short_prompt_single_coherent_paragraph(self):
+        """
+        Acceptance-style prompt (answer_focus=both): no duplicate action + out-loud layers.
+        """
+        self.db.record_decision_memory(
+            scenario_id="ob_push_avoid3",
+            scenario_text="coworker asking to cover shifts after you said no let it slide",
+            choice_label="Just let it go",
+            choice_value="a",
+            reasoning_label="Not worth the drama",
+            reasoning_value="b",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.96,
+            correction_status="accurate",
+        )
+        self.db.record_decision_memory(
+            scenario_id="ob_push_direct3",
+            scenario_text="coworker keeps asking after no hold boundary firm",
+            choice_label="Say no, explain you can't right now",
+            choice_value="d",
+            reasoning_label="I was already overloaded",
+            reasoning_value="s",
+            value_tags=["directness"],
+            trait_signals={},
+            confidence_score=0.85,
+            correction_status="accurate",
+        )
+        prev = normalize_input(
+            "what would i say when my coworker keeps asking me to cover shifts after i said no"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet="say you cannot cover and keep it short",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        q_short = "same coworker is still pushing after i already said no"
+        self.assertEqual(classify_answer_focus(normalize_input(q_short)), "both")
+        pr = generate_personal_response(q_short, self.db, debug_phase44_carryover=True)
+        dbg = pr.phase44_carryover_debug
+        self.assertTrue(dbg["phase45_escalation_active"], msg=f"dbg={dbg!r}")
+        self.assertEqual(dbg["phase45_escalation_subtype"], "boundary_push_repeat")
+        low = pr.likely_answer.lower()
+        self.assertLessEqual(
+            low.count("mostly because"),
+            1,
+            msg=pr.likely_answer,
+        )
+        self.assertNotIn("if i said it out loud", low, msg=pr.likely_answer)
+        self.assertNotIn("\n", (pr.likely_answer or "").strip(), msg=pr.likely_answer)
+        self.assertTrue(
+            any(
+                x in low
+                for x in (
+                    "no",
+                    "boundary",
+                    "line",
+                    "hold",
+                    "say",
+                )
+            ),
+            msg=pr.likely_answer,
+        )
+        ta = (pr.likely_answer or "").strip()
+        if '"' in ta:
+            lastq = ta.rindex('"')
+            rest = ta[lastq + 1 :].strip()
+            if rest.startswith("."):
+                rest = rest[1:].strip()
+            self.assertEqual(
+                rest,
+                "",
+                msg=f"unexpected text after spoken quote (rationale leak): {ta!r}",
+            )
+        self.assertIn("already overloaded", low, msg=pr.likely_answer)
+
+    def test_phase45_insufficient_evidence_carryover_row_does_not_dominate(self):
+        """
+        Regression: a prior respond-like-me insufficient-evidence row (same prompt hash)
+        must not beat a real thread carryover row or force generic answer text.
+        """
+        self.db.record_decision_memory(
+            scenario_id="ob_push_avoid2",
+            scenario_text="coworker asking to cover shifts after you said no let it slide",
+            choice_label="Just let it go",
+            choice_value="a",
+            reasoning_label="Not worth the drama",
+            reasoning_value="b",
+            value_tags=["patience"],
+            trait_signals={},
+            confidence_score=0.96,
+            correction_status="accurate",
+        )
+        self.db.record_decision_memory(
+            scenario_id="ob_push_direct2",
+            scenario_text="coworker keeps asking after no hold boundary firm",
+            choice_label="Hold the line clearly",
+            choice_value="d",
+            reasoning_label="Restate your no calmly",
+            reasoning_value="s",
+            value_tags=["directness"],
+            trait_signals={},
+            confidence_score=0.85,
+            correction_status="accurate",
+        )
+        prev = normalize_input(
+            "what would i say when my coworker keeps asking me to cover shifts after i said no"
+        )
+        ph_prev = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph_prev,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet="say you cannot cover and keep it short",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        q2 = "same coworker is still pushing after i already said no what would i say"
+        q2_norm = normalize_input(q2)
+        ph_q2 = hashlib.sha256(q2_norm.encode("utf-8")).hexdigest()
+        sk_bad = combined_shape_key(
+            q2_norm,
+            OBLIGATION_OVERLOAD,
+            {"route_keys": ["insufficient_evidence"], "clarif_slot_keys": []},
+        )
+        self.db.record_short_term_situation(
+            prompt_norm=q2_norm,
+            prompt_norm_hash=ph_q2,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=sk_bad,
+            stance_snippet=(
+                "I don't have enough saved decisions or style picks to say what you'd probably do here."
+            ),
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        pr = generate_personal_response(q2, self.db, debug_phase44_carryover=True)
+        dbg = pr.phase44_carryover_debug
+        low = pr.likely_answer.lower()
+        self.assertNotIn(
+            "don't have enough saved decisions",
+            low,
+            msg=pr.likely_answer,
+        )
+        self.assertTrue(dbg["phase45_escalation_active"], msg=f"dbg={dbg!r}")
+        pick = dbg["pick_best_for_ask"]
+        bad_hints = [
+            c
+            for c in pick["candidates"]
+            if "insufficient_evidence" in (c.get("stored_shape_key") or "")
+        ]
+        self.assertTrue(
+            any(
+                "excluded_low_information_route:insufficient_evidence"
+                in c.get("zero_score_hints", [])
+                for c in bad_hints
+            ),
+            msg=f"expected exclusion hint on fallback row, got {bad_hints!r}",
+        )
+        self.assertNotEqual(
+            pick.get("best_row_id"),
+            "",
+            msg="expected a non-fallback carryover pick",
+        )
+
+    def test_phase45_same_tone_different_issue_no_escalation(self):
+        """Regression C: new interpersonal annoyance is not the same escalated thread."""
+        prev = normalize_input(
+            "what would i say if someone is being passive aggressive at work"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family="conflict",
+            shape_key=carryover_shape_key(prev, "conflict"),
+            stance_snippet="address it directly calmly",
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        q2 = (
+            "what would i say if my roommate keeps leaving dishes everywhere "
+            "and it is getting under my skin"
+        )
+        pr = generate_personal_response(q2, self.db, debug_phase44_carryover=True)
+        dbg = pr.phase44_carryover_debug
+        self.assertFalse(dbg["phase45_escalation_active"], msg=f"dbg={dbg!r}")
+        reasons = dbg.get("phase45_escalation_reject_reasons") or []
+        self.assertTrue(
+            ("no_situation_carryover_match" in reasons)
+            or ("escalation_thread_alignment_failed" in reasons)
+            or ("not_escalation_eligible_family" in reasons),
+            msg=f"expected explicit reject path, got {reasons!r}",
+        )
 
     def test_phase44_respond_unit_soft_band_suppress_and_audit(self):
         """Regression: ~0.34 strength + PA bridge must pass respond gates (not 0.52/0.50 walls)."""
@@ -2297,6 +2577,8 @@ class TestPhase44RespondContinuation(unittest.TestCase):
             dbg["reasoning_line_audit"]["blocked_by"],
             "no_situation_carryover_match",
         )
+        self.assertFalse(dbg["phase45_escalation_evaluated"])
+        self.assertFalse(dbg["phase45_escalation_active"])
 
     def test_obligation_coworker_respond_like_me_continuation_keeps_carryover_line(self):
         prev = normalize_input(
@@ -2327,6 +2609,52 @@ class TestPhase44RespondContinuation(unittest.TestCase):
                 )
             ),
             msg=pr.reasoning_brief,
+        )
+
+    def test_surfaced_answer_uses_carryover_replacement_stance_after_wording_off(self):
+        """After wording-off feedback replaces the carryover stance, the next
+        respond-like-me on the same thread should surface that replacement
+        snippet — not the original stitched answer."""
+        prev = normalize_input(
+            "what would i say coworker keeps asking me to cover shifts after i said no"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        replacement = "I already told you no. I can't take that on right now."
+        awkward = (
+            "I was already overloaded. I'd hold the line on what I already said."
+        )
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet=awkward,
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        self.db.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text=replacement,
+            confidence_shown=0.55,
+            effective_family=OBLIGATION_OVERLOAD,
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet=awkward[:200],
+            feedback_target="wording",
+        )
+        q2 = "same coworker is still pushing after i already said no"
+        pr = generate_personal_response(
+            q2, self.db, debug_phase44_carryover=True
+        )
+        la = (pr.likely_answer or "").strip()
+        self.assertIn("already told you no", la.lower())
+        self.assertNotIn("already overloaded", la.lower())
+        dbg = pr.phase44_carryover_debug
+        self.assertIsNotNone(dbg)
+        self.assertTrue(
+            dbg["surfaced_answer_used_carryover_replacement_stance"]
         )
 
     def test_spending_realism_pass_no_mixed_pronouns_on_needs_clause(self):

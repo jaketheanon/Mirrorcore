@@ -11,13 +11,21 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from mirrorcore.db.store import DatabaseStore
 from mirrorcore.decision.routed_clarification import pick_next_question
+from mirrorcore.persona.respond import build_respond_feedback_influence
 from mirrorcore.decision.situation_carryover import (
+    boundary_carryover_aligned,
+    carryover_safe_stance_fallback,
     carryover_shape_key,
     carryover_slots_prefix,
+    combined_shape_key,
+    conflict_escalation_carryover_thread_ok,
     continuation_strength,
+    diagnose_ask_carryover_candidates,
+    low_information_carryover_row_exclusion_reason,
     pick_best_carryover,
     pick_best_carryover_for_ask,
     reference_continuation_cues,
+    respond_route_keys_skip_short_term_situation_record,
     significant_tokens,
 )
 from mirrorcore.decision.ontology import GENERAL, OBLIGATION_OVERLOAD
@@ -166,6 +174,47 @@ class TestSituationCarryover(unittest.TestCase):
         if p.exists():
             p.unlink()
 
+    def test_store_low_information_insert_does_not_supersede_prior_thread_row(self):
+        """Fallback respond shape must not mark a real unresolved row superseded."""
+        p = Path(__file__).parent / "_tmp_phase45_lowinfo.db"
+        if p.exists():
+            p.unlink()
+        store = DatabaseStore(p)
+        store.initialize_database()
+        prev_norm = normalize_input(
+            "what would i say when my coworker keeps asking me to cover shifts after i said no"
+        )
+        cur_norm = normalize_input(
+            "same coworker is still pushing after i already said no what would i say"
+        )
+        store.record_short_term_situation(
+            prompt_norm=prev_norm,
+            prompt_norm_hash="h_prev",
+            effective_family="obligation_overload",
+            shape_key=carryover_shape_key(prev_norm, "obligation_overload"),
+            stance_snippet="say you cannot cover",
+            source="respond_like_me",
+        )
+        sk_bad = combined_shape_key(
+            cur_norm,
+            "obligation_overload",
+            {"route_keys": ["insufficient_evidence"], "clarif_slot_keys": []},
+        )
+        store.record_short_term_situation(
+            prompt_norm=cur_norm,
+            prompt_norm_hash="h_cur",
+            effective_family="obligation_overload",
+            shape_key=sk_bad,
+            stance_snippet="I don't have enough saved decisions",
+            source="respond_like_me",
+        )
+        rows = store.list_recent_short_term_situations()
+        by_stance = {r["stance_snippet"][:24]: r["state"] for r in rows}
+        self.assertEqual(by_stance.get("say you cannot cover"), "unresolved")
+        store.close()
+        if p.exists():
+            p.unlink()
+
     def test_pick_next_question_deprioritizes_prior_slots(self):
         slot = pick_next_question(
             context_parts=["colleague asked me to cover a shift tomorrow im drained"],
@@ -261,6 +310,263 @@ class TestSituationCarryover(unittest.TestCase):
         self.assertGreaterEqual(strength, 0.38)
         self.assertEqual(fam, "conflict")
         self.assertEqual(best["id"], "direct")
+
+    def test_boundary_carryover_aligned_same_coworker_push_thread(self):
+        prev = normalize_input(
+            "what would i say when my coworker keeps asking me to cover shifts after i said no"
+        )
+        cur = normalize_input(
+            "same coworker is still pushing after i already said no what would i say"
+        )
+        self.assertTrue(boundary_carryover_aligned(cur, prev))
+
+    def test_boundary_carryover_aligned_false_without_explicit_continuation(self):
+        prev = normalize_input(
+            "what would i say when my coworker keeps asking me to cover shifts after i said no"
+        )
+        cur = normalize_input(
+            "my coworker is pushing me to cover shifts what would i say"
+        )
+        self.assertFalse(boundary_carryover_aligned(cur, prev))
+
+    def test_conflict_escalation_thread_ok_false_across_unrelated_domains(self):
+        prev = normalize_input("should i buy a laptop when rent is late")
+        cur = normalize_input(
+            "what would i say if this same passive aggressive person keeps doing it"
+        )
+        self.assertFalse(
+            conflict_escalation_carryover_thread_ok(cur, prev, "h1", "h2")
+        )
+
+    def test_continuation_strength_zero_for_insufficient_evidence_shape(self):
+        now = datetime(2026, 4, 3, 10, 0, 0)
+        q = normalize_input(
+            "same coworker is still pushing after i already said no what would i say"
+        )
+        h = hashlib.sha256(q.encode("utf-8")).hexdigest()
+        sk_bad = combined_shape_key(
+            q,
+            "obligation_overload",
+            {"route_keys": ["insufficient_evidence"], "clarif_slot_keys": []},
+        )
+        row = {
+            "state": "unresolved",
+            "updated_at": now.isoformat(),
+            "effective_family": "obligation_overload",
+            "prompt_norm": q,
+            "prompt_norm_hash": h,
+            "shape_key": sk_bad,
+            "stance_snippet": (
+                "I don't have enough saved decisions or style picks to say what you'd probably do here."
+            ),
+        }
+        self.assertEqual(
+            low_information_carryover_row_exclusion_reason(row),
+            "excluded_low_information_route:insufficient_evidence",
+        )
+        s = continuation_strength(
+            q,
+            h,
+            "obligation_overload",
+            carryover_shape_key(q, "obligation_overload"),
+            row,
+            now=now,
+        )
+        self.assertEqual(s, 0.0)
+
+    def test_pick_best_carryover_prefers_useful_row_over_same_hash_fallback(self):
+        """Same-hash insufficient-evidence row must not beat a real thread row."""
+        now = datetime(2026, 4, 3, 11, 0, 0)
+        q = normalize_input(
+            "same coworker is still pushing after i already said no what would i say"
+        )
+        h = hashlib.sha256(q.encode("utf-8")).hexdigest()
+        prev = normalize_input(
+            "what would i say when my coworker keeps asking me to cover shifts after i said no"
+        )
+        sk_bad = combined_shape_key(
+            q,
+            "obligation_overload",
+            {"route_keys": ["insufficient_evidence"], "clarif_slot_keys": []},
+        )
+        row_bad = {
+            "id": "bad",
+            "state": "unresolved",
+            "updated_at": now.isoformat(),
+            "effective_family": "obligation_overload",
+            "prompt_norm": q,
+            "prompt_norm_hash": h,
+            "shape_key": sk_bad,
+            "stance_snippet": "I don't have enough saved decisions",
+        }
+        row_good = {
+            "id": "good",
+            "state": "unresolved",
+            "updated_at": now.isoformat(),
+            "effective_family": "obligation_overload",
+            "prompt_norm": prev,
+            "prompt_norm_hash": "otherhash",
+            "shape_key": carryover_shape_key(prev, "obligation_overload"),
+            "stance_snippet": "say you cannot cover and keep it short",
+        }
+        best, strength = pick_best_carryover(
+            q,
+            h,
+            "obligation_overload",
+            carryover_shape_key(q, "obligation_overload"),
+            [row_bad, row_good],
+            now=now,
+        )
+        self.assertIsNotNone(best)
+        self.assertEqual(best["id"], "good")
+        self.assertGreater(strength, 0.25)
+
+    def test_diagnose_carryover_marks_excluded_fallback_row(self):
+        now = datetime(2026, 4, 3, 12, 0, 0)
+        q = normalize_input("same coworker is still pushing after i already said no")
+        h = hashlib.sha256(q.encode("utf-8")).hexdigest()
+        sk_bad = combined_shape_key(
+            q,
+            "obligation_overload",
+            {"route_keys": ["insufficient_evidence"], "clarif_slot_keys": []},
+        )
+        row_bad = {
+            "id": "x1",
+            "state": "unresolved",
+            "updated_at": now.isoformat(),
+            "effective_family": "obligation_overload",
+            "prompt_norm": q,
+            "prompt_norm_hash": h,
+            "shape_key": sk_bad,
+            "stance_snippet": "generic",
+        }
+        diag = diagnose_ask_carryover_candidates(q, h, [row_bad], now=now)
+        c0 = diag["candidates"][0]
+        self.assertIn("excluded_low_information_route:insufficient_evidence", c0["zero_score_hints"])
+        self.assertFalse(diag["any_candidate_meets_threshold"])
+
+    def test_respond_skip_short_term_record_reason_for_insufficient_evidence(self):
+        r = respond_route_keys_skip_short_term_situation_record(
+            ("insufficient_evidence",)
+        )
+        self.assertEqual(r, "skip_short_term_record_low_information_route:insufficient_evidence")
+        self.assertIsNone(
+            respond_route_keys_skip_short_term_situation_record(("strong_decision",))
+        )
+
+    def test_carryover_safe_stance_fallback_avoids_hold_the_line_phrasing(self):
+        pn = normalize_input(
+            "same coworker is still pushing after i already said no what would i say"
+        )
+        s = carryover_safe_stance_fallback(pn, "obligation_overload").lower()
+        self.assertNotIn("hold the line", s)
+        self.assertIn("no", s)
+
+    def test_action_ok_word_bad_feedback_rewrites_short_term_stance_snippet(self):
+        p = Path(__file__).parent / "_tmp_phase45_wordoff.db"
+        if p.exists():
+            p.unlink()
+        store = DatabaseStore(p)
+        store.initialize_database()
+        prev = normalize_input(
+            "what would i say coworker keeps asking me to cover shifts after i said no"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        awkward = (
+            "I was already overloaded. I'd hold the line on what I already said."
+        )
+        store.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family="obligation_overload",
+            shape_key=carryover_shape_key(prev, "obligation_overload"),
+            stance_snippet=awkward,
+            source="respond_like_me",
+        )
+        store.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text="No, I can't cover that shift.",
+            confidence_shown=0.55,
+            effective_family="obligation_overload",
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet=awkward[:200],
+            feedback_target="wording",
+        )
+        rows = store.list_recent_short_term_situations()
+        hit = [r for r in rows if r.get("prompt_norm_hash") == ph]
+        self.assertEqual(len(hit), 1)
+        st = (hit[0].get("stance_snippet") or "").lower()
+        self.assertNotIn("already overloaded", st)
+        self.assertNotIn("hold the line", st)
+        self.assertIn("can't cover", st)
+        infl = build_respond_feedback_influence(store, ph, "obligation_overload")
+        self.assertTrue(infl.action_ok_wording_off)
+        self.assertIn(
+            "can't cover",
+            (infl.action_ok_wording_replacement_line or "").lower(),
+        )
+        store.close()
+        if p.exists():
+            p.unlink()
+
+    def test_continuation_pick_uses_clean_stance_after_word_off_rewrite(self):
+        """Repeated-boundary follow-up must not top-rank awkward prior surface wording."""
+        p = Path(__file__).parent / "_tmp_phase45_wordoff2.db"
+        if p.exists():
+            p.unlink()
+        store = DatabaseStore(p)
+        store.initialize_database()
+        prev = normalize_input(
+            "what would i say coworker keeps asking me to cover shifts after i said no"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        awkward = (
+            "I was already overloaded. I'd hold the line on what I already said."
+        )
+        store.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family="obligation_overload",
+            shape_key=carryover_shape_key(prev, "obligation_overload"),
+            stance_snippet=awkward,
+            source="respond_like_me",
+        )
+        store.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text="",
+            confidence_shown=0.55,
+            effective_family="obligation_overload",
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet=awkward[:200],
+            feedback_target="wording",
+        )
+        q = normalize_input(
+            "same coworker is still pushing after i already said no what would i say"
+        )
+        qh = hashlib.sha256(q.encode("utf-8")).hexdigest()
+        rows = store.list_recent_short_term_situations()
+        best, strength = pick_best_carryover(
+            q,
+            qh,
+            "obligation_overload",
+            carryover_shape_key(q, "obligation_overload"),
+            rows,
+        )
+        self.assertIsNotNone(best)
+        self.assertGreater(strength, 0.25)
+        st = (best.get("stance_snippet") or "").lower()
+        self.assertNotIn("already overloaded", st)
+        self.assertNotIn("hold the line", st)
+        self.assertIn("same clear no", st)
+        store.close()
+        if p.exists():
+            p.unlink()
 
 
 if __name__ == "__main__":

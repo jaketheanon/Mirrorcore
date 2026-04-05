@@ -9,8 +9,44 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
-from .ontology import GENERAL, slot_ids_covered_by_context
+from .ontology import GENERAL, interpersonal_conflict_markers_present, slot_ids_covered_by_context
+
+# Respond paths whose stored stance is generic / not a useful continuity anchor (Phase 45).
+LOW_INFORMATION_CARRYOVER_ROUTES: FrozenSet[str] = frozenset(
+    {
+        "insufficient_evidence",
+        "weak_profile_signal",
+        "profile_pattern_fallback",
+        "profile_pattern_fallback_suppressed",
+        "family_misalign",
+        "family_misalign_ungated",
+        "strict_shape_miss",
+    }
+)
+
+# When ``shape_key`` has no ``|r:...`` tail (e.g. ask-recorded rows), match only these
+# stance prefixes so real ask/clarification rows are not dropped.
+_LOW_INFORMATION_STANCE_PREFIXES: Tuple[str, ...] = (
+    "i don't have enough saved decisions",
+    "nothing on file fits this question tightly",
+    "no tight save for this question.",
+    "no tight save for this question ",
+    "nothing in your saved decisions is the same shape",
+    "i don't have a labeled save that really matches",
+    "the labeled saves on file aren't really the same kind",
+    "nothing in your saved decisions matches this shape cleanly",
+)
 from ..router import normalize_input
+
+# --- Phase 44/45: named thresholds (continuation scoring + carryover pick) ---
+CARRYOVER_PICK_BEST_THRESHOLD = 0.25
+CONTINUATION_STRENGTH_MAX_ROW_AGE_HOURS = 72.0
+CONTINUATION_RECENCY_DECAY_REF_HOURS = 90.0
+JACCARD_REF_GATE_MIN = 0.17
+JACCARD_HARD_MIN = 0.24
+JACCARD_INTER_SOFT_MIN = 0.34
+INTER_MIN_FOR_REF_GATE = 2
+INTER_STRICT_WITHOUT_REF = 3
 
 STOPWORDS = frozenset(
     {
@@ -282,6 +318,176 @@ def pa_carryover_aligned(cur_norm: str, row_norm: str) -> bool:
     )
 
 
+_PERSISTENCE_AFTER_DECLINED_NEEDLES: Tuple[str, ...] = (
+    "already said no",
+    "said no already",
+    "after i said no",
+    "after i told them no",
+    "i already said no",
+    "i already told them no",
+    "told them no",
+    "already told them no",
+    "they wont take no",
+    "they won't take no",
+)
+
+_SAME_PERSON_THREAD_NEEDLES: Tuple[str, ...] = (
+    "same coworker",
+    "same colleague",
+    "same person",
+    "same guy",
+    "same girl",
+    "same boss",
+    "same teammate",
+    "this same coworker",
+    "this same person",
+)
+
+
+def persistence_after_declined_shaped(norm: str) -> bool:
+    """Prior refusal + ongoing pushback phrasing (deterministic)."""
+    low = (norm or "").lower()
+    return any(n in low for n in _PERSISTENCE_AFTER_DECLINED_NEEDLES)
+
+
+def still_persisting_wording(norm: str) -> bool:
+    """Recurrence / ongoing pressure wording (narrow — not generic \"still upset\")."""
+    low = (norm or "").lower()
+    return any(
+        x in low
+        for x in (
+            "still pushing",
+            "still asking",
+            "still trying",
+            "keeps asking",
+            "keeps pushing",
+            "keep asking",
+            "keep pushing",
+            " again ",
+            " again.",
+            "ongoing",
+            "every time",
+            "repeatedly",
+            " keeps ",
+            " keep doing",
+            " keeps doing",
+        )
+    )
+
+
+def _row_conflict_social_thread(norm: str) -> bool:
+    """Stored row looks like an interpersonal work/social thread, not a lone abstract ask."""
+    low = (norm or "").lower()
+    if not any(
+        w in low
+        for w in (
+            "coworker",
+            "colleague",
+            "boss",
+            "teammate",
+            "person",
+            "someone",
+            "they",
+        )
+    ):
+        return False
+    return any(
+        w in low
+        for w in (
+            "work",
+            "office",
+            "push",
+            "ask",
+            "shift",
+            "cover",
+            "no",
+            "boundary",
+            "say",
+            "passive",
+            "rude",
+            "tension",
+            "snide",
+            "keep",
+            "still",
+        )
+    )
+
+
+def boundary_carryover_aligned(cur_norm: str, row_norm: str) -> bool:
+    """
+    Phase 45: same-thread boundary / persistence continuation (not tone-only match).
+
+    Requires explicit continuation phrasing, token overlap, boundary/persistence cues on
+    the current prompt, and a row that still looks like the same social thread.
+    """
+    if not reference_continuation_cues(cur_norm):
+        return False
+    inter = len(significant_tokens(cur_norm) & significant_tokens(row_norm))
+    if inter < INTER_MIN_FOR_REF_GATE:
+        return False
+    if not _row_conflict_social_thread(row_norm):
+        return False
+    from ..decision.memory_relevance import conflict_situational_cues
+
+    cc = conflict_situational_cues(cur_norm)
+    if not (
+        cc.get("boundary_push")
+        or persistence_after_declined_shaped(cur_norm)
+        or still_persisting_wording(cur_norm)
+    ):
+        return False
+    return True
+
+
+def same_person_conflict_thread_carryover_aligned(cur_norm: str, row_norm: str) -> bool:
+    """
+    Phase 45: same identifiable person/thread + conflict markers on both sides.
+
+    Stricter than loose token overlap: needs explicit same-person reference on the
+    current prompt and interpersonal-conflict markers on both prompts.
+    """
+    if not reference_continuation_cues(cur_norm):
+        return False
+    low = (cur_norm or "").lower()
+    if not any(n in low for n in _SAME_PERSON_THREAD_NEEDLES):
+        return False
+    inter = len(significant_tokens(cur_norm) & significant_tokens(row_norm))
+    if inter < INTER_STRICT_WITHOUT_REF:
+        return False
+    if not interpersonal_conflict_markers_present(cur_norm):
+        return False
+    if not interpersonal_conflict_markers_present(row_norm):
+        return False
+    if not _row_conflict_social_thread(row_norm):
+        return False
+    return True
+
+
+def conflict_escalation_carryover_thread_ok(
+    cur_norm: str,
+    row_norm: str,
+    cur_hash: str,
+    row_hash: str,
+) -> bool:
+    """
+    Phase 45 gate: escalation may only consider rows that pass a same-thread test.
+
+    Blocks \"same tense vibe, different issue\" carryover from triggering escalation
+    when continuation phrasing or PA/boundary/same-person alignment is missing.
+    """
+    ch = (cur_hash or "").strip()
+    rh = (row_hash or "").strip()
+    if ch and rh and ch == rh and reference_continuation_cues(cur_norm):
+        return True
+    if pa_carryover_aligned(cur_norm, row_norm):
+        return True
+    if boundary_carryover_aligned(cur_norm, row_norm):
+        return True
+    if same_person_conflict_thread_carryover_aligned(cur_norm, row_norm):
+        return True
+    return False
+
+
 def carryover_shape_key(prompt_norm: str, effective_family: str) -> str:
     """Family + covered clarification slots — same prompt shape for ask and respond."""
     fam = (effective_family or "general").strip().lower() or "general"
@@ -334,6 +540,96 @@ def respond_evidence_shape_key(evidence_dict: Dict[str, Any]) -> str:
     rk = "|".join(routes) if routes else "none"
     sk = "|".join(slots) if slots else "none"
     return f"r:{rk};c:{sk}"
+
+
+def respond_route_tokens_from_shape_key(shape_key: str) -> FrozenSet[str]:
+    """Parse ``r:...`` route segment from a combined respond ``shape_key`` (deterministic)."""
+    s = (shape_key or "").strip().lower()
+    idx = s.find("|r:")
+    if idx < 0:
+        return frozenset()
+    tail = s[idx + len("|r:") :]
+    semi = tail.find(";c:")
+    rpart = tail[:semi] if semi >= 0 else tail
+    rpart = rpart.strip()
+    if not rpart or rpart == "none":
+        return frozenset()
+    return frozenset(x.strip() for x in rpart.split("|") if x.strip())
+
+
+def shape_key_low_information_carryover_exclusion_reason(shape_key: str) -> Optional[str]:
+    """Non-None when ``shape_key`` carries a low-information respond route tail."""
+    rts = respond_route_tokens_from_shape_key(shape_key)
+    hit = sorted(rts & LOW_INFORMATION_CARRYOVER_ROUTES)
+    if hit:
+        return f"excluded_low_information_route:{hit[0]}"
+    return None
+
+
+def low_information_carryover_row_exclusion_reason(row: Dict[str, Any]) -> Optional[str]:
+    """
+    If this short-term row must not anchor carryover, return a stable debug reason.
+
+    Rows from respond-like-me store ``|r:<routes>;c:...``; ask rows omit that tail.
+    """
+    sk = str(row.get("shape_key") or "")
+    sk_excl = shape_key_low_information_carryover_exclusion_reason(sk)
+    if sk_excl:
+        return sk_excl
+    if "|r:" not in sk.lower():
+        st = (str(row.get("stance_snippet") or "")).strip().lower()
+        for pref in _LOW_INFORMATION_STANCE_PREFIXES:
+            if st.startswith(pref):
+                return "excluded_low_information_stance_marker"
+    return None
+
+
+def carryover_safe_stance_fallback(prompt_norm: str, effective_family: str) -> str:
+    """
+    Deterministic stance text for short-term carryover when surfaced answer wording
+    was rejected (action ok, wording off). Avoids recycling awkward stitched lines.
+    """
+    from ..decision.memory_relevance import conflict_situational_cues
+
+    pn = normalize_input(prompt_norm or "")
+    cues = conflict_situational_cues(pn)
+    ef = (effective_family or "general").strip().lower() or "general"
+    if persistence_after_declined_shaped(pn) or still_persisting_wording(pn):
+        return (
+            "Same clear no as before; one short repeat if they press again, "
+            "without adding new excuses."
+        )
+    if cues.get("boundary_push"):
+        return (
+            "Same boundary as before; keep the limit steady if they push again."
+        )
+    if passive_aggressive_friction_shaped(pn):
+        return (
+            "Same direct calm stance as before; name the pattern if it repeats."
+        )
+    if ef == "conflict":
+        return (
+            "Same stance as before; keep direction steady without mirroring "
+            "prior awkward phrasing."
+        )
+    return (
+        "Same direction as before; avoid reusing wording that felt off last time."
+    )
+
+
+def respond_route_keys_skip_short_term_situation_record(
+    route_keys: Sequence[str],
+) -> Optional[str]:
+    """
+    When non-None, respond-like-me should not append a short-term situation row.
+
+    Overlay routes (examples, etc.) still carry the base route in ``route_keys``.
+    """
+    for rk in route_keys:
+        k = str(rk).strip().lower()
+        if k in LOW_INFORMATION_CARRYOVER_ROUTES:
+            return f"skip_short_term_record_low_information_route:{k}"
+    return None
 
 
 def combined_shape_key(
@@ -419,9 +715,11 @@ def continuation_strength(
     st = (row.get("state") or "").strip().lower()
     if st != "unresolved":
         return 0.0
+    if low_information_carryover_row_exclusion_reason(row):
+        return 0.0
     updated = str(row.get("updated_at") or row.get("created_at") or "")
     hours = _hours_old(updated, now)
-    if hours > 72.0:
+    if hours > CONTINUATION_STRENGTH_MAX_ROW_AGE_HOURS:
         return 0.0
     rf = str(row.get("effective_family") or "").strip().lower() or "general"
     cf = str(cur_family or "").strip().lower() or "general"
@@ -447,18 +745,25 @@ def continuation_strength(
         pa_bridge_gate = pa_issue_carryover_bridge(cur_norm, row_norm)
         ref_ok = (
             reference_continuation_cues(cur_norm)
-            and inter >= 2
-            and (jacc >= 0.17 or pa_overlap_gate or pa_bridge_gate)
+            and inter >= INTER_MIN_FOR_REF_GATE
+            and (
+                jacc >= JACCARD_REF_GATE_MIN
+                or pa_overlap_gate
+                or pa_bridge_gate
+            )
         )
-        if inter < 3 and jacc < 0.34:
+        if inter < INTER_STRICT_WITHOUT_REF and jacc < JACCARD_INTER_SOFT_MIN:
             if not ref_ok:
                 return 0.0
-        if jacc < 0.24:
+        if jacc < JACCARD_HARD_MIN:
             if not ref_ok:
                 return 0.0
         base = min(1.0, 0.33 + jacc * 1.18 + min(0.38, inter * 0.045))
-        if ref_ok and inter >= 2:
-            base = min(1.0, base + 0.09 + min(0.12, (inter - 2) * 0.04))
+        if ref_ok and inter >= INTER_MIN_FOR_REF_GATE:
+            base = min(
+                1.0,
+                base + 0.09 + min(0.12, (inter - INTER_MIN_FOR_REF_GATE) * 0.04),
+            )
     stance_early = str(row.get("stance_snippet") or "")
     pn_tokens = significant_tokens(cur_norm)
     pa_align = pa_carryover_aligned(cur_norm, row_norm)
@@ -477,7 +782,7 @@ def continuation_strength(
             and not _stance_snippet_avoidance_leans(stance_early)
         ):
             base = min(1.0, base + 0.13)
-        elif ref_ok and pa_align and inter >= 2:
+        elif ref_ok and pa_align and inter >= INTER_MIN_FOR_REF_GATE:
             base = min(1.0, base + 0.08)
     # Shape: same family is not enough; mismatch weakens unless match was very strong.
     if row_shape and cur_shape and row_shape != cur_shape:
@@ -525,7 +830,7 @@ def pick_best_carryover(
         if s > best_s:
             best_s = s
             best = d
-    if best_s < 0.25:
+    if best_s < CARRYOVER_PICK_BEST_THRESHOLD:
         return None, 0.0
     return best, best_s
 
@@ -554,7 +859,7 @@ def pick_best_carryover_for_ask(
             best_s = s
             best = d
             best_fam = fam
-    if best_s < 0.25 or best is None:
+    if best_s < CARRYOVER_PICK_BEST_THRESHOLD or best is None:
         return None, 0.0, GENERAL
     return best, best_s, best_fam
 
@@ -565,7 +870,7 @@ def diagnose_ask_carryover_candidates(
     rows: Sequence[Dict[str, Any]],
     *,
     now: Optional[datetime] = None,
-    pick_threshold: float = 0.25,
+    pick_threshold: float = CARRYOVER_PICK_BEST_THRESHOLD,
 ) -> Dict[str, Any]:
     """
     Temporary Phase 44 observability: per-row scores using the same rules as
@@ -586,9 +891,12 @@ def diagnose_ask_carryover_candidates(
         hours = _hours_old(updated, now)
         st = str(d.get("state") or "").strip().lower()
         hints: List[str] = []
+        excl_li = low_information_carryover_row_exclusion_reason(d)
+        if excl_li:
+            hints.append(excl_li)
         if st != "unresolved":
             hints.append("state_not_unresolved")
-        if hours > 72.0:
+        if hours > CONTINUATION_STRENGTH_MAX_ROW_AGE_HOURS:
             hints.append("row_updated_gt_72h")
         row_norm = str(d.get("prompt_norm") or "")
         row_h = str(d.get("prompt_norm_hash") or "")

@@ -503,7 +503,11 @@ class DatabaseStore:
         asked_slots_json: Optional[str] = None,
     ) -> Optional[str]:
         """Append one situation row; supersede prior continuation match (Phase 44)."""
-        from ..decision.situation_carryover import pick_best_carryover, truncate_prompt_norm
+        from ..decision.situation_carryover import (
+            pick_best_carryover,
+            shape_key_low_information_carryover_exclusion_reason,
+            truncate_prompt_norm,
+        )
 
         conn = self.get_db_connection()
         now = datetime.utcnow().isoformat()
@@ -517,7 +521,8 @@ class DatabaseStore:
             src = "ask"
         rows = self.list_recent_short_term_situations(limit=48)
         best, strength = pick_best_carryover(pn, h, fam, sk, rows)
-        if best and strength >= 0.38:
+        skip_supersede_prior = bool(shape_key_low_information_carryover_exclusion_reason(sk))
+        if not skip_supersede_prior and best and strength >= 0.38:
             oid = str(best.get("id") or "").strip()
             if oid:
                 conn.execute(
@@ -559,6 +564,68 @@ class DatabaseStore:
                 )
         conn.commit()
         return eid
+
+    def _rewrite_short_term_stance_for_word_off_feedback(
+        self,
+        *,
+        prompt_norm_hash: str,
+        replacement_text: Optional[str],
+        scenario_snippet: str,
+        effective_family: str,
+    ) -> Dict[str, Any]:
+        """
+        After partly + action-ok/wording-off feedback, replace the latest unresolved
+        short-term row stance so awkward surfaced lines do not anchor the next turn.
+        """
+        from ..router import normalize_input
+        from ..decision.situation_carryover import carryover_safe_stance_fallback
+
+        h = (prompt_norm_hash or "").strip()
+        if not h:
+            return {"applied": False, "reason": "empty_prompt_norm_hash"}
+        self.ensure_phase44_short_term_situation()
+        conn = self.get_db_connection()
+        row = conn.execute(
+            """
+            SELECT id, stance_snippet, prompt_norm
+            FROM short_term_situation_memory
+            WHERE prompt_norm_hash = ? AND state = 'unresolved'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (h,),
+        ).fetchone()
+        if not row:
+            return {"applied": False, "reason": "no_unresolved_row_for_hash"}
+        rid = str(row["id"])
+        old_snip = str(row["stance_snippet"] or "")
+        pn_row = str(row["prompt_norm"] or "")
+        pn_src = pn_row or normalize_input(scenario_snippet or "")
+        rep = (replacement_text or "").strip()
+        if len(rep) >= 8:
+            new_snip = rep[:220]
+            mode = "replacement_line"
+        else:
+            new_snip = carryover_safe_stance_fallback(
+                pn_src, str(effective_family or "general")
+            )[:220]
+            mode = "carryover_safe_fallback"
+        now = datetime.utcnow().isoformat()
+        conn.execute(
+            """
+            UPDATE short_term_situation_memory
+            SET stance_snippet = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (new_snip, now, rid),
+        )
+        conn.commit()
+        return {
+            "applied": True,
+            "rewrite_mode": mode,
+            "old_stance_snippet_prefix": old_snip[:120],
+            "new_stance_snippet_prefix": new_snip[:120],
+        }
 
     def list_personal_response_feedback_for_prompt(
         self, prompt_norm_hash: str, limit: int = 40
@@ -810,6 +877,13 @@ class DatabaseStore:
             ),
         )
         conn.commit()
+        if (partial_aspect or "").strip() == "action_ok_word_bad":
+            self._rewrite_short_term_stance_for_word_off_feedback(
+                prompt_norm_hash=prompt_norm_hash,
+                replacement_text=replacement_text,
+                scenario_snippet=scenario_snippet,
+                effective_family=effective_family,
+            )
         self._apply_phase38_feedback_to_weights(
             rating,
             partial_aspect,

@@ -22,8 +22,8 @@ from ..decision.cross_system_knowledge import (
 from ..decision.memory_relevance import (
     _spending_pressure_prompt,
     conflict_situational_cues,
-    decision_memory_relevance_multiplier,
     decision_row_text_blob,
+    decision_memory_relevance_multiplier,
     gossip_or_backchannel_user_prompt,
     personal_response_decision_families_aligned,
     profile_memory_fit_score,
@@ -44,13 +44,20 @@ from ..decision.ontology import (
 )
 from ..decision.routed_clarification import rank_families
 from ..decision.situation_carryover import (
+    boundary_carryover_aligned,
+    carryover_safe_stance_fallback,
     carryover_shape_key,
     carryover_slots_prefix,
     combined_shape_key,
+    conflict_escalation_carryover_thread_ok,
     diagnose_ask_carryover_candidates,
     pa_carryover_aligned,
+    persistence_after_declined_shaped,
     reference_continuation_cues,
+    respond_route_keys_skip_short_term_situation_record,
+    same_person_conflict_thread_carryover_aligned,
     short_term_row_recent_enough,
+    still_persisting_wording,
 )
 from ..router import normalize_input
 from .profile import PersonalProfile, build_personal_profile_from_rows
@@ -61,6 +68,12 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+", re.I)
 RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN = 0.28
 RESPOND_CARRYOVER_NOTE_HIGH_MIN = 0.58
 RESPOND_CARRYOVER_NOTE_SOFT_MIN = 0.50
+# Phase 44/45: GENERAL routing escape when conflict carryover is very strong + continuation cues.
+RESPOND_CONFLICT_GENERAL_ESCAPE_CARRY_STRENGTH_MIN = 0.45
+# Phase 45: gentle retrieval tilt toward direct/boundary-shaped saves (deterministic cap).
+RESPOND_ESCALATION_DIRECT_RETRIEVAL_MULT = 1.09
+# Same-thread boundary persistence can route obligation_overload; include it narrowly for Phase 45.
+_PHASE45_ESCALATION_EFFECTIVE_FAMILIES = frozenset({CONFLICT_FAMILY, OBLIGATION_OVERLOAD})
 
 
 def _respond_path_multipliers(
@@ -351,6 +364,10 @@ class RespondFeedbackInfluence:
     replacement_inject_line: str = ""
     # Phase 43: same-prompt replacements disagree; damp confidence / overlays.
     replacement_direction_mixed: float = 0.0
+    # Phase 45: partly + action ok / wording off — do not anchor carryover on surface line.
+    action_ok_wording_off: bool = False
+    # Newest-first replacement from partly + action_ok_word_bad (not the wrong-only inject path).
+    action_ok_wording_replacement_line: str = ""
 
 
 @dataclass(frozen=True)
@@ -522,7 +539,7 @@ def _respond_situation_carryover_effective_family_aligned(
     if (
         eff == GENERAL
         and cfam == CONFLICT_FAMILY
-        and carry_strength >= 0.45
+        and carry_strength >= float(RESPOND_CONFLICT_GENERAL_ESCAPE_CARRY_STRENGTH_MIN)
         and reference_continuation_cues(prompt_norm)
     ):
         return situation_carryover
@@ -555,6 +572,11 @@ def _respond_carryover_reasoning_line_audit(
         audit["blocked_by"] = "no_situation_carryover_match"
         return audit
     match = situation_carryover["match"]
+    row_prompt_norm = str(match.get("prompt_norm") or "")
+    explicit = reference_continuation_cues(prompt_norm)
+    pa_row_align = pa_carryover_aligned(prompt_norm, row_prompt_norm)
+    audit["explicit_continuation_cues"] = explicit
+    audit["pa_carryover_aligned"] = pa_row_align
     if str(match.get("state") or "").strip().lower() != "unresolved":
         audit["blocked_by"] = "match_state_not_unresolved"
         return audit
@@ -565,19 +587,14 @@ def _respond_carryover_reasoning_line_audit(
     eff = audit["eff_family"]
     row_hash = str(match.get("prompt_norm_hash") or "").strip()
     row_shape = str(match.get("shape_key") or "")
-    row_prompt_norm = str(match.get("prompt_norm") or "")
     cur_core = carryover_slots_prefix(
         carryover_shape_key(prompt_norm, str(eff_pf or "general"))
     )
     row_core = carryover_slots_prefix(row_shape)
     shape_core_match = bool(cur_core) and cur_core == row_core
-    explicit = reference_continuation_cues(prompt_norm)
     same_prompt = bool(row_hash and prompt_norm_hash and row_hash == prompt_norm_hash)
-    pa_row_align = pa_carryover_aligned(prompt_norm, row_prompt_norm)
     audit["same_prompt_hash"] = same_prompt
     audit["shape_core_match"] = shape_core_match
-    audit["explicit_continuation_cues"] = explicit
-    audit["pa_carryover_aligned"] = pa_row_align
     audit["cur_core"] = cur_core
     audit["row_core"] = row_core
 
@@ -680,42 +697,173 @@ def _respond_carryover_suppress_avoidance(
     if not reference_continuation_cues(prompt_norm):
         return False
     cues = conflict_situational_cues(prompt_norm)
+    boundary_suppress_path = bool(
+        boundary_carryover_aligned(prompt_norm, row_pn)
+        and (
+            cues.get("boundary_push")
+            or persistence_after_declined_shaped(prompt_norm)
+        )
+        and (
+            cues.get("repeat_pattern")
+            or still_persisting_wording(prompt_norm)
+        )
+    )
     if not (
         cues.get("passive_slight")
         or (cues.get("repeat_pattern") and reference_continuation_cues(prompt_norm))
+        or boundary_suppress_path
     ):
         return False
     if _stance_favors_engagement_over_avoidance(stance):
         return True
     if pa_align:
         return strength >= soft_min
+    if boundary_suppress_path:
+        return strength >= soft_min
     return strength >= 0.52
+
+
+def _decision_row_phase45_escalation_retrieval_multiplier(row: Dict[str, Any]) -> float:
+    """Slight score tilt toward direct/boundary-shaped decision rows (Phase 45)."""
+    blob = decision_row_text_blob(row)
+    if _memory_blob_avoidance_hit(blob):
+        return 1.0
+    low = blob.lower()
+    needles = (
+        "boundary",
+        "direct",
+        "address",
+        "name ",
+        "plain",
+        "calm",
+        "conversation",
+        "honest",
+        "clear line",
+        "one clear",
+        "pattern",
+        "noticed",
+        "sideways",
+    )
+    if any(n in low for n in needles):
+        return float(RESPOND_ESCALATION_DIRECT_RETRIEVAL_MULT)
+    return 1.0
+
+
+def _apply_phase45_escalation_retrieval_boost(
+    ranked: List[Tuple[Dict[str, Any], float, List[str]]],
+) -> List[Tuple[Dict[str, Any], float, List[str]]]:
+    out: List[Tuple[Dict[str, Any], float, List[str]]] = []
+    for row, sc, rs in ranked:
+        mult = _decision_row_phase45_escalation_retrieval_multiplier(row)
+        if mult > 1.0:
+            rs2 = list(rs) + ["phase45_escalation_direct_boundary_boost"]
+            out.append((row, float(sc) * mult, rs2))
+        else:
+            out.append((row, sc, rs))
+    return out
+
+
+def _evaluate_phase45_conflict_escalation(
+    *,
+    eff_pf: str,
+    prompt_norm: str,
+    prompt_norm_hash: str,
+    situation_carryover: Optional[Dict[str, Any]],
+    carry_strength: float,
+) -> Dict[str, Any]:
+    """
+    Phase 45: deterministic escalation state for repeated same-thread conflict
+    continuation (debug + retrieval + avoidance demotion).
+    """
+    eff = str(eff_pf or "").strip().lower()
+    rejects: List[str] = []
+    base: Dict[str, Any] = {
+        "phase45_escalation_evaluated": False,
+        "phase45_escalation_active": False,
+        "phase45_escalation_subtype": "",
+        "phase45_escalation_reject_reasons": rejects,
+        "phase45_demote_avoidance_due_to_escalation": False,
+        "phase45_boost_direct_boundary_retrieval": False,
+    }
+    if eff not in _PHASE45_ESCALATION_EFFECTIVE_FAMILIES:
+        rejects.append("not_escalation_eligible_family")
+        return base
+    base["phase45_escalation_evaluated"] = True
+    soft_floor = float(RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN)
+    if not situation_carryover or not situation_carryover.get("match"):
+        rejects.append("no_situation_carryover_match")
+        return base
+    match = situation_carryover["match"]
+    strength = float(carry_strength or 0.0)
+    if strength < soft_floor:
+        rejects.append("carry_strength_below_escalation_floor")
+    st = str(match.get("state") or "").strip().lower()
+    if st != "unresolved":
+        rejects.append("carryover_match_not_unresolved")
+    if not short_term_row_recent_enough(match):
+        rejects.append("carryover_match_not_recent_enough_42h")
+    if not reference_continuation_cues(prompt_norm):
+        rejects.append("no_explicit_continuation_cues")
+    if rejects:
+        return base
+    row_pn = str(match.get("prompt_norm") or "")
+    row_h = str(match.get("prompt_norm_hash") or "").strip()
+    cur_h = str(prompt_norm_hash or "").strip()
+    thread_ok = conflict_escalation_carryover_thread_ok(
+        prompt_norm, row_pn, cur_h, row_h
+    )
+    if not thread_ok:
+        rejects.append("escalation_thread_alignment_failed")
+        return base
+    cues = conflict_situational_cues(prompt_norm)
+    subtype = ""
+    if (
+        pa_carryover_aligned(prompt_norm, row_pn)
+        and cues.get("passive_slight")
+        and cues.get("repeat_pattern")
+    ):
+        subtype = "passive_aggressive_repeat"
+    elif boundary_carryover_aligned(prompt_norm, row_pn) and (
+        cues.get("boundary_push") or persistence_after_declined_shaped(prompt_norm)
+    ) and (cues.get("repeat_pattern") or still_persisting_wording(prompt_norm)):
+        subtype = "boundary_push_repeat"
+    elif same_person_conflict_thread_carryover_aligned(
+        prompt_norm, row_pn
+    ) and (cues.get("repeat_pattern") or still_persisting_wording(prompt_norm)):
+        subtype = "interpersonal_persistence_repeat"
+    else:
+        rejects.append("no_escalation_subtype_matched")
+        return base
+    base["phase45_escalation_active"] = True
+    base["phase45_escalation_subtype"] = subtype
+    base["phase45_demote_avoidance_due_to_escalation"] = True
+    base["phase45_boost_direct_boundary_retrieval"] = True
+    base["phase45_escalation_reject_reasons"] = []
+    return base
 
 
 def _respond_repeated_passive_aggressive_escalation_active(
     *,
     eff_pf: str,
     prompt_norm: str,
+    prompt_norm_hash: str,
     situation_carryover: Optional[Dict[str, Any]],
+    carry_strength: float,
 ) -> bool:
     """
-    Narrow Phase 44+ escalation gate: same-thread passive-aggressive continuation
-    where the prompt signals repetition (not a one-off slight).
-
-    Used to strip avoidance-shaped decision/style retrieval when carryover is
-    aligned but stored rows still echo \"let it go\" style answers.
+    Phase 44 flag: only the passive-aggressive + repeat subtype (debug field compat).
     """
-    if str(eff_pf or "").strip().lower() != CONFLICT_FAMILY:
-        return False
-    if not situation_carryover or not situation_carryover.get("match"):
-        return False
-    if not reference_continuation_cues(prompt_norm):
-        return False
-    row_pn = str(situation_carryover["match"].get("prompt_norm") or "")
-    if not pa_carryover_aligned(prompt_norm, row_pn):
-        return False
-    cues = conflict_situational_cues(prompt_norm)
-    return bool(cues.get("passive_slight") and cues.get("repeat_pattern"))
+    st = _evaluate_phase45_conflict_escalation(
+        eff_pf=eff_pf,
+        prompt_norm=prompt_norm,
+        prompt_norm_hash=prompt_norm_hash,
+        situation_carryover=situation_carryover,
+        carry_strength=carry_strength,
+    )
+    return bool(
+        st.get("phase45_escalation_active")
+        and st.get("phase45_escalation_subtype") == "passive_aggressive_repeat"
+    )
 
 
 def _normalize_replacement_direction(text: str) -> str:
@@ -736,6 +884,23 @@ def build_respond_feedback_influence(
     rows = store.list_personal_response_feedback_for_prompt(
         prompt_norm_hash, limit=40
     )
+    action_ok_wording_off = any(
+        _feedback_family_compatible(str(r.get("effective_family") or ""), effective_family)
+        and (r.get("partial_aspect") or "").strip() == "action_ok_word_bad"
+        for r in rows
+    )
+    action_ok_wording_replacement_line = ""
+    for row in rows:
+        if not _feedback_family_compatible(
+            str(row.get("effective_family") or ""), effective_family
+        ):
+            continue
+        if (row.get("partial_aspect") or "").strip() != "action_ok_word_bad":
+            continue
+        rep_w = (row.get("replacement_text") or "").strip()
+        if len(rep_w) >= 8:
+            action_ok_wording_replacement_line = rep_w[:400]
+            break
     pref: Dict[str, float] = {}
     wrong_avoid = 0
     direct_hits = 0.0
@@ -872,6 +1037,8 @@ def build_respond_feedback_influence(
         wrong_replacement_count=wrong_rep_count,
         replacement_inject_line=inject_line.strip(),
         replacement_direction_mixed=replacement_direction_mixed,
+        action_ok_wording_off=action_ok_wording_off,
+        action_ok_wording_replacement_line=action_ok_wording_replacement_line.strip(),
     )
 
 
@@ -1840,6 +2007,69 @@ def _merge_action_wording_paragraphs(action_line: str, wording_line: str, *, see
     return f"{a}\n{wording_block}"
 
 
+def _obligation_boundary_repeat_both_coherent(
+    choice: str,
+    why: str,
+    *,
+    phrase_seed: str,
+    cautious: bool,
+    blunt: float,
+    aggressive_short: bool,
+) -> str:
+    """
+    One paragraph for Phase 45 ``boundary_push_repeat`` + obligation overload + ``both``.
+
+    Replaces stacked action + wording + \"If I said it out loud\" merge, which duplicated
+    the same boundary idea and appended \"Mostly because\" twice.
+
+    Rationale from the save stays *before* the quoted spoken line so it never trails
+    awkwardly after the closing quote (blunt path used to append a bare fragment).
+    """
+    ch = (choice or "").strip().rstrip(".,;:!?")
+    why_low = _to_lower_start(why) if (why or "").strip() else ""
+    if why_low.startswith("i "):
+        why_readable = "I " + why_low[2:]
+    elif why_low.startswith("i'm "):
+        why_readable = "I'm " + why_low[4:]
+    elif why_low.startswith("i've "):
+        why_readable = "I've " + why_low[5:]
+    else:
+        why_readable = why_low
+    cautious_openers = (
+        "If I'm reading your saves right, ",
+        "From what's on file, ",
+        "",
+    )
+    pref = (
+        cautious_openers[_stable_index(f"{phrase_seed}:obbr_cp", len(cautious_openers))]
+        if cautious
+        else ""
+    )
+    if why_readable:
+        if blunt >= 0.62:
+            lead = f"{why_readable[0].upper()}{why_readable[1:]}. " if len(why_readable) > 1 else f"{why_readable.upper()}. "
+        else:
+            lead = f"Mostly because {why_readable}, "
+    else:
+        lead = ""
+    if ch:
+        pools = (
+            f"{pref}{lead}I'd hold the line on what I already said — same short no, not a new debate — like: \"{ch}\".",
+            f"{pref}{lead}I'd keep my boundary simple and repeat the same words if they push again — like: \"{ch}\".",
+            f"{pref}{lead}I'd say no the same way as before — clear and plain — like: \"{ch}\".",
+        )
+    else:
+        pools = (
+            f"{pref}{lead}I'd keep saying no the same short way — no fresh argument round.",
+            f"{pref}{lead}I'd hold the boundary steady instead of re-explaining it.",
+        )
+    line = pools[_stable_index(f"{phrase_seed}:obbr_pool:{blunt}", len(pools))]
+    line = line.replace("..", ".").strip()
+    if not line.endswith("."):
+        line += "."
+    return _shorten_sentence(line, aggressive_short)
+
+
 def _strict_conflict_shape_evidence_fallback(
     *,
     prompt_norm: str,
@@ -1854,6 +2084,7 @@ def _strict_conflict_shape_evidence_fallback(
     answer_focus: str = "both",
     feedback_influence: Optional[RespondFeedbackInfluence] = None,
     skip_avoidance_style_memory: bool = False,
+    phase45_escalation_subtype: str = "",
 ) -> Tuple[str, str, float, List[str], Tuple[str, ...]]:
     """Cautious likely-you line when strict conflict gating finds no decision row.
 
@@ -1966,6 +2197,36 @@ def _strict_conflict_shape_evidence_fallback(
         return answer, reasoning, 0.37, extra_basis, ()
 
     cues = conflict_situational_cues(prompt_norm)
+    if phase45_escalation_subtype in (
+        "boundary_push_repeat",
+        "interpersonal_persistence_repeat",
+    ) and not gossip:
+        if af == "action":
+            opts = (
+                "You'd probably hold the line you already drew — short and plain that your answer hasn't changed, and you can't keep rehashing it.",
+                "My read is you'd name that they keep coming back after you already said no, and ask for the topic to drop unless something new is on the table.",
+            )
+        else:
+            opts = (
+                "You'd probably say it directly: you gave a clear no, they're circling the same ask, and you need them to stop treating it like it's open.",
+                "My read is you'd keep it calm but unmistakable — repeat your boundary once, then close the loop instead of debating it again.",
+            )
+        answer = opts[_stable_index(f"{phrase_seed}:p45bd", len(opts))]
+        if af == "both":
+            act_m = (
+                "You'd probably keep your footing — same boundary as before, no extra justification, and you don't need a long back-and-forth.",
+                "My read is you'd treat it as a pattern now: they already heard your answer, so the issue is the push, not the original ask.",
+            )
+            answer = _merge_action_wording_paragraphs(
+                act_m[_stable_index(f"{phrase_seed}:p45bd_a", len(act_m))],
+                answer,
+                seed=f"{phrase_seed}:p45bd_m",
+            )
+        reasoning = (
+            "No tight conflict save on file; continued boundary pressure on the same thread leans toward calm directness over \"let it go\" — still a template read, not a saved quote."
+        )
+        return answer, reasoning, 0.36, extra_basis, ()
+
     if (
         cues["passive_slight"]
         and cues["repeat_pattern"]
@@ -2576,10 +2837,17 @@ def generate_personal_response(
     carry_suppress_avoidance = _respond_carryover_suppress_avoidance(
         situation_carryover, prompt_norm
     )
-    repeated_pa_escalation = _respond_repeated_passive_aggressive_escalation_active(
+    phase45_escalation = _evaluate_phase45_conflict_escalation(
         eff_pf=str(eff_pf or "general"),
         prompt_norm=prompt_norm,
+        prompt_norm_hash=prompt_norm_hash,
         situation_carryover=situation_carryover,
+        carry_strength=carry_strength,
+    )
+    repeated_pa_escalation = bool(
+        phase45_escalation.get("phase45_escalation_active")
+        and phase45_escalation.get("phase45_escalation_subtype")
+        == "passive_aggressive_repeat"
     )
     carry_boost = min(0.11, carry_strength * 0.086) if carry_strength >= 0.38 else 0.0
 
@@ -2615,6 +2883,8 @@ def generate_personal_response(
         feedback_influence=feedback_influence,
         example_influence=example_influence,
     )
+    if phase45_escalation.get("phase45_boost_direct_boundary_retrieval"):
+        d_ranked = _apply_phase45_escalation_retrieval_boost(d_ranked)
     s_ranked = retrieve_relevant_style_memories(
         s_rows,
         text,
@@ -2638,7 +2908,10 @@ def generate_personal_response(
             for r, s, rs in d_gated
             if not _memory_blob_avoidance_hit(decision_row_text_blob(r))
         ]
-    strip_avoidance_decisions = carry_suppress_avoidance or repeated_pa_escalation
+    strip_avoidance_decisions = (
+        carry_suppress_avoidance
+        or phase45_escalation.get("phase45_escalation_active", False)
+    )
     if strip_avoidance_decisions:
         kept_av = [
             (r, s, rs)
@@ -2873,28 +3146,41 @@ def generate_personal_response(
         choice = str(row.get("choice_label") or "").strip()
         why = str(row.get("reasoning_label") or "").strip()
         if answer_focus == "both":
-            act = _both_mode_action_line(
-                choice,
-                why,
-                primary_family=eff_pf,
-                seed=f"{phrase_seed}:sd_a",
-                cautious=weak_or_cross,
-                blunt=blunt,
-                aggressive_short=aggressive_short,
-            )
-            wrd = _natural_likely_line(
-                choice,
-                why,
-                primary_family=eff_pf,
-                seed=f"{phrase_seed}:sd_w",
-                cautious=weak_or_cross,
-                blunt=blunt,
-                aggressive_short=aggressive_short,
-                utterance_mode="wording",
-            )
-            answer = _merge_action_wording_paragraphs(
-                act, wrd, seed=f"{phrase_seed}:sd_m"
-            )
+            if (
+                phase45_escalation.get("phase45_escalation_subtype") == "boundary_push_repeat"
+                and str(eff_pf or "").strip().lower() == OBLIGATION_OVERLOAD
+            ):
+                answer = _obligation_boundary_repeat_both_coherent(
+                    choice,
+                    why,
+                    phrase_seed=f"{phrase_seed}:sd_obbr",
+                    cautious=weak_or_cross,
+                    blunt=blunt,
+                    aggressive_short=aggressive_short,
+                )
+            else:
+                act = _both_mode_action_line(
+                    choice,
+                    why,
+                    primary_family=eff_pf,
+                    seed=f"{phrase_seed}:sd_a",
+                    cautious=weak_or_cross,
+                    blunt=blunt,
+                    aggressive_short=aggressive_short,
+                )
+                wrd = _natural_likely_line(
+                    choice,
+                    why,
+                    primary_family=eff_pf,
+                    seed=f"{phrase_seed}:sd_w",
+                    cautious=weak_or_cross,
+                    blunt=blunt,
+                    aggressive_short=aggressive_short,
+                    utterance_mode="wording",
+                )
+                answer = _merge_action_wording_paragraphs(
+                    act, wrd, seed=f"{phrase_seed}:sd_m"
+                )
         else:
             answer = _natural_likely_line(
                 choice,
@@ -2947,28 +3233,41 @@ def generate_personal_response(
         choice = str(row.get("choice_label") or "").strip()
         why = str(row.get("reasoning_label") or "").strip()
         if answer_focus == "both":
-            act = _both_mode_action_line(
-                choice,
-                why,
-                primary_family=eff_pf,
-                seed=f"{phrase_seed}:md_a",
-                cautious=True,
-                blunt=blunt,
-                aggressive_short=aggressive_short,
-            )
-            wrd = _natural_likely_line(
-                choice,
-                why,
-                primary_family=eff_pf,
-                seed=f"{phrase_seed}:md_w",
-                cautious=True,
-                blunt=blunt,
-                aggressive_short=aggressive_short,
-                utterance_mode="wording",
-            )
-            answer = _merge_action_wording_paragraphs(
-                act, wrd, seed=f"{phrase_seed}:md_m"
-            )
+            if (
+                phase45_escalation.get("phase45_escalation_subtype") == "boundary_push_repeat"
+                and str(eff_pf or "").strip().lower() == OBLIGATION_OVERLOAD
+            ):
+                answer = _obligation_boundary_repeat_both_coherent(
+                    choice,
+                    why,
+                    phrase_seed=f"{phrase_seed}:md_obbr",
+                    cautious=True,
+                    blunt=blunt,
+                    aggressive_short=aggressive_short,
+                )
+            else:
+                act = _both_mode_action_line(
+                    choice,
+                    why,
+                    primary_family=eff_pf,
+                    seed=f"{phrase_seed}:md_a",
+                    cautious=True,
+                    blunt=blunt,
+                    aggressive_short=aggressive_short,
+                )
+                wrd = _natural_likely_line(
+                    choice,
+                    why,
+                    primary_family=eff_pf,
+                    seed=f"{phrase_seed}:md_w",
+                    cautious=True,
+                    blunt=blunt,
+                    aggressive_short=aggressive_short,
+                    utterance_mode="wording",
+                )
+                answer = _merge_action_wording_paragraphs(
+                    act, wrd, seed=f"{phrase_seed}:md_m"
+                )
         else:
             answer = _natural_likely_line(
                 choice,
@@ -3036,7 +3335,10 @@ def generate_personal_response(
             answer_focus=answer_focus,
         )
     elif strict_shape and not top_d and eff_pf == CONFLICT_FAMILY:
-        skip_style_avoid = carry_suppress_avoidance or repeated_pa_escalation
+        skip_style_avoid = (
+            carry_suppress_avoidance
+            or phase45_escalation.get("phase45_escalation_active", False)
+        )
         ans, reas, ccap, extra_mb, style_ids_fb = _strict_conflict_shape_evidence_fallback(
             prompt_norm=prompt_norm,
             phrase_seed=phrase_seed,
@@ -3050,6 +3352,9 @@ def generate_personal_response(
             answer_focus=answer_focus,
             feedback_influence=feedback_influence,
             skip_avoidance_style_memory=skip_style_avoid,
+            phase45_escalation_subtype=str(
+                phase45_escalation.get("phase45_escalation_subtype") or ""
+            ),
         )
         answer = ans
         reasoning = reas
@@ -3266,6 +3571,31 @@ def generate_personal_response(
         reasoning += " Repeated corrections in the same shape point in one direction."
     answer = _phase41_style_realism_pass(answer, answer_focus=answer_focus)
 
+    _carry_used_replacement_stance = False
+    if (
+        situation_carryover
+        and carry_strength >= float(RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN)
+    ):
+        _cm = situation_carryover.get("match") or {}
+        _cs = (_cm.get("stance_snippet") or "").strip()
+        _ch = (_cm.get("prompt_norm_hash") or "").strip()
+        _cfam = (
+            str(_cm.get("effective_family") or eff_pf or "general")
+            .strip()
+            .lower()
+        )
+        if _ch and len(_cs) >= 12:
+            _cfb = build_respond_feedback_influence(store, _ch, _cfam)
+            if (
+                _cfb.action_ok_wording_off
+                and len(
+                    (_cfb.action_ok_wording_replacement_line or "").strip()
+                )
+                >= 8
+            ):
+                answer = _cs
+                _carry_used_replacement_stance = True
+
     continuity_note = ""
     reasoning_line_audit = _respond_carryover_reasoning_line_audit(
         situation_carryover,
@@ -3331,6 +3661,27 @@ def generate_personal_response(
         conf = min(0.86, conf + 0.03)
     for cap in conf_caps:
         conf = min(conf, cap)
+    stm_record_skip_reason = respond_route_keys_skip_short_term_situation_record(
+        evidence_path.route_keys
+    )
+    la0_stm = (answer or "").strip().split("\n")[0].strip()
+    default_st_snip = (
+        la0_stm[:200] if len(la0_stm) > 20 else (reasoning or "")[:200]
+    )
+    short_term_stance_mode = "surface_first_line"
+    planned_st_snip = default_st_snip
+    if feedback_influence.action_ok_wording_off:
+        rep_fb = (feedback_influence.replacement_inject_line or "").strip()
+        if len(rep_fb) < 8:
+            rep_fb = (feedback_influence.action_ok_wording_replacement_line or "").strip()
+        if len(rep_fb) >= 8:
+            planned_st_snip = rep_fb[:200]
+            short_term_stance_mode = "replacement_from_feedback"
+        else:
+            planned_st_snip = carryover_safe_stance_fallback(
+                prompt_norm, str(eff_pf or "general")
+            )[:200]
+            short_term_stance_mode = "carryover_safe_after_wording_feedback"
     phase44_carryover_debug: Optional[Dict[str, Any]] = None
     if debug_phase44_carryover:
         rows_dbg: List[Dict[str, Any]] = []
@@ -3387,24 +3738,56 @@ def generate_personal_response(
             "continuity_language_tier": cont_tier,
             "continuity_note_emitted": bool((continuity_note or "").strip()),
             "continuity_note_text": (continuity_note or "").strip(),
+            "phase45_escalation_evaluated": bool(
+                phase45_escalation.get("phase45_escalation_evaluated")
+            ),
+            "phase45_escalation_active": bool(
+                phase45_escalation.get("phase45_escalation_active")
+            ),
+            "phase45_escalation_subtype": str(
+                phase45_escalation.get("phase45_escalation_subtype") or ""
+            ),
+            "phase45_escalation_reject_reasons": list(
+                phase45_escalation.get("phase45_escalation_reject_reasons") or []
+            ),
+            "phase45_demote_avoidance_due_to_escalation": bool(
+                phase45_escalation.get("phase45_demote_avoidance_due_to_escalation")
+            ),
+            "phase45_boost_direct_boundary_retrieval": bool(
+                phase45_escalation.get("phase45_boost_direct_boundary_retrieval")
+            ),
+            "short_term_situation_record_skip_reason": stm_record_skip_reason or "",
+            "short_term_situation_will_record": stm_record_skip_reason is None,
+            "short_term_stance_recording_mode": (
+                short_term_stance_mode
+                if stm_record_skip_reason is None
+                else "skipped_no_record"
+            ),
+            "short_term_stance_snippet_stored_prefix": (
+                (planned_st_snip or "")[:120]
+                if stm_record_skip_reason is None
+                else ""
+            ),
+            "wording_off_feedback_affects_stance_recording": bool(
+                feedback_influence.action_ok_wording_off
+            ),
+            "surfaced_answer_used_carryover_replacement_stance": _carry_used_replacement_stance,
         }
 
     try:
         rec = getattr(store, "record_short_term_situation", None)
-        if callable(rec):
+        if callable(rec) and stm_record_skip_reason is None:
             sk_rec = combined_shape_key(
                 prompt_norm,
                 str(eff_pf or "general"),
                 evidence_path.to_storage_dict(),
             )
-            la0 = (answer or "").strip().split("\n")[0].strip()
-            st_snip = la0[:200] if len(la0) > 20 else (reasoning or "")[:200]
             rec(
                 prompt_norm=prompt_norm,
                 prompt_norm_hash=prompt_norm_hash,
                 effective_family=str(eff_pf or "general"),
                 shape_key=sk_rec,
-                stance_snippet=st_snip,
+                stance_snippet=planned_st_snip,
                 source="respond_like_me",
             )
     except Exception:
