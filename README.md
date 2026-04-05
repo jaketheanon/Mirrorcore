@@ -100,6 +100,3 @@ Authoritative syntax: **`mirrorcore <command> --help`**.
 
 Data stays **local** by default. Any optional external or LLM use depends on your configuration and explicit choices.
 
-## License
-
-MIT — see `LICENSE`.
