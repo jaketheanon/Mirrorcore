@@ -1,5 +1,7 @@
 # Memory Model Design
 
+> **Note:** This document describes design intent and conceptual layers. Canonical table definitions and migrations live under `src/mirrorcore/db/`; use the code and tests as the source of truth for what is persisted today.
+
 ## Overview
 
 The memory system provides persistent storage and retrieval of episodic interactions, patterns, and learned insights. It enables Mirrorcore to provide contextually relevant assistance based on historical user interactions.

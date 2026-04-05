@@ -1,5 +1,7 @@
 # Mirrorcore Architecture
 
+See **[docs/README.md](README.md)** for the full documentation index.
+
 Mirrorcore is a local-first modular Python CLI system designed to act as a persistent reasoning assistant. All data remains local using SQLite storage and no external services are required for core functionality.
 
 ## Core Agents
