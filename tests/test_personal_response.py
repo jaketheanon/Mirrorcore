@@ -31,9 +31,13 @@ from mirrorcore.decision.situation_carryover import (
 from mirrorcore.persona.respond import (
     RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN,
     RespondEvidencePath,
+    RespondFeedbackInfluence,
     _merge_action_wording_paragraphs,
     _phase41_style_realism_pass,
     _phase48_final_answer_polish,
+    _phase49_hedge_level,
+    _phase49_skip_wording_tightening,
+    _phase49_wording_strength_polish,
     _respond_carryover_reasoning_line_audit,
     _evaluate_phase45_conflict_escalation,
     _respond_carryover_suppress_avoidance,
@@ -3098,6 +3102,169 @@ class TestPhase44RespondContinuation(unittest.TestCase):
             )
         )
         self.assertEqual(ordered[0][0], OBLIGATION_OVERLOAD)
+
+
+class TestPhase49SurfaceWording(unittest.TestCase):
+    """Phase 49: hedge tier and final polish without changing decision logic."""
+
+    def test_hedge_level_soft_for_template_routes_and_mixed_signals(self):
+        self.assertEqual(
+            _phase49_hedge_level(
+                conf=0.55,
+                route_keys=("insufficient_evidence",),
+                feedback_direction_mixed=0.0,
+                example_contradiction=0.0,
+            ),
+            "soft",
+        )
+        self.assertEqual(
+            _phase49_hedge_level(
+                conf=0.62,
+                route_keys=("strong_decision",),
+                feedback_direction_mixed=0.4,
+                example_contradiction=0.0,
+            ),
+            "soft",
+        )
+        self.assertEqual(
+            _phase49_hedge_level(
+                conf=0.62,
+                route_keys=("strong_decision",),
+                feedback_direction_mixed=0.0,
+                example_contradiction=0.45,
+            ),
+            "soft",
+        )
+        self.assertEqual(
+            _phase49_hedge_level(
+                conf=0.35,
+                route_keys=("strong_decision",),
+                feedback_direction_mixed=0.0,
+                example_contradiction=0.0,
+            ),
+            "soft",
+        )
+
+    def test_hedge_level_firm_and_medium_bands(self):
+        self.assertEqual(
+            _phase49_hedge_level(
+                conf=0.53,
+                route_keys=("strong_decision",),
+                feedback_direction_mixed=0.0,
+                example_contradiction=0.0,
+            ),
+            "firm",
+        )
+        self.assertEqual(
+            _phase49_hedge_level(
+                conf=0.44,
+                route_keys=("medium_decision",),
+                feedback_direction_mixed=0.0,
+                example_contradiction=0.0,
+            ),
+            "medium",
+        )
+        self.assertEqual(
+            _phase49_hedge_level(
+                conf=0.40,
+                route_keys=("strict_spending_fallback",),
+                feedback_direction_mixed=0.0,
+                example_contradiction=0.0,
+            ),
+            "medium",
+        )
+
+    def test_polish_firm_trims_cautious_preface_and_maybe_not_hook(self):
+        s = (
+            "If I'm reading your saves right, I'd draw the line here.\n"
+            'If I said it out loud, maybe: "No, not tonight."'
+        )
+        out = _phase49_wording_strength_polish(s, hedge_level="firm")
+        low = out.lower()
+        self.assertNotIn("if i'm reading your saves right", low)
+        self.assertIn("if i said it out loud", low)
+        self.assertNotIn("maybe:", low)
+
+    def test_polish_medium_replaces_maybe_colon_only(self):
+        s = 'Line one.\nIf I said it out loud, maybe: "Stop."'
+        out = _phase49_wording_strength_polish(s, hedge_level="medium")
+        low = out.lower()
+        self.assertIn("if i said it out loud", low)
+        self.assertNotIn("maybe:", low)
+
+    def test_polish_soft_is_noop(self):
+        s = (
+            "If I'm reading your saves right, I'd draw the line.\n"
+            'If I said it out loud, maybe: "No."'
+        )
+        self.assertEqual(
+            _phase49_wording_strength_polish(s, hedge_level="soft").strip(),
+            s.strip(),
+        )
+
+    def test_skip_user_approved_replacement_line_exact_match(self):
+        fb = RespondFeedbackInfluence(
+            pref_token_weight={},
+            avoidance_demote=0.0,
+            direct_calm_signal=0.0,
+            action_ok_wording_off=True,
+            action_ok_wording_replacement_line="User approved line exactly",
+        )
+        self.assertTrue(
+            _phase49_skip_wording_tightening(
+                "User approved line exactly",
+                carry_used_replacement_stance=False,
+                feedback_influence=fb,
+            )
+        )
+        self.assertFalse(
+            _phase49_skip_wording_tightening(
+                "Different surface text",
+                carry_used_replacement_stance=False,
+                feedback_influence=fb,
+            )
+        )
+
+
+class TestPhase49RespondIntegration(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = DatabaseStore(Path(self.tmp.name))
+        self.db.initialize_database()
+
+    def tearDown(self):
+        self.db.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_low_evidence_keeps_soft_hedge_markers(self):
+        pr = generate_personal_response("quantum flux capacitor polarity", self.db)
+        self.assertLessEqual(pr.confidence, 0.36)
+        self.assertIn("insufficient_evidence", pr.evidence_path.route_keys)
+
+    def test_spending_memory_match_avoids_likely_stacking(self):
+        self.db.record_decision_memory(
+            scenario_id="rent_fun_v1",
+            scenario_text=(
+                "I want something fun but rent is due tomorrow and I am short on money."
+            ),
+            choice_label="Cover rent first, skip the fun buy for now",
+            choice_value="r",
+            reasoning_label="Keep the hole from getting deeper",
+            reasoning_value="d",
+            value_tags=["caution"],
+            trait_signals={"financial_caution": 0.75},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "i want to buy something fun but rent is due tomorrow and i am short on money",
+            self.db,
+        )
+        self.assertEqual(pr.effective_family, "spending")
+        self.assertGreater(pr.confidence, 0.4)
+        low = pr.likely_answer.lower()
+        self.assertNotRegex(low, r"\bi(?:'d| would) likely\b")
 
 
 if __name__ == "__main__":

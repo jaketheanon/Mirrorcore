@@ -2122,6 +2122,138 @@ def _phase48_final_answer_polish(text: str) -> str:
     return t.strip()
 
 
+def _phase49_hedge_level(
+    *,
+    conf: float,
+    route_keys: Sequence[str],
+    feedback_direction_mixed: float,
+    example_contradiction: float,
+) -> str:
+    """
+    Phase 49: surface-only hedge tier from existing confidence and route signals.
+
+    Does not alter confidence; only selects wording polish strength.
+    Returns ``soft``, ``medium``, or ``firm``.
+    """
+    rks = {str(x).strip().lower() for x in (route_keys or ()) if str(x).strip()}
+    soft_routes = {
+        "strict_conflict_fallback",
+        "strict_shape_miss",
+        "insufficient_evidence",
+        "profile_pattern_fallback",
+        "profile_pattern_fallback_suppressed",
+        "weak_profile_signal",
+        "family_misalign",
+        "family_misalign_ungated",
+        "example_conflict_mixed",
+    }
+    if float(feedback_direction_mixed or 0.0) >= 0.34:
+        return "soft"
+    if float(example_contradiction or 0.0) >= 0.42:
+        return "soft"
+    if float(conf or 0.0) < 0.38:
+        return "soft"
+    if rks & soft_routes:
+        return "soft"
+    if float(conf or 0.0) >= 0.50:
+        return "firm"
+    if float(conf or 0.0) >= 0.40:
+        return "medium"
+    return "soft"
+
+
+def _phase49_skip_wording_tightening(
+    answer: str,
+    *,
+    carry_used_replacement_stance: bool,
+    feedback_influence: RespondFeedbackInfluence,
+) -> bool:
+    """Preserve carryover / user-approved replacement lines verbatim (Phase 49)."""
+    if carry_used_replacement_stance:
+        return True
+    ao = bool(feedback_influence.action_ok_wording_off)
+    if not ao:
+        return False
+    rep = (_phase46_resolved_replacement_line(feedback_influence) or "").strip()
+    if len(rep) < 8:
+        return False
+    a_norm = " ".join((answer or "").strip().lower().split())
+    r_norm = " ".join(rep.lower().split())
+    return a_norm == r_norm
+
+
+def _phase49_wording_strength_polish(
+    text: str,
+    *,
+    hedge_level: str,
+) -> str:
+    """
+    Phase 49: trim redundant hedges on the final surfaced line when grounding is solid.
+
+    Runs after Phase 48; does not change retrieval, caps, or reasoning text.
+    """
+    t = (text or "").strip()
+    if not t:
+        return t
+    level = (hedge_level or "soft").strip().lower()
+    if level not in ("medium", "firm"):
+        return t
+
+    cautious_prefs = (
+        "If I'm reading your saves right, ",
+        "From what's on file, ",
+    )
+
+    def _strip_cautious_line_prefixes(segment: str) -> str:
+        s = segment
+        if level != "firm":
+            return s
+        for p in cautious_prefs:
+            if s.startswith(p):
+                s = s[len(p) :]
+        return s
+
+    lines = t.split("\n")
+    out_lines: List[str] = []
+    for raw_ln in lines:
+        ln = raw_ln
+        ln = _strip_cautious_line_prefixes(ln)
+        # Out-loud framing: keep a short hook for both-mode; drop hedgy "maybe"/"like".
+        if level == "firm":
+            for ol, repl in (
+                ("If I said it out loud, maybe: ", "If I said it out loud, "),
+                ("If I said it out loud, it'd be something like: ", "If I said it out loud, "),
+                ("if i said it out loud, maybe: ", "If I said it out loud, "),
+                ("if i said it out loud, it'd be something like: ", "If I said it out loud, "),
+            ):
+                if ol in ln:
+                    ln = ln.replace(ol, repl)
+        else:
+            ln = re.sub(
+                r"(?i)If I said it out loud, maybe:\s*",
+                "If I said it out loud, ",
+                ln,
+                count=1,
+            )
+            ln = re.sub(
+                r"(?i)If I said it out loud, it'd be something like:\s*",
+                "If I said it out loud, ",
+                ln,
+                count=1,
+            )
+        out_lines.append(ln)
+    t = "\n".join(out_lines)
+
+    # Light "likely" trim when not in soft-lock territory.
+    if level in ("medium", "firm"):
+        t = re.sub(r"(?i)\bI would likely\b", "I would", t)
+        t = re.sub(r"(?i)\bI'd likely\b", "I'd", t)
+    t = re.sub(r" {2,}", " ", t)
+    lines2 = t.split("\n")
+    t = "\n".join(_phase48_normalize_sentence_starts(x) for x in lines2)
+    return t.strip()
+
+
 def _family_label(primary_family: str) -> str:
     pf = (primary_family or "").strip().lower()
     if "conflict" in pf:
@@ -3988,6 +4120,37 @@ def generate_personal_response(
         and float(example_influence.contradiction_level or 0.0) <= 0.18
     ):
         reasoning += " Repeated corrections in the same shape point in one direction."
+
+    path_m = _respond_path_multipliers(evidence_path, mmap)
+    conf = _compute_response_confidence(
+        profile,
+        top_score,
+        top_d[0] if top_d else None,
+        agreement_boost,
+        decision_family_aligned=top_family_aligned,
+        path_multipliers=path_m or None,
+        example_influence=example_influence,
+        route_keys=evidence_path.route_keys,
+        feedback_direction_mixed=float(
+            feedback_influence.replacement_direction_mixed or 0.0
+        ),
+    )
+    if float(feedback_influence.replacement_direction_mixed or 0.0) >= 0.38:
+        conf_caps.append(0.54)
+    if (
+        example_influence
+        and float(example_influence.contradiction_level or 0.0) >= 0.52
+    ):
+        conf_caps.append(0.5)
+    elif (
+        example_influence
+        and float(example_influence.winning_effective_strength or 0.0) >= 0.95
+        and float(example_influence.contradiction_level or 0.0) <= 0.14
+    ):
+        conf = min(0.86, conf + 0.03)
+    for cap in conf_caps:
+        conf = min(conf, cap)
+
     answer = _phase41_style_realism_pass(answer, answer_focus=answer_focus)
 
     _carry_used_replacement_stance = False
@@ -4044,6 +4207,26 @@ def generate_personal_response(
 
     answer = _phase48_final_answer_polish(answer)
 
+    ex_contra = (
+        float(example_influence.contradiction_level or 0.0)
+        if example_influence
+        else 0.0
+    )
+    p49_level = _phase49_hedge_level(
+        conf=conf,
+        route_keys=evidence_path.route_keys,
+        feedback_direction_mixed=float(
+            feedback_influence.replacement_direction_mixed or 0.0
+        ),
+        example_contradiction=ex_contra,
+    )
+    if not _phase49_skip_wording_tightening(
+        answer,
+        carry_used_replacement_stance=_carry_used_replacement_stance,
+        feedback_influence=feedback_influence,
+    ):
+        answer = _phase49_wording_strength_polish(answer, hedge_level=p49_level)
+
     continuity_note = ""
     reasoning_line_audit = _respond_carryover_reasoning_line_audit(
         situation_carryover,
@@ -4080,35 +4263,6 @@ def generate_personal_response(
     if continuity_note:
         reasoning = (reasoning or "").rstrip() + continuity_note
 
-    path_m = _respond_path_multipliers(evidence_path, mmap)
-    conf = _compute_response_confidence(
-        profile,
-        top_score,
-        top_d[0] if top_d else None,
-        agreement_boost,
-        decision_family_aligned=top_family_aligned,
-        path_multipliers=path_m or None,
-        example_influence=example_influence,
-        route_keys=evidence_path.route_keys,
-        feedback_direction_mixed=float(
-            feedback_influence.replacement_direction_mixed or 0.0
-        ),
-    )
-    if float(feedback_influence.replacement_direction_mixed or 0.0) >= 0.38:
-        conf_caps.append(0.54)
-    if (
-        example_influence
-        and float(example_influence.contradiction_level or 0.0) >= 0.52
-    ):
-        conf_caps.append(0.5)
-    elif (
-        example_influence
-        and float(example_influence.winning_effective_strength or 0.0) >= 0.95
-        and float(example_influence.contradiction_level or 0.0) <= 0.14
-    ):
-        conf = min(0.86, conf + 0.03)
-    for cap in conf_caps:
-        conf = min(conf, cap)
     stm_record_skip_reason = respond_route_keys_skip_short_term_situation_record(
         evidence_path.route_keys
     )

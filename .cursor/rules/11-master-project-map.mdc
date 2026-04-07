@@ -1,0 +1,34 @@
+---
+description: 
+alwaysApply: true
+---
+
+# Master project map (source of truth)
+
+Before making any substantive code changes, read docs/master_project_map.md.
+
+This applies to:
+- new behavior
+- phase work
+- design-affecting refactors
+- changes to memory, carryover, replay, response generation, CLI behavior, storage, routing, or investigation flows
+- any change that could diverge from agreed project direction
+
+Treat docs/master_project_map.md as authoritative for:
+- project direction
+- completed phase context
+- invariants that must not break
+- roadmap intent
+
+Conflict resolution:
+- If the map states something explicitly and the codebase looks different, incomplete, experimental, or ambiguous, follow the map as the source of product intent.
+- Do not assume current code behavior defines intended behavior when the map is clearer.
+- If there is a real mismatch between code and map, prefer narrow changes that move implementation toward the map rather than expanding the mismatch.
+- If the mismatch appears intentional but uncertain, flag it explicitly before making broad changes.
+
+Light edits:
+- Small typos, isolated local bugfixes, or test fixes for an already-established behavior do not require a full reread.
+- Still do a quick map skim if the change touches phases, agents, CLI, storage, replay, carryover, memory, or investigation flows.
+
+Example:
+- If the map says Phase X is complete and Phase Y is next, but the codebase contains a half-finished experiment for Phase Y, align implementation to the map’s stated phase boundaries and scope instead of extending the experiment based only on what is already in the tree.
