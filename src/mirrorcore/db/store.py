@@ -451,6 +451,67 @@ class DatabaseStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_latest_unresolved_short_term_situation_row(
+        self,
+        *,
+        prompt_norm_hash: str,
+        effective_family: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Newest unresolved row for a prompt hash (Phase 47 replay recording)."""
+        self.ensure_phase44_short_term_situation()
+        conn = self.get_db_connection()
+        h = (prompt_norm_hash or "").strip()
+        if not h:
+            return None
+        if effective_family is not None:
+            fam = (effective_family or "general").strip().lower() or "general"
+            row = conn.execute(
+                """
+                SELECT id, created_at, updated_at, prompt_norm_hash, prompt_norm,
+                       effective_family, shape_key, stance_snippet, state, source,
+                       asked_slots_json
+                FROM short_term_situation_memory
+                WHERE prompt_norm_hash = ? AND state = 'unresolved'
+                  AND LOWER(TRIM(effective_family)) = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (h, fam),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT id, created_at, updated_at, prompt_norm_hash, prompt_norm,
+                       effective_family, shape_key, stance_snippet, state, source,
+                       asked_slots_json
+                FROM short_term_situation_memory
+                WHERE prompt_norm_hash = ? AND state = 'unresolved'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (h,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def touch_short_term_situation_updated_at(self, row_id: str) -> bool:
+        """Bump ``updated_at`` without changing stance (Phase 47 replay dedupe)."""
+        rid = (row_id or "").strip()
+        if not rid:
+            return False
+        self.ensure_phase44_short_term_situation()
+        conn = self.get_db_connection()
+        now = datetime.utcnow().isoformat()
+        cur = conn.execute(
+            """
+            UPDATE short_term_situation_memory
+            SET updated_at = ?
+            WHERE id = ? AND state = 'unresolved'
+            """,
+            (now, rid),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
     def find_situation_carryover(
         self,
         prompt_norm: str,

@@ -53,6 +53,9 @@ PHASE46_REPLACEMENT_FEEDBACK_MERGE_STRENGTH_MIN = 0.28  # align with respond inf
 PHASE46_REPLACEMENT_THREAD_OVERLAP_MIN = INTER_STRICT_WITHOUT_REF
 PHASE46_REPLACEMENT_THREAD_JACCARD_MIN = JACCARD_INTER_SOFT_MIN
 
+# --- Phase 47: two-token overlap bridge (only when Phase 46 min is not met; auditable) ---
+PHASE47_REFUSAL_THREAD_REFINEMENT_BRIDGE_JACCARD_MIN = 0.075
+
 STOPWORDS = frozenset(
     {
         "a",
@@ -493,6 +496,81 @@ def conflict_escalation_carryover_thread_ok(
     return False
 
 
+def phase47_narrow_coworker_refusal_rephrase_bridge(
+    cur_norm: str,
+    row_norm: str,
+    inter: int,
+    *,
+    cur_tokens: FrozenSet[str],
+    row_tokens: FrozenSet[str],
+) -> bool:
+    """
+    Phase 47: obvious same-thread rephrase when Jaccard/token overlap is exactly 2.
+
+    Covers near variants like "my coworker is pushing again after i already told them no"
+    vs an earlier coworker + refusal + shifts row where ``said`` vs ``told`` split tokens.
+
+    Narrow: work + refusal persistence on the current prompt, social-thread row, continuation
+    cues, and a small Jaccard floor so unrelated long prompts do not pass.
+    """
+    if inter != INTER_MIN_FOR_REF_GATE:
+        return False
+    if not reference_continuation_cues(cur_norm):
+        return False
+    lc = (cur_norm or "").lower()
+    lr = (row_norm or "").lower()
+    if not any(w in lc for w in ("coworker", "colleague")):
+        return False
+    if not any(w in lr for w in ("coworker", "colleague", "boss", "teammate")):
+        return False
+    if not _row_conflict_social_thread(row_norm):
+        return False
+    if not (
+        persistence_after_declined_shaped(cur_norm)
+        or still_persisting_wording(cur_norm)
+    ):
+        return False
+    cur_refusal = any(
+        n in lc
+        for n in (
+            "said no",
+            "told them no",
+            "tell them no",
+            "after i said",
+            "after i told",
+            "already said",
+            "already told",
+            "wont take no",
+            "won't take no",
+        )
+    )
+    row_refusal = any(
+        n in lr
+        for n in (
+            "said no",
+            "told them no",
+            "tell them no",
+            "after i said",
+            "after i told",
+            "already said",
+            "already told",
+            "wont take no",
+            "won't take no",
+            "cover",
+            "shift",
+            "push",
+            "asking",
+        )
+    )
+    if not (cur_refusal and row_refusal):
+        return False
+    uni = len(cur_tokens | row_tokens)
+    jacc = inter / uni if uni else 0.0
+    if jacc < PHASE47_REFUSAL_THREAD_REFINEMENT_BRIDGE_JACCARD_MIN:
+        return False
+    return True
+
+
 def feedback_replacement_same_thread_gate(
     cur_norm: str,
     row_norm: str,
@@ -525,6 +603,14 @@ def feedback_replacement_same_thread_gate(
     if not reference_continuation_cues(cur_norm):
         return False, "no_continuation_cues"
     if inter < PHASE46_REPLACEMENT_THREAD_OVERLAP_MIN:
+        if phase47_narrow_coworker_refusal_rephrase_bridge(
+            cur_norm,
+            row_norm,
+            inter,
+            cur_tokens=cur_t,
+            row_tokens=row_t,
+        ):
+            return True, "phase47_narrow_coworker_refusal_rephrase_bridge"
         return False, "token_overlap_below_phase46_min"
     uni = len(cur_t | row_t)
     jacc = inter / uni if uni else 0.0

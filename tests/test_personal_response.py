@@ -2825,6 +2825,189 @@ class TestPhase44RespondContinuation(unittest.TestCase):
         self.assertIn("newer approved replacement line wins here", low)
         self.assertNotIn("older replacement line should not win", low)
 
+    def test_phase47_exact_replay_stable_after_wording_off(self):
+        """Repeated same prompt must keep user-approved replacement on the surface."""
+        prev = normalize_input(
+            "what would i say coworker keeps asking me to cover shifts after i said no"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        replacement = "I already told you no. I can't take that on right now."
+        awkward = (
+            "I was already overloaded. I'd hold the line on what I already said."
+        )
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet=awkward,
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        self.db.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text=replacement,
+            confidence_shown=0.55,
+            effective_family=OBLIGATION_OVERLOAD,
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet=awkward[:200],
+            feedback_target="wording",
+        )
+        pr1 = generate_personal_response(prev, self.db, debug_phase44_carryover=True)
+        pr2 = generate_personal_response(prev, self.db, debug_phase44_carryover=True)
+        for pr in (pr1, pr2):
+            la = (pr.likely_answer or "").lower()
+            self.assertIn("already told you no", la)
+            self.assertNotIn("already overloaded", la)
+        self.assertTrue(pr2.phase44_carryover_debug["replay_exact_prompt_match"])
+        self.assertTrue(pr2.phase44_carryover_debug["replay_used_existing_corrected_stance"])
+
+    def test_phase47_my_coworker_pushing_again_variant_uses_approved_line(self):
+        prev = normalize_input(
+            "what would i say coworker keeps asking me to cover shifts after i said no"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        replacement = "I already told you no. I can't take that on right now."
+        awkward = "I was already overloaded. I'd hold the line on what I already said."
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet=awkward,
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        self.db.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text=replacement,
+            confidence_shown=0.55,
+            effective_family=OBLIGATION_OVERLOAD,
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet=awkward[:200],
+            feedback_target="wording",
+        )
+        q2 = normalize_input(
+            "my coworker is pushing again after i already told them no"
+        )
+        pr = generate_personal_response(q2, self.db, debug_phase44_carryover=True)
+        la = (pr.likely_answer or "").lower()
+        self.assertIn("already told you no", la)
+        self.assertNotIn("already overloaded", la)
+        dbg = pr.phase44_carryover_debug
+        self.assertTrue(dbg["phase46_feedback_merge"]["merge_applied"])
+        self.assertEqual(
+            dbg["phase46_feedback_merge"]["merge_block_reason"],
+            "",
+        )
+        self.assertTrue(dbg["replay_same_thread_variant_match"])
+        self.assertTrue(
+            dbg["phase46_feedback_merge"]["replacement_thread_gate_ok"]
+        )
+
+    def test_phase47_near_variant_uses_stm_stance_when_variant_hash_has_no_feedback(
+        self,
+    ):
+        """
+        Carryover winner can be a thread variant whose stance_snippet already holds
+        the user-approved line (from prior replay) while personal_response_feedback
+        rows still live only on an older prompt hash. Phase 47 must inherit from
+        stance_snippet under the same-thread gate.
+        """
+        prev_variant = normalize_input(
+            "same coworker keeps pushing after i already said no"
+        )
+        ph_var = hashlib.sha256(prev_variant.encode("utf-8")).hexdigest()
+        stored_line = "I already told you no. I can't take that on right now."
+        self.db.record_short_term_situation(
+            prompt_norm=prev_variant,
+            prompt_norm_hash=ph_var,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev_variant, OBLIGATION_OVERLOAD),
+            stance_snippet=stored_line,
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        infl = build_respond_feedback_influence(
+            self.db, ph_var, OBLIGATION_OVERLOAD
+        )
+        self.assertFalse(infl.action_ok_wording_off)
+        q2 = normalize_input(
+            "my coworker is pushing again after i already told them no"
+        )
+        pr = generate_personal_response(q2, self.db, debug_phase44_carryover=True)
+        la = (pr.likely_answer or "").lower()
+        self.assertIn("already told you no", la)
+        self.assertNotIn("same way as before", la)
+        dbg = pr.phase44_carryover_debug
+        self.assertTrue(dbg["phase46_feedback_merge"]["merge_applied"])
+        self.assertTrue(dbg["phase46_feedback_merge"]["stance_snippet_carryover_merge"])
+        self.assertEqual(
+            dbg["phase46_feedback_merge"]["merge_source"],
+            "carryover_row_stored_stance_snippet_phase47",
+        )
+        self.assertIn(
+            "stance",
+            dbg["phase46_feedback_merge"]["corrected_stance_inheritance_reason"],
+        )
+
+    def test_phase47_stm_stance_prefers_resolved_replacement_over_wrong_inject(self):
+        """STM recording must not prefer wrong+replacement inject over action-ok line."""
+        prev = normalize_input(
+            "what would i say coworker keeps asking me to cover shifts after i said no"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        approved = "USER APPROVED REPLACEMENT LINE FOR STM RECORD"
+        awkward = "awkward stitched surface line for test"
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet=awkward,
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        self.db.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="wrong",
+            partial_aspect="",
+            replacement_text="WRONG INJECT LINE SHOULD NOT WIN STM",
+            confidence_shown=0.5,
+            effective_family=OBLIGATION_OVERLOAD,
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet="x",
+            feedback_target="wording",
+        )
+        self.db.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text=approved,
+            confidence_shown=0.55,
+            effective_family=OBLIGATION_OVERLOAD,
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet=awkward[:200],
+            feedback_target="wording",
+        )
+        generate_personal_response(prev, self.db)
+        latest = self.db.get_latest_unresolved_short_term_situation_row(
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+        )
+        self.assertIsNotNone(latest)
+        st = (latest.get("stance_snippet") or "").strip()
+        self.assertIn("USER APPROVED", st)
+        self.assertNotIn("WRONG INJECT", st)
+
     def test_spending_realism_pass_no_mixed_pronouns_on_needs_clause(self):
         raw = (
             "You'd likely separate what you truly need from what you want right now "

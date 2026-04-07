@@ -23,6 +23,7 @@ from mirrorcore.decision.situation_carryover import (
     diagnose_ask_carryover_candidates,
     feedback_replacement_same_thread_gate,
     low_information_carryover_row_exclusion_reason,
+    phase47_narrow_coworker_refusal_rephrase_bridge,
     pick_best_carryover,
     pick_best_carryover_for_ask,
     reference_continuation_cues,
@@ -416,6 +417,52 @@ class TestSituationCarryover(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(reason, "thread_gate_escalation_ok")
 
+    def test_phase47_narrow_bridge_two_token_coworker_refusal_rephrase(self):
+        """Phase 47: 'told' vs 'said' splits tokens; bridge fires at inter==2."""
+        prev = normalize_input(
+            "what would i say coworker keeps asking me to cover shifts after i said no"
+        )
+        cur = normalize_input(
+            "my coworker is pushing again after i already told them no"
+        )
+        ct = significant_tokens(cur)
+        rt = significant_tokens(prev)
+        inter = len(ct & rt)
+        self.assertEqual(inter, 2)
+        self.assertTrue(
+            phase47_narrow_coworker_refusal_rephrase_bridge(
+                cur, prev, inter, cur_tokens=ct, row_tokens=rt
+            )
+        )
+        h_prev = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        h_cur = hashlib.sha256(cur.encode("utf-8")).hexdigest()
+        row = {
+            "state": "unresolved",
+            "updated_at": "2026-04-05T12:00:00",
+            "effective_family": "obligation_overload",
+            "prompt_norm": prev,
+            "prompt_norm_hash": h_prev,
+            "shape_key": carryover_shape_key(prev, "obligation_overload"),
+            "stance_snippet": "z",
+        }
+        ok, reason = feedback_replacement_same_thread_gate(
+            cur,
+            prev,
+            h_cur,
+            h_prev,
+            carryover_shape_key(cur, "obligation_overload"),
+            row["shape_key"],
+            row,
+        )
+        self.assertTrue(ok, msg=reason)
+        self.assertIn(
+            reason,
+            (
+                "thread_gate_escalation_ok",
+                "phase47_narrow_coworker_refusal_rephrase_bridge",
+            ),
+        )
+
     def test_conflict_escalation_thread_ok_false_across_unrelated_domains(self):
         prev = normalize_input("should i buy a laptop when rent is late")
         cur = normalize_input(
@@ -540,6 +587,41 @@ class TestSituationCarryover(unittest.TestCase):
         self.assertIsNone(
             respond_route_keys_skip_short_term_situation_record(("strong_decision",))
         )
+
+    def test_phase47_get_latest_unresolved_and_touch_updated_at(self):
+        p = Path(__file__).parent / "_tmp_phase47_touch.db"
+        if p.exists():
+            p.unlink()
+        store = DatabaseStore(p)
+        store.initialize_database()
+        prev = normalize_input("coworker cover shifts after i said no test touch")
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        eid = store.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family="obligation_overload",
+            shape_key=carryover_shape_key(prev, "obligation_overload"),
+            stance_snippet="stance a",
+            source="respond_like_me",
+        )
+        self.assertIsNotNone(eid)
+        row1 = store.get_latest_unresolved_short_term_situation_row(
+            prompt_norm_hash=ph,
+            effective_family="obligation_overload",
+        )
+        self.assertIsNotNone(row1)
+        self.assertEqual(row1.get("stance_snippet"), "stance a")
+        u1 = str(row1.get("updated_at") or "")
+        self.assertTrue(store.touch_short_term_situation_updated_at(str(eid)))
+        row2 = store.get_latest_unresolved_short_term_situation_row(
+            prompt_norm_hash=ph,
+            effective_family="obligation_overload",
+        )
+        self.assertIsNotNone(row2)
+        u2 = str(row2.get("updated_at") or "")
+        self.assertNotEqual(u1, u2)
+        store.close()
+        p.unlink(missing_ok=True)
 
     def test_carryover_safe_stance_fallback_avoids_hold_the_line_phrasing(self):
         pn = normalize_input(

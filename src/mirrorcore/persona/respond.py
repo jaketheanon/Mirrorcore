@@ -1055,6 +1055,96 @@ def _phase46_has_action_ok_replacement_line(infl: RespondFeedbackInfluence) -> b
     )
 
 
+# Phrases from obligation stitched templates (see _obligation_boundary_blunt_reply_line) —
+# if a carryover stance_snippet contains these, it is not a user-approved direct line.
+_PHASE47_OBLIGATION_STITCHED_STANCE_MARKERS: Tuple[str, ...] = (
+    "same way as before",
+    "clear and plain",
+    "same short no, not a new debate",
+    "repeat the same words if they push",
+    "like: \"say no",
+    'like: "say no',
+    "like: \"say",
+    " — like:",
+    ' — like: "',
+    " - like: \"",
+    ' - like: "',
+    "mostly because i was already overloaded",
+    "i'd say no the same way",
+    "i'd hold the line on what i already said",
+    "i'd keep my boundary simple",
+)
+
+# Prefixes aligned with carryover_safe_stance_fallback (narrow reject list).
+_PHASE47_CARRYOVER_SAFE_FALLBACK_STANCE_PREFIXES: Tuple[str, ...] = (
+    "same clear no as before",
+    "same boundary as before",
+    "same direct calm stance as before",
+    "same stance as before",
+    "same direction as before",
+)
+
+
+def _phase47_stance_snippet_has_stitched_obligation_markers(low: str) -> bool:
+    return any(m in low for m in _PHASE47_OBLIGATION_STITCHED_STANCE_MARKERS)
+
+
+def _phase47_stance_snippet_matches_safe_fallback_prefix(low: str) -> bool:
+    return any(low.startswith(p) for p in _PHASE47_CARRYOVER_SAFE_FALLBACK_STANCE_PREFIXES)
+
+
+def _phase47_stance_snippet_has_first_person_refusal_anchor(low: str) -> bool:
+    """Narrow: direct surface line the user would say, not generic imperative coaching."""
+    if low.startswith(("i ", "i'd ", "i've ", "i'm ")):
+        return True
+    if "i already" in low or "i told you" in low or "i've already" in low:
+        return True
+    if "told you no" in low:
+        return True
+    return False
+
+
+def _phase47_obligation_persistence_stance_merge_prompt_shaped(prompt_norm: str) -> bool:
+    """
+    Phase 47 stance merge applies only to obligation / boundary-persistence threads,
+    not generic interpersonal-conflict coaching (wrong+replacement inject still applies).
+    """
+    pn = normalize_input(prompt_norm or "")
+    if persistence_after_declined_shaped(pn) or still_persisting_wording(pn):
+        return True
+    cues = conflict_situational_cues(pn)
+    if cues.get("boundary_push"):
+        return True
+    return False
+
+
+def carryover_row_stance_eligible_for_phase47_corrected_merge(
+    snippet: str,
+    *,
+    prompt_norm: str,
+) -> bool:
+    """
+    Phase 47: when a carryover row's prompt hash has no action_ok feedback rows, the
+    short-term stance_snippet may still hold the user-approved replacement (STM rewrite).
+
+    Only accept snippets that look like a direct spoken line, not stitched templates
+    or deterministic safe fallbacks. Narrow to obligation/boundary-persistence prompts.
+    """
+    if not _phase47_obligation_persistence_stance_merge_prompt_shaped(prompt_norm):
+        return False
+    s = (snippet or "").strip()
+    if len(s) < 12 or len(s) > 400:
+        return False
+    low = s.lower()
+    if _phase47_stance_snippet_has_stitched_obligation_markers(low):
+        return False
+    if _phase47_stance_snippet_matches_safe_fallback_prefix(low):
+        return False
+    if not _phase47_stance_snippet_has_first_person_refusal_anchor(low):
+        return False
+    return True
+
+
 def _phase46_resolved_replacement_line(infl: RespondFeedbackInfluence) -> str:
     if infl.action_ok_wording_off:
         w = (infl.action_ok_wording_replacement_line or "").strip()
@@ -1085,7 +1175,12 @@ def phase46_merge_carryover_feedback_influence(
         "merge_attempted": False,
         "merge_applied": False,
         "merge_block_reason": "",
+        "merge_source": "",
         "carryover_row_hash": "",
+        "replacement_thread_gate_ok": False,
+        "replacement_thread_gate_reason": "",
+        "stance_snippet_carryover_merge": False,
+        "corrected_stance_inheritance_reason": "",
     }
     if _phase46_has_action_ok_replacement_line(base):
         info["merge_block_reason"] = "current_prompt_has_action_ok_replacement"
@@ -1119,18 +1214,41 @@ def phase46_merge_carryover_feedback_influence(
         row_shape,
         match,
     )
+    info["replacement_thread_gate_ok"] = bool(ok)
+    info["replacement_thread_gate_reason"] = str(reason or "")
     if not ok:
         info["merge_block_reason"] = reason
         return base, info
     alt = build_respond_feedback_influence(store, row_hash, str(eff_pf or "general"))
-    if not alt.action_ok_wording_off:
-        info["merge_block_reason"] = "carryover_prompt_no_action_ok_wording_feedback"
-        return base, info
-    rep = (alt.action_ok_wording_replacement_line or "").strip()
+    rep = ""
+    merge_source = ""
+    if _phase46_has_action_ok_replacement_line(alt):
+        rep = (alt.action_ok_wording_replacement_line or "").strip()
+        merge_source = "carryover_prompt_action_ok_feedback"
+        info["corrected_stance_inheritance_reason"] = (
+            "carryover_row_prompt_hash_has_action_ok_wording_feedback"
+        )
+    else:
+        stance_snip = str(match.get("stance_snippet") or "").strip()
+        if carryover_row_stance_eligible_for_phase47_corrected_merge(
+            stance_snip, prompt_norm=prompt_norm
+        ):
+            rep = stance_snip[:400]
+            merge_source = "carryover_row_stored_stance_snippet_phase47"
+            info["stance_snippet_carryover_merge"] = True
+            info["corrected_stance_inheritance_reason"] = (
+                "same_thread_gate_ok_carryover_row_stance_matches_phase47_direct_line_rules"
+            )
+        else:
+            info["merge_block_reason"] = (
+                "carryover_prompt_no_action_ok_wording_feedback_or_eligible_stance"
+            )
+            return base, info
     if len(rep) < 8:
         info["merge_block_reason"] = "carryover_replacement_text_too_short"
         return base, info
     info["merge_applied"] = True
+    info["merge_source"] = merge_source
     new_pref = dict(base.pref_token_weight)
     seed = float(RESPOND_PHASE46_REPLACEMENT_PREF_TOKEN_SEED)
     for tok in _tokenize_feedback_phrase(rep):
@@ -3781,7 +3899,12 @@ def generate_personal_response(
         if _ch and len(_cs) >= 12:
             _cfb = build_respond_feedback_influence(store, _ch, _cfam)
             _rep_line = (_cfb.action_ok_wording_replacement_line or "").strip()
-            if _cfb.action_ok_wording_off and len(_rep_line) >= 8:
+            _from_db = _cfb.action_ok_wording_off and len(_rep_line) >= 8
+            if not _from_db and carryover_row_stance_eligible_for_phase47_corrected_merge(
+                _cs, prompt_norm=prompt_norm
+            ):
+                _rep_line = _cs[:400]
+            if len(_rep_line) >= 8:
                 row_shape = str(_cm.get("shape_key") or "")
                 cur_shape = carryover_shape_key(
                     prompt_norm, str(eff_pf or "general")
@@ -3796,8 +3919,9 @@ def generate_personal_response(
                     _cm,
                 )
                 if _gate_ok:
-                    # Prefer explicit DB replacement text over stance snippet when the
-                    # short-term row did not get rewritten for that hash.
+                    # Prefer explicit DB replacement text; else Phase 47 eligible
+                    # stance_snippet (same-thread STM may hold approved wording without
+                    # feedback rows for that variant hash).
                     answer = _rep_line
                     _carry_used_replacement_stance = True
 
@@ -3884,26 +4008,89 @@ def generate_personal_response(
     )
     short_term_stance_mode = "surface_first_line"
     planned_st_snip = default_st_snip
+    resolved_stm_rep = (_phase46_resolved_replacement_line(feedback_influence) or "").strip()
+    # Phase 47: for wording-off feedback, always prefer the resolved user-approved /
+    # merged replacement line for STM — not the wrong+replacement inject line alone,
+    # which can differ and self-poison replayed stance rows.
     if feedback_influence.action_ok_wording_off:
-        rep_fb = (feedback_influence.replacement_inject_line or "").strip()
-        if len(rep_fb) < 8:
-            rep_fb = (feedback_influence.action_ok_wording_replacement_line or "").strip()
-        if len(rep_fb) >= 8:
-            planned_st_snip = rep_fb[:200]
-            short_term_stance_mode = "replacement_from_feedback"
+        if len(resolved_stm_rep) >= 8:
+            planned_st_snip = resolved_stm_rep[:220]
+            short_term_stance_mode = "replay_resolved_user_approved_replacement"
         else:
             planned_st_snip = carryover_safe_stance_fallback(
                 prompt_norm, str(eff_pf or "general")
             )[:200]
             short_term_stance_mode = "carryover_safe_after_wording_feedback"
-    phase44_carryover_debug: Optional[Dict[str, Any]] = None
+
+    rows_for_carryover_debug: Optional[List[Dict[str, Any]]] = None
     if debug_phase44_carryover:
-        rows_dbg: List[Dict[str, Any]] = []
         try:
             if hasattr(store, "list_recent_short_term_situations"):
-                rows_dbg = store.list_recent_short_term_situations(limit=40)
+                rows_for_carryover_debug = store.list_recent_short_term_situations(
+                    limit=40
+                )
         except Exception:
-            rows_dbg = []
+            rows_for_carryover_debug = []
+
+    replay_recording_mode_dbg = ""
+    replay_recording_block_reason_dbg = ""
+    replay_protected_from_self_poisoning_dbg = False
+    stm_replay_dedupe_touch = False
+    stm_row_inserted = False
+    try:
+        rec = getattr(store, "record_short_term_situation", None)
+        if not callable(rec):
+            replay_recording_mode_dbg = "no_record_method"
+        elif stm_record_skip_reason is not None:
+            replay_recording_mode_dbg = "skipped_low_information_route"
+            replay_recording_block_reason_dbg = stm_record_skip_reason or ""
+        else:
+            sk_rec = combined_shape_key(
+                prompt_norm,
+                str(eff_pf or "general"),
+                evidence_path.to_storage_dict(),
+            )
+            skip_stm_insert = False
+            get_latest = getattr(
+                store, "get_latest_unresolved_short_term_situation_row", None
+            )
+            touch_stm = getattr(store, "touch_short_term_situation_updated_at", None)
+            if callable(get_latest) and callable(touch_stm):
+                prev_stm = get_latest(
+                    prompt_norm_hash=prompt_norm_hash,
+                    effective_family=str(eff_pf or "general"),
+                )
+                if prev_stm:
+                    prev_st = (prev_stm.get("stance_snippet") or "").strip()
+                    plan_st = (planned_st_snip or "").strip()
+                    if prev_st and prev_st == plan_st:
+                        rid = str(prev_stm.get("id") or "").strip()
+                        if rid and touch_stm(rid):
+                            skip_stm_insert = True
+                            stm_replay_dedupe_touch = True
+                            replay_recording_mode_dbg = "replay_refreshed_existing_row"
+                            replay_protected_from_self_poisoning_dbg = True
+            if not skip_stm_insert:
+                rec(
+                    prompt_norm=prompt_norm,
+                    prompt_norm_hash=prompt_norm_hash,
+                    effective_family=str(eff_pf or "general"),
+                    shape_key=sk_rec,
+                    stance_snippet=planned_st_snip,
+                    source="respond_like_me",
+                )
+                stm_row_inserted = True
+                if not replay_recording_mode_dbg:
+                    replay_recording_mode_dbg = "inserted_new_row"
+    except Exception:
+        replay_recording_mode_dbg = replay_recording_mode_dbg or "record_error_skipped"
+        replay_recording_block_reason_dbg = (
+            replay_recording_block_reason_dbg or "exception_during_short_term_record"
+        )
+
+    phase44_carryover_debug: Optional[Dict[str, Any]] = None
+    if debug_phase44_carryover:
+        rows_dbg: List[Dict[str, Any]] = list(rows_for_carryover_debug or [])
         ask_diag = diagnose_ask_carryover_candidates(
             prompt_norm, prompt_norm_hash, rows_dbg
         )
@@ -3952,6 +4139,31 @@ def generate_personal_response(
         else:
             p46_block_dbg = "no_user_replacement_line_available"
 
+        _mh_dbg = ""
+        if situation_carryover and situation_carryover.get("match"):
+            _mh_dbg = str(
+                situation_carryover["match"].get("prompt_norm_hash") or ""
+            ).strip()
+        _ch_dbg = (prompt_norm_hash or "").strip()
+        replay_exact_prompt_match_dbg = bool(_mh_dbg and _mh_dbg == _ch_dbg)
+        replay_same_thread_variant_match_dbg = bool(
+            _mh_dbg
+            and _ch_dbg
+            and _mh_dbg != _ch_dbg
+            and carry_strength >= float(RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN)
+        )
+        replay_used_existing_corrected_stance_dbg = bool(
+            _carry_used_replacement_stance
+            or (
+                bool(p46_rep_dbg)
+                and (
+                    p46_sel_dbg
+                    or (p46_rep_dbg.lower() in fa_dbg)
+                    or _answer_covers_injection_tokens(answer or "", p46_rep_dbg)
+                )
+            )
+        )
+
         phase44_carryover_debug = {
                 "prompt_norm_prefix": (prompt_norm or "")[:160],
                 "pick_best_for_ask": ask_diag,
@@ -3992,7 +4204,10 @@ def generate_personal_response(
                 phase45_escalation.get("phase45_boost_direct_boundary_retrieval")
             ),
             "short_term_situation_record_skip_reason": stm_record_skip_reason or "",
-            "short_term_situation_will_record": stm_record_skip_reason is None,
+            "short_term_situation_will_record": bool(
+                stm_record_skip_reason is None
+                and (stm_row_inserted or stm_replay_dedupe_touch)
+            ),
             "short_term_stance_recording_mode": (
                 short_term_stance_mode
                 if stm_record_skip_reason is None
@@ -4015,27 +4230,17 @@ def generate_personal_response(
             "older_phrasing_demoted_due_to_feedback": bool(
                 phase46_overlay_demoted or phase46_carryover_demoted
             ),
+            "replay_exact_prompt_match": replay_exact_prompt_match_dbg,
+            "replay_same_thread_variant_match": replay_same_thread_variant_match_dbg,
+            "replay_used_existing_corrected_stance": (
+                replay_used_existing_corrected_stance_dbg
+            ),
+            "replay_recording_mode": replay_recording_mode_dbg,
+            "replay_recording_block_reason": replay_recording_block_reason_dbg,
+            "replay_protected_from_self_poisoning": (
+                replay_protected_from_self_poisoning_dbg
+            ),
         }
-
-    try:
-        rec = getattr(store, "record_short_term_situation", None)
-        if callable(rec) and stm_record_skip_reason is None:
-            sk_rec = combined_shape_key(
-                prompt_norm,
-                str(eff_pf or "general"),
-                evidence_path.to_storage_dict(),
-            )
-            rec(
-                prompt_norm=prompt_norm,
-                prompt_norm_hash=prompt_norm_hash,
-                effective_family=str(eff_pf or "general"),
-                shape_key=sk_rec,
-                stance_snippet=planned_st_snip,
-                source="respond_like_me",
-            )
-    except Exception:
-        pass
-
 
         
         
