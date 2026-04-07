@@ -4,7 +4,7 @@ import hashlib
 import json
 import sys
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -32,6 +32,11 @@ from mirrorcore.decision.situation_carryover import (
 )
 from mirrorcore.decision.ontology import GENERAL, OBLIGATION_OVERLOAD
 from mirrorcore.router import normalize_input
+
+
+def _carryover_row_recent_timestamp() -> str:
+    """Keep synthetic STM rows inside ``short_term_row_recent_enough`` across test dates."""
+    return (datetime.utcnow() - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 class TestSituationCarryover(unittest.TestCase):
@@ -336,7 +341,7 @@ class TestSituationCarryover(unittest.TestCase):
         h = hashlib.sha256(prev.encode("utf-8")).hexdigest()
         row = {
             "state": "unresolved",
-            "updated_at": "2026-04-05T12:00:00",
+            "updated_at": _carryover_row_recent_timestamp(),
             "effective_family": "obligation_overload",
             "prompt_norm": prev,
             "prompt_norm_hash": h,
@@ -366,7 +371,7 @@ class TestSituationCarryover(unittest.TestCase):
         h_cur = hashlib.sha256(cur.encode("utf-8")).hexdigest()
         row = {
             "state": "unresolved",
-            "updated_at": "2026-04-05T12:00:00",
+            "updated_at": _carryover_row_recent_timestamp(),
             "effective_family": "obligation_overload",
             "prompt_norm": prev,
             "prompt_norm_hash": h_prev,
@@ -398,7 +403,7 @@ class TestSituationCarryover(unittest.TestCase):
         h_cur = hashlib.sha256(cur.encode("utf-8")).hexdigest()
         row = {
             "state": "unresolved",
-            "updated_at": "2026-04-05T12:00:00",
+            "updated_at": _carryover_row_recent_timestamp(),
             "effective_family": "obligation_overload",
             "prompt_norm": prev,
             "prompt_norm_hash": h_prev,
@@ -438,7 +443,7 @@ class TestSituationCarryover(unittest.TestCase):
         h_cur = hashlib.sha256(cur.encode("utf-8")).hexdigest()
         row = {
             "state": "unresolved",
-            "updated_at": "2026-04-05T12:00:00",
+            "updated_at": _carryover_row_recent_timestamp(),
             "effective_family": "obligation_overload",
             "prompt_norm": prev,
             "prompt_norm_hash": h_prev,

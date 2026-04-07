@@ -2005,6 +2005,123 @@ def _phase41_style_realism_pass(text: str, *, answer_focus: str) -> str:
     return out.strip()
 
 
+def _phase48_fix_sentence_initial_pronoun(chunk: str) -> str:
+    """Capitalize sentence-initial ``i`` / common contractions (safe surface fix)."""
+    if not chunk:
+        return chunk
+    m = re.match(r"^(\s*)([\s\S]*)$", chunk)
+    if not m:
+        return chunk
+    ws, body = m.group(1), m.group(2)
+    if not body:
+        return chunk
+    bl = body.lower()
+    fixes = (
+        ("i'd ", "I'd "),
+        ("i'd.", "I'd."),
+        ("i'm ", "I'm "),
+        ("i've ", "I've "),
+        ("i'll ", "I'll "),
+        ("i cant ", "I can't "),
+        ("i cant.", "I can't."),
+        ("i won't ", "I won't "),
+        ("i won't.", "I won't."),
+        ("i wont ", "I won't "),
+        ("i wont.", "I won't."),
+        ("i ", "I "),
+    )
+    for ol, nw in fixes:
+        if bl.startswith(ol):
+            return ws + nw + body[len(ol) :]
+    return chunk
+
+
+def _phase48_normalize_sentence_starts(segment: str) -> str:
+    """Apply pronoun fixes after ``.!?`` boundaries within one line."""
+    if not segment:
+        return segment
+    parts = re.split(r"([.!?]\s+)", segment)
+    out: List[str] = []
+    for i, p in enumerate(parts):
+        if i % 2 == 0:
+            out.append(_phase48_fix_sentence_initial_pronoun(p))
+        else:
+            out.append(p)
+    return "".join(out)
+
+
+def _phase48_dedupe_stacked_out_loud_wrappers(text: str) -> str:
+    """
+    Drop a redundant ``it might sound like this`` line when the next block
+    already opens with the same out-loud hook.
+    """
+    t = (text or "").strip()
+    if not t:
+        return t
+    return re.sub(
+        r"(?is)\bIf I said it out loud, it might sound like this:\s*\n+\s*(If I said it out loud)",
+        r"\1",
+        t,
+    )
+
+
+def _phase48_fix_pronoun_after_closing_quote(text: str) -> str:
+    """``..." i was`` fragments — sentence split misses ``."`` before a space."""
+    return re.sub(r'(["\u201d])(\s+)i\b', r"\1\2I", text)
+
+
+def _phase48_fix_because_i(text: str) -> str:
+    """Normalize ``because i`` / ``mostly because i`` after template merges."""
+    t = re.sub(r"(?i)\bmostly because i\b", "Mostly because I", text)
+    return re.sub(r"(?i)\bbecause i\b", "because I", t)
+
+
+def _phase48_strip_duplicate_trailing_why(action_line: str, wording_flat: str) -> str:
+    """
+    When the action paragraph already ends with ``Mostly because {why}``, drop the
+    same ``why`` fragment repeated at the end of the wording line (Phase 48).
+    """
+    a = (action_line or "").strip()
+    w = (wording_flat or "").strip()
+    if not a or not w:
+        return w
+    m = re.search(r"(?is)\bmostly\s+because\s+(.+?)\.(\s*)$", a)
+    if not m:
+        return w
+    why_raw = (m.group(1) or "").strip()
+    if len(why_raw) < 6:
+        return w
+    w_st = w.strip()
+    w_low = w_st.lower()
+    suf = why_raw.lower().rstrip(".") + "."
+    if w_low.endswith(suf):
+        cut = w_st[: -len(suf)].rstrip()
+        return cut if len(cut) >= 12 else w
+    return w
+
+
+def _phase48_final_answer_polish(text: str) -> str:
+    """
+    Phase 48: presentation-only cleanup for surfaced ``likely_answer``.
+
+    Does not touch ``reasoning_brief``. Deterministic; no retrieval/scoring changes.
+    """
+    t = (text or "").strip()
+    if not t:
+        return t
+    t = _phase48_dedupe_stacked_out_loud_wrappers(t)
+    lines = t.split("\n")
+    fixed_lines = []
+    for line in lines:
+        ln = _phase48_normalize_sentence_starts(line)
+        ln = _phase48_fix_pronoun_after_closing_quote(ln)
+        ln = _phase48_fix_because_i(ln)
+        fixed_lines.append(ln)
+    t = "\n".join(fixed_lines)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
 def _family_label(primary_family: str) -> str:
     pf = (primary_family or "").strip().lower()
     if "conflict" in pf:
@@ -2266,6 +2383,7 @@ def _merge_action_wording_paragraphs(action_line: str, wording_line: str, *, see
         )
         return f"{a}\n{tail[_stable_index(f'{seed}:br_dup', len(tail))]}"
     w_flat = " ".join(w.split())
+    w_flat = _phase48_strip_duplicate_trailing_why(a, w_flat)
     low_w = w_flat.lower()
     if low_w.startswith("if i said it out loud"):
         wording_block = w_flat
@@ -2828,19 +2946,9 @@ def _strict_spending_pressure_evidence_fallback(
         )
     idx = _stable_index(f"{phrase_seed}:spendfb", len(opts_core))
     answer = opts_core[idx]
-    af = (answer_focus or "both").strip().lower()
-    if af not in ("action", "wording", "both"):
-        af = "both"
-    if af in ("wording", "both"):
-        talk_track = (
-            "The line I'd use with myself is blunt: essentials first, treat the big want like it can wait.",
-            "If I said it out loud, it would sound like triage — roof and bills stable before the shiny buy.",
-        )
-        tt = talk_track[_stable_index(f"{phrase_seed}:spendtt", len(talk_track))]
-        if af == "both":
-            answer = f"{answer}\n\nIf I said it out loud, it might sound like this:\n{tt}"
-        else:
-            answer = answer + " " + tt
+    # Phase 48.1: ``opts_core`` already states rent-first / pause-want triage in full.
+    # Appending talk-track lines duplicated the same gist with a mismatched “out loud”
+    # tone; keep one strong practical surface for all answer_focus values here.
 
     reasoning = (
         "No same-shape money save matched this prompt, so I am not leaning on quick-vs-careful work habits — "
@@ -3933,6 +4041,8 @@ def generate_personal_response(
             answer_pre_carryover_replace, phase46_rep_line
         )
     )
+
+    answer = _phase48_final_answer_polish(answer)
 
     continuity_note = ""
     reasoning_line_audit = _respond_carryover_reasoning_line_audit(

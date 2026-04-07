@@ -31,7 +31,9 @@ from mirrorcore.decision.situation_carryover import (
 from mirrorcore.persona.respond import (
     RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN,
     RespondEvidencePath,
+    _merge_action_wording_paragraphs,
     _phase41_style_realism_pass,
+    _phase48_final_answer_polish,
     _respond_carryover_reasoning_line_audit,
     _evaluate_phase45_conflict_escalation,
     _respond_carryover_suppress_avoidance,
@@ -482,6 +484,78 @@ class TestRespondGeneration(unittest.TestCase):
         self.assertNotIn("proper way", low)
         self.assertTrue(
             any(w in low for w in ("hold", "pause", "triage", "rent", "optional", "stable"))
+        )
+
+    def test_phase48_spending_both_mode_no_stacked_out_loud_wrapper(self):
+        """Phase 48.1: strict spending fallback stays one practical paragraph (no talk-track echo)."""
+        self.db.record_decision_memory(
+            scenario_id="speed_vs_safety_phase48",
+            scenario_text=(
+                "You need to get something done and there's a quick way that cuts some corners."
+            ),
+            choice_label="Do it the proper way even if it takes longer",
+            choice_value="right",
+            reasoning_label="Avoid regret from sloppy work",
+            reasoning_value="r",
+            value_tags=["quality", "caution"],
+            trait_signals={"thoroughness": 0.9, "risk_tolerance": 0.2},
+            confidence_score=0.9,
+            correction_status="accurate",
+        )
+        pr = generate_personal_response(
+            "i want to buy something fun but rent is due tomorrow and i am short on money",
+            self.db,
+        )
+        self.assertEqual(pr.effective_family, "spending")
+        low = pr.likely_answer.lower()
+        self.assertNotIn("\n", (pr.likely_answer or "").strip(), msg=pr.likely_answer)
+        self.assertNotIn("if i said it out loud", low, msg=pr.likely_answer)
+        self.assertNotIn("might sound like this", low, msg=pr.likely_answer)
+        self.assertNotIn("line i'd use with myself", low, msg=pr.likely_answer)
+        self.assertTrue(
+            any(
+                w in low
+                for w in (
+                    "rent",
+                    "roof",
+                    "want",
+                    "need",
+                    "pause",
+                    "triage",
+                    "bill",
+                    "optional",
+                    "cheaper",
+                )
+            ),
+            msg=pr.likely_answer,
+        )
+
+    def test_phase48_final_polish_fixes_mid_sentence_i_cant(self):
+        self.assertEqual(
+            _phase48_final_answer_polish("I already said no. i cant take that on right now"),
+            "I already said no. I can't take that on right now",
+        )
+
+    def test_phase48_final_polish_dedupes_legacy_double_out_loud_header(self):
+        raw = (
+            "I'd triage bills first.\n\n"
+            "If I said it out loud, it might sound like this:\n"
+            "If I said it out loud, it would sound like triage — roof first."
+        )
+        out = _phase48_final_answer_polish(raw)
+        self.assertEqual(out.lower().count("if i said it out loud"), 1)
+
+    def test_phase48_merge_drops_repeated_why_after_quoted_line(self):
+        act = "I'd hold the line. Mostly because I was already overloaded."
+        wrd = (
+            'you\'d probably go with: "Say no, explain you can\'t right now." '
+            "i was already overloaded."
+        )
+        out = _merge_action_wording_paragraphs(act, wrd, seed="phase48_why_dedupe")
+        self.assertEqual(
+            out.lower().count("already overloaded"),
+            1,
+            msg=out,
         )
 
     def test_cross_family_does_not_quote_shift_save_for_gossip_prompt(self):
