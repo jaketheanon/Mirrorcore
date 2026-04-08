@@ -1833,7 +1833,7 @@ def _confidence_bucket(value: float) -> str:
     return "high"
 
 
-def _compute_response_confidence(
+def _compute_response_confidence_detail(
     profile: PersonalProfile,
     top_decision_score: float,
     top_decision: Optional[Dict[str, Any]],
@@ -1844,32 +1844,126 @@ def _compute_response_confidence(
     example_influence: Optional[RespondExampleInfluence] = None,
     route_keys: Optional[Sequence[str]] = None,
     feedback_direction_mixed: float = 0.0,
-) -> float:
+) -> Tuple[float, List[Dict[str, Any]]]:
+    """Same numerics as legacy confidence; also returns ordered step trace (Phase 51)."""
+    trace: List[Dict[str, Any]] = []
     base = 0.32
+    trace.append(
+        {
+            "step": "base",
+            "delta": 0.32,
+            "running": round(base, 4),
+        }
+    )
     ev = min(1.0, profile.total_evidence_weight / 8.0)
-    base += 0.18 * ev
-    base += 0.14 * min(1.0, top_decision_score / 4.5)
+    d_ev = 0.18 * ev
+    base += d_ev
+    trace.append(
+        {
+            "step": "evidence_weight_component",
+            "delta": round(d_ev, 4),
+            "running": round(base, 4),
+            "detail": f"total_evidence_weight={profile.total_evidence_weight:.3f}",
+        }
+    )
+    d_top = 0.14 * min(1.0, top_decision_score / 4.5)
+    base += d_top
+    trace.append(
+        {
+            "step": "top_decision_score_component",
+            "delta": round(d_top, 4),
+            "running": round(base, 4),
+            "detail": f"top_score={top_decision_score:.4f}",
+        }
+    )
     if profile.has_trait_conflict:
         base -= 0.12
+        trace.append(
+            {
+                "step": "trait_conflict_penalty",
+                "delta": -0.12,
+                "running": round(base, 4),
+            }
+        )
     conf_ag = agreement_boost
-    base += 0.12 * min(1.0, conf_ag)
+    d_ag = 0.12 * min(1.0, conf_ag)
+    base += d_ag
+    trace.append(
+        {
+            "step": "agreement_boost_component",
+            "delta": round(d_ag, 4),
+            "running": round(base, 4),
+            "detail": f"agreement_boost={conf_ag:.4f}",
+        }
+    )
     if top_decision:
         st = top_decision.get("correction_status")
         if st == "accurate":
             base += 0.08
+            trace.append(
+                {
+                    "step": "correction_status_accurate",
+                    "delta": 0.08,
+                    "running": round(base, 4),
+                }
+            )
         elif st == "not_really":
             base -= 0.22
+            trace.append(
+                {
+                    "step": "correction_status_not_really",
+                    "delta": -0.22,
+                    "running": round(base, 4),
+                }
+            )
         elif st == "partially_true":
             base -= 0.06
+            trace.append(
+                {
+                    "step": "correction_status_partially_true",
+                    "delta": -0.06,
+                    "running": round(base, 4),
+                }
+            )
     if not decision_family_aligned:
         base -= 0.2
+        trace.append(
+            {
+                "step": "family_mismatch_penalty",
+                "delta": -0.2,
+                "running": round(base, 4),
+            }
+        )
     if profile.total_evidence_weight < 0.85:
         base -= 0.14
+        trace.append(
+            {
+                "step": "low_profile_evidence_penalty",
+                "delta": -0.14,
+                "running": round(base, 4),
+            }
+        )
     if profile.decision_entries_used == 0 and profile.style_entries_used == 0:
         base -= 0.2
+        trace.append(
+            {
+                "step": "no_entries_penalty",
+                "delta": -0.2,
+                "running": round(base, 4),
+            }
+        )
     if path_multipliers:
         deficit = sum(max(0.0, 1.0 - float(m)) for m in path_multipliers if m < 1.0)
-        base -= min(0.24, 0.058 * deficit)
+        d_pm = min(0.24, 0.058 * deficit)
+        base -= d_pm
+        trace.append(
+            {
+                "step": "evidence_path_multiplier_deficit",
+                "delta": round(-d_pm, 4),
+                "running": round(base, 4),
+                "detail": f"multipliers={list(path_multipliers)}",
+            }
+        )
     rks = {str(x).strip().lower() for x in (route_keys or ()) if str(x).strip()}
     fallback_route = any(
         x in rks
@@ -1885,19 +1979,113 @@ def _compute_response_confidence(
     )
     if fallback_route:
         base -= 0.08
+        _fb_tags = (
+            "profile_pattern_fallback",
+            "profile_pattern_fallback_suppressed",
+            "weak_profile_signal",
+            "insufficient_evidence",
+            "strict_shape_miss",
+            "strict_conflict_fallback",
+            "strict_spending_fallback",
+        )
+        _fb_hit = sorted(x for x in rks if x in _fb_tags)
+        trace.append(
+            {
+                "step": "fallback_route_penalty",
+                "delta": -0.08,
+                "running": round(base, 4),
+                "detail": f"route_keys_hit={_fb_hit}",
+            }
+        )
     if example_influence:
         cx = max(0.0, min(1.0, float(example_influence.contradiction_level or 0.0)))
-        base -= 0.18 * cx
+        d_contra = 0.18 * cx
+        base -= d_contra
+        trace.append(
+            {
+                "step": "example_contradiction_penalty",
+                "delta": round(-d_contra, 4),
+                "running": round(base, 4),
+                "detail": f"contradiction_level={cx:.4f}",
+            }
+        )
         if float(example_influence.winning_gap or 0.0) >= 0.34 and cx <= 0.28:
             base += 0.04
+            trace.append(
+                {
+                    "step": "repeated_example_gap_boost",
+                    "delta": 0.04,
+                    "running": round(base, 4),
+                    "detail": f"winning_gap={float(example_influence.winning_gap or 0.0):.4f}",
+                }
+            )
         if float(example_influence.winning_effective_strength or 0.0) >= 0.92 and cx <= 0.2:
             base += 0.03
+            trace.append(
+                {
+                    "step": "repeated_example_strength_boost",
+                    "delta": 0.03,
+                    "running": round(base, 4),
+                    "detail": f"winning_effective_strength={float(example_influence.winning_effective_strength or 0.0):.4f}",
+                }
+            )
         if bool(example_influence.uses_fallback_only):
             base -= 0.05
+            trace.append(
+                {
+                    "step": "example_uses_fallback_only_penalty",
+                    "delta": -0.05,
+                    "running": round(base, 4),
+                }
+            )
     fb_mix = max(0.0, min(1.0, float(feedback_direction_mixed or 0.0)))
     if fb_mix > 0:
-        base -= 0.19 * fb_mix
-    return max(0.12, min(0.9, base))
+        d_fb = 0.19 * fb_mix
+        base -= d_fb
+        trace.append(
+            {
+                "step": "feedback_direction_mixed_penalty",
+                "delta": round(-d_fb, 4),
+                "running": round(base, 4),
+                "detail": f"mixed={fb_mix:.4f}",
+            }
+        )
+    pre_clamp = base
+    final = max(0.12, min(0.9, base))
+    if final != pre_clamp:
+        trace.append(
+            {
+                "step": "clamp_0.12_0.9",
+                "delta": round(final - pre_clamp, 4),
+                "running": round(final, 4),
+            }
+        )
+    return final, trace
+
+
+def _compute_response_confidence(
+    profile: PersonalProfile,
+    top_decision_score: float,
+    top_decision: Optional[Dict[str, Any]],
+    agreement_boost: float,
+    *,
+    decision_family_aligned: bool = True,
+    path_multipliers: Optional[Sequence[float]] = None,
+    example_influence: Optional[RespondExampleInfluence] = None,
+    route_keys: Optional[Sequence[str]] = None,
+    feedback_direction_mixed: float = 0.0,
+) -> float:
+    return _compute_response_confidence_detail(
+        profile,
+        top_decision_score,
+        top_decision,
+        agreement_boost,
+        decision_family_aligned=decision_family_aligned,
+        path_multipliers=path_multipliers,
+        example_influence=example_influence,
+        route_keys=route_keys,
+        feedback_direction_mixed=feedback_direction_mixed,
+    )[0]
 
 
 def _shorten_sentence(text: str, aggressive: bool) -> str:
@@ -3398,6 +3586,229 @@ class PersonalResponse:
     answer_focus: str = "both"
     # Temporary Phase 44 observability (set only when ``debug_phase44_carryover``).
     phase44_carryover_debug: Optional[Dict[str, Any]] = None
+    # Phase 51: structured debug trace (only when ``debug_trace`` was enabled).
+    debug_trace_report: Optional[Dict[str, Any]] = None
+
+
+def _respond_debug_decision_rows(
+    d_ranked: Sequence[Tuple[Dict[str, Any], float, List[str]]],
+    d_gated_actual: Sequence[Tuple[Dict[str, Any], float, List[str]]],
+    *,
+    prompt_norm: str,
+    eff_pf: str,
+    public_disrespect: bool,
+    strip_avoidance: bool,
+) -> List[Dict[str, Any]]:
+    """Structured per-row trace for decision retrieval (Phase 51)."""
+    d_g1: List[Tuple[Dict[str, Any], float, List[str]]] = [
+        (r, s, rs)
+        for r, s, rs in d_ranked
+        if respond_main_decision_passes_shape_gate(
+            prompt_norm, r, effective_primary=eff_pf
+        )
+    ]
+    if public_disrespect:
+        d_g1 = [
+            (r, s, rs)
+            for r, s, rs in d_g1
+            if not _memory_blob_avoidance_hit(decision_row_text_blob(r))
+        ]
+    final_ids_ordered = [
+        str(r.get("id") or "") for r, _, _ in d_gated_actual
+    ]
+    final_set = set(final_ids_ordered)
+    top_id = final_ids_ordered[0] if final_ids_ordered else ""
+    out: List[Dict[str, Any]] = []
+    non_avoid_count = sum(
+        1
+        for r, _, _ in d_g1
+        if not _memory_blob_avoidance_hit(decision_row_text_blob(r))
+    )
+    for row, score, reasons in list(d_ranked)[:10]:
+        rid = str(row.get("id") or "")
+        blob = decision_row_text_blob(row)
+        avoid = _memory_blob_avoidance_hit(blob)
+        shape_ok = respond_main_decision_passes_shape_gate(
+            prompt_norm, row, effective_primary=eff_pf
+        )
+        fam_ok = personal_response_decision_families_aligned(prompt_norm, row)
+        if rid and rid == top_id:
+            status = "selected"
+        elif rid in final_set:
+            status = "eligible_lower_rank"
+        else:
+            status = "rejected"
+        reject: List[str] = []
+        if status == "rejected":
+            if not shape_ok:
+                reject.append("weak_shape_match")
+            elif public_disrespect and avoid:
+                reject.append("public_disrespect_avoidance_blocked")
+            elif strip_avoidance and avoid:
+                if non_avoid_count > 0:
+                    reject.append("avoidance_row_demoted_escalation_carryover")
+                else:
+                    reject.append("avoidance_only_pool_emptied")
+            else:
+                reject.append("not_in_final_gated_chain")
+        out.append(
+            {
+                "id": rid,
+                "score": round(float(score), 4),
+                "status": status,
+                "family_aligned_with_prompt": fam_ok,
+                "shape_gate_ok": shape_ok,
+                "retrieval_reasons": list(reasons)[:8],
+                "reject_reasons": reject,
+            }
+        )
+    return out
+
+
+def _respond_debug_style_rows(
+    s_ranked: Sequence[Tuple[Dict[str, Any], float, List[str]]],
+    limit: int = 6,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row, score, reasons in list(s_ranked)[:limit]:
+        out.append(
+            {
+                "id": str(row.get("id") or ""),
+                "prompt_id": str(row.get("prompt_id") or ""),
+                "score": round(float(score), 4),
+                "retrieval_reasons": list(reasons)[:8],
+            }
+        )
+    return out
+
+
+def format_personal_response_debug_trace(report: Mapping[str, Any]) -> List[str]:
+    """Plain, deterministic lines for CLI (Phase 51)."""
+    lines: List[str] = []
+    if not report:
+        return lines
+    lines.append("--- Debug trace (respond-like-me) ---")
+    lines.append("")
+    rf = report.get("route_family") or {}
+    if rf:
+        lines.append("Route / family scoring")
+        lines.append("-" * 28)
+        for fam, sc in rf.get("ordered", [])[:12]:
+            lines.append(f"  {fam}: {sc}")
+        lines.append(
+            f"  primary: {rf.get('primary_pf')}  effective: {rf.get('eff_pf')}  "
+            f"strict_shape: {rf.get('strict_shape')}"
+        )
+        lines.append("")
+    af = report.get("answer_focus") or {}
+    if af:
+        lines.append("Answer focus (action / wording / both)")
+        lines.append("-" * 38)
+        lines.append(
+            f"  focus: {af.get('focus')}  decision_bias: {af.get('decision_score_bias')}  "
+            f"style_bias: {af.get('style_score_bias')}"
+        )
+        lines.append("")
+    co = report.get("carryover") or {}
+    if co:
+        lines.append("Continuation / carryover")
+        lines.append("-" * 26)
+        lines.append(f"  strength: {co.get('strength')}")
+        lines.append(f"  carry_boost_to_agreement: {co.get('carry_boost')}")
+        lines.append(f"  kept_after_family_align: {co.get('kept_after_family_align')}")
+        lines.append(f"  suppress_avoidance_demotion: {co.get('suppress_avoidance')}")
+        if co.get("reasoning_line_audit_allowed") is not None:
+            lines.append(
+                f"  reasoning_line_audit_allowed: {co.get('reasoning_line_audit_allowed')}"
+            )
+        cand = co.get("carryover_candidate_diag") or {}
+        if cand.get("candidate_count", 0):
+            lines.append(
+                f"  short_term_carryover_candidates: {cand.get('candidate_count')}  "
+                f"best_id: {cand.get('best_row_id')}  "
+                f"accepted: {cand.get('any_candidate_meets_threshold')}"
+            )
+        lines.append("")
+    dc = report.get("memory_decision_candidates") or []
+    if dc:
+        lines.append("Memory candidates (decision rows)")
+        lines.append("-" * 34)
+        for item in dc:
+            lines.append(
+                f"  {item.get('status')}: id={item.get('id')} score={item.get('score')} "
+                f"shape_ok={item.get('shape_gate_ok')} fam_ok={item.get('family_aligned_with_prompt')}"
+            )
+            rr = item.get("reject_reasons") or []
+            if rr:
+                lines.append(f"    rejected because: {', '.join(rr)}")
+        lines.append("")
+    sc = report.get("memory_style_candidates") or []
+    if sc:
+        lines.append("Memory candidates (style rows)")
+        lines.append("-" * 32)
+        for item in sc:
+            lines.append(
+                f"  id={item.get('id')} prompt_id={item.get('prompt_id')} "
+                f"score={item.get('score')}"
+            )
+        lines.append("")
+    ex = report.get("example_influence") or {}
+    if ex:
+        lines.append("Example candidates (repeated corrections)")
+        lines.append("-" * 40)
+        for k, v in ex.items():
+            lines.append(f"  {k}: {v}")
+        lines.append("")
+    cmpo = report.get("composition") or {}
+    if cmpo:
+        lines.append("Final answer path (memory route keys)")
+        lines.append("-" * 38)
+        lines.append(f"  route_keys: {cmpo.get('route_keys')}")
+        lines.append(f"  answer_focus: {cmpo.get('answer_focus')}")
+        if cmpo.get("spending_speed_trap"):
+            lines.append("  note: spending_speed_quality_trap_active")
+        lines.append("")
+    sh = report.get("output_shaping") or {}
+    if sh:
+        lines.append("Final output shaping")
+        lines.append("-" * 20)
+        lines.append(f"  direct_response_branch: {sh.get('composition_route_keys')}")
+        lines.append(f"  correction_overlay_applied: {sh.get('correction_overlay_applied')}")
+        lines.append(f"  example_overlay_applied: {sh.get('example_overlay_applied')}")
+        lines.append(
+            f"  carryover_replacement_stance_applied: {sh.get('carryover_replacement_stance')}"
+        )
+        if sh.get("carryover_blocked_reason"):
+            lines.append(
+                f"  carryover_wording_blocked: {sh.get('carryover_blocked_reason')}"
+            )
+        lines.append(f"  continuity_note_emitted: {sh.get('continuity_note_emitted')}")
+        lines.append("")
+    ct = report.get("confidence_trace") or {}
+    if ct:
+        lines.append("Confidence trace")
+        lines.append("-" * 18)
+        for step in ct.get("pre_cap_steps", [])[:40]:
+            lines.append(
+                f"  {step.get('step')}: delta {step.get('delta')}  "
+                f"running {step.get('running')}  {step.get('detail') or ''}".rstrip()
+            )
+        caps = ct.get("caps_applied") or []
+        if caps:
+            lines.append(f"  caps_applied: {caps}")
+        if ct.get("post_cap_boost"):
+            lines.append(f"  post_cap_boost: {ct.get('post_cap_boost')}")
+        lines.append(f"  final_confidence: {ct.get('final')}")
+        lines.append("")
+    tc = report.get("tone_calibration") or {}
+    if tc:
+        lines.append("Tone calibration (wording strength / hedge)")
+        lines.append("-" * 42)
+        lines.append(f"  phase49_hedge_level: {tc.get('phase49_hedge_level')}")
+        lines.append(f"  phase50_hedge_level: {tc.get('phase50_hedge_level')}")
+        lines.append("")
+    lines.append("--- End debug trace ---")
+    return lines
 
 
 def generate_personal_response(
@@ -3407,6 +3818,7 @@ def generate_personal_response(
     style_fetch_limit: int = 800,
     *,
     debug_phase44_carryover: bool = False,
+    debug_trace: bool = False,
 ) -> PersonalResponse:
     """Build a likely-you answer using stored memory and aggregated profile."""
     text = (scenario_text or "").strip()
@@ -4159,6 +4571,7 @@ def generate_personal_response(
         answer_focus=answer_focus,
         eff_pf=str(eff_pf or "general"),
     )
+    correction_overlay_changed = (answer or "").strip() != answer_pre_feedback_overlay
     _fb_mix = float(feedback_influence.replacement_direction_mixed or 0.0)
     if _fb_mix >= 0.42:
         rl = (reasoning or "").lower()
@@ -4239,19 +4652,35 @@ def generate_personal_response(
         reasoning += " Repeated corrections in the same shape point in one direction."
 
     path_m = _respond_path_multipliers(evidence_path, mmap)
-    conf = _compute_response_confidence(
-        profile,
-        top_score,
-        top_d[0] if top_d else None,
-        agreement_boost,
-        decision_family_aligned=top_family_aligned,
-        path_multipliers=path_m or None,
-        example_influence=example_influence,
-        route_keys=evidence_path.route_keys,
-        feedback_direction_mixed=float(
-            feedback_influence.replacement_direction_mixed or 0.0
-        ),
-    )
+    if debug_trace:
+        conf, conf_pre_cap_trace = _compute_response_confidence_detail(
+            profile,
+            top_score,
+            top_d[0] if top_d else None,
+            agreement_boost,
+            decision_family_aligned=top_family_aligned,
+            path_multipliers=path_m or None,
+            example_influence=example_influence,
+            route_keys=evidence_path.route_keys,
+            feedback_direction_mixed=float(
+                feedback_influence.replacement_direction_mixed or 0.0
+            ),
+        )
+    else:
+        conf = _compute_response_confidence(
+            profile,
+            top_score,
+            top_d[0] if top_d else None,
+            agreement_boost,
+            decision_family_aligned=top_family_aligned,
+            path_multipliers=path_m or None,
+            example_influence=example_influence,
+            route_keys=evidence_path.route_keys,
+            feedback_direction_mixed=float(
+                feedback_influence.replacement_direction_mixed or 0.0
+            ),
+        )
+        conf_pre_cap_trace: List[Dict[str, Any]] = []
     if float(feedback_influence.replacement_direction_mixed or 0.0) >= 0.38:
         conf_caps.append(0.54)
     if (
@@ -4259,18 +4688,23 @@ def generate_personal_response(
         and float(example_influence.contradiction_level or 0.0) >= 0.52
     ):
         conf_caps.append(0.5)
-    elif (
+    conf_post_cap_boost_note: Optional[str] = None
+    if (
         example_influence
         and float(example_influence.winning_effective_strength or 0.0) >= 0.95
         and float(example_influence.contradiction_level or 0.0) <= 0.14
     ):
+        conf_before_ex_boost = conf
         conf = min(0.86, conf + 0.03)
+        if debug_trace and conf > conf_before_ex_boost:
+            conf_post_cap_boost_note = "repeated_example_strength_conf_ceiling_boost"
     for cap in conf_caps:
         conf = min(conf, cap)
 
     answer = _phase41_style_realism_pass(answer, answer_focus=answer_focus)
 
     _carry_used_replacement_stance = False
+    carryover_blocked_reason = ""
     answer_pre_carryover_replace = (answer or "").strip()
     if (
         situation_carryover
@@ -4312,6 +4746,16 @@ def generate_personal_response(
                     # feedback rows for that variant hash).
                     answer = _rep_line
                     _carry_used_replacement_stance = True
+                elif not _gate_ok:
+                    carryover_blocked_reason = "same_thread_gate_failed"
+                elif (answer_focus or "").strip().lower() == "action":
+                    carryover_blocked_reason = (
+                        "wording_only_carryover_blocked_in_action_mode"
+                    )
+            else:
+                carryover_blocked_reason = "no_eligible_replacement_line"
+        else:
+            carryover_blocked_reason = "carryover_row_missing_hash_or_short_stance"
 
     phase46_carryover_demoted = bool(
         phase46_rep_line
@@ -4416,7 +4860,7 @@ def generate_personal_response(
             short_term_stance_mode = "carryover_safe_after_wording_feedback"
 
     rows_for_carryover_debug: Optional[List[Dict[str, Any]]] = None
-    if debug_phase44_carryover:
+    if debug_phase44_carryover or debug_trace:
         try:
             if hasattr(store, "list_recent_short_term_situations"):
                 rows_for_carryover_debug = store.list_recent_short_term_situations(
@@ -4635,8 +5079,137 @@ def generate_personal_response(
             ),
         }
 
-        
-        
+    debug_trace_report: Optional[Dict[str, Any]] = None
+    if debug_trace:
+        carry_rows: List[Dict[str, Any]] = list(rows_for_carryover_debug or [])
+        carry_diag = diagnose_ask_carryover_candidates(
+            prompt_norm, prompt_norm_hash, carry_rows
+        )
+        cand_trim = list(carry_diag.get("candidates") or [])[:8]
+        ex_map: Dict[str, Any] = {}
+        if example_influence:
+            ex_map = {
+                "strongest_strength": round(
+                    float(example_influence.strongest_strength or 0.0), 4
+                ),
+                "winning_effective_strength": round(
+                    float(example_influence.winning_effective_strength or 0.0), 4
+                ),
+                "contradiction_level": round(
+                    float(example_influence.contradiction_level or 0.0), 4
+                ),
+                "consistency": round(float(example_influence.consistency or 0.0), 4),
+                "winning_gap": round(float(example_influence.winning_gap or 0.0), 4),
+                "uses_fallback_only": bool(example_influence.uses_fallback_only),
+                "action_line_prefix": (example_influence.action_line or "")[:100],
+                "wording_line_prefix": (example_influence.wording_line or "")[:100],
+            }
+        fb_summary = {
+            "wrong_replacement_count": int(
+                feedback_influence.wrong_replacement_count or 0
+            ),
+            "replacement_direction_mixed": round(
+                float(feedback_influence.replacement_direction_mixed or 0.0), 4
+            ),
+            "action_ok_wording_off": bool(feedback_influence.action_ok_wording_off),
+            "avoidance_demote": round(
+                float(feedback_influence.avoidance_demote or 0.0), 4
+            ),
+            "direct_calm_signal": round(
+                float(feedback_influence.direct_calm_signal or 0.0), 4
+            ),
+            "phase46_merged_carryover_feedback": bool(
+                feedback_influence.phase46_merged_carryover_feedback
+            ),
+        }
+        debug_trace_report = {
+            "phase": "mirrorcore_debug_trace_v1",
+            "route_family": {
+                "ordered": [
+                    (a, round(float(b), 4)) for a, b in (ordered_pf or [])[:14]
+                ],
+                "primary_pf": primary_pf,
+                "eff_pf": str(eff_pf or "general"),
+                "strict_shape": strict_shape,
+            },
+            "answer_focus": {
+                "focus": answer_focus,
+                "decision_score_bias": d_bias,
+                "style_score_bias": s_bias,
+            },
+            "carryover": {
+                "strength": round(float(carry_strength), 4),
+                "carry_boost": round(float(carry_boost), 4),
+                "kept_after_family_align": situation_carryover is not None,
+                "suppress_avoidance": strip_avoidance_decisions,
+                "reasoning_line_audit_allowed": allow_carry_line,
+                "carryover_candidate_diag": {
+                    "pick_threshold": carry_diag.get("pick_threshold"),
+                    "candidate_count": carry_diag.get("candidate_count"),
+                    "best_row_id": carry_diag.get("best_row_id"),
+                    "best_score": carry_diag.get("best_score"),
+                    "any_candidate_meets_threshold": carry_diag.get(
+                        "any_candidate_meets_threshold"
+                    ),
+                    "candidates": cand_trim,
+                },
+            },
+            "phase45_escalation": {
+                "active": bool(phase45_escalation.get("phase45_escalation_active")),
+                "subtype": str(
+                    phase45_escalation.get("phase45_escalation_subtype") or ""
+                ),
+                "boost_direct_boundary_retrieval": bool(
+                    phase45_escalation.get("phase45_boost_direct_boundary_retrieval")
+                ),
+                "demote_avoidance": bool(
+                    phase45_escalation.get("phase45_demote_avoidance_due_to_escalation")
+                ),
+                "reject_reasons": list(
+                    phase45_escalation.get("phase45_escalation_reject_reasons") or []
+                ),
+            },
+            "memory_decision_candidates": _respond_debug_decision_rows(
+                d_ranked,
+                d_gated,
+                prompt_norm=prompt_norm,
+                eff_pf=str(eff_pf or "general"),
+                public_disrespect=public_audience_disrespect_prompt(prompt_norm),
+                strip_avoidance=strip_avoidance_decisions,
+            ),
+            "memory_style_candidates": _respond_debug_style_rows(s_ranked),
+            "example_influence": ex_map,
+            "feedback_influence_summary": fb_summary,
+            "cross_agreement": {
+                "agreement_boost": round(float(agreement_boost), 4),
+                "cross_boost": round(float(cross_boost), 4),
+                "money_pressure_prompt": bool(money_pressure_prompt),
+            },
+            "composition": {
+                "route_keys": list(evidence_path.route_keys),
+                "answer_focus": answer_focus,
+                "spending_speed_trap": spending_quote_is_speed_trap,
+            },
+            "output_shaping": {
+                "composition_route_keys": list(evidence_path.route_keys),
+                "correction_overlay_applied": correction_overlay_changed,
+                "example_overlay_applied": used_example_overlay,
+                "carryover_replacement_stance": _carry_used_replacement_stance,
+                "carryover_blocked_reason": carryover_blocked_reason or "",
+                "continuity_note_emitted": bool((continuity_note or "").strip()),
+            },
+            "confidence_trace": {
+                "pre_cap_steps": conf_pre_cap_trace,
+                "caps_applied": [round(float(c), 4) for c in conf_caps],
+                "post_cap_boost": conf_post_cap_boost_note,
+                "final": round(float(conf), 4),
+            },
+            "tone_calibration": {
+                "phase49_hedge_level": str(p49_base),
+                "phase50_hedge_level": str(p50_level),
+            },
+        }
+
     label = _confidence_bucket(conf)
     return PersonalResponse(
         likely_answer=answer,
@@ -4650,5 +5223,6 @@ def generate_personal_response(
         effective_family=str(eff_pf or "general"),
         answer_focus=answer_focus,
         phase44_carryover_debug=phase44_carryover_debug,
+        debug_trace_report=debug_trace_report,
     )
 

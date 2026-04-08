@@ -11,7 +11,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 from ..persona.profile import PersonalProfile, build_personal_profile
 from ..router import normalize_input
@@ -39,7 +39,7 @@ from .ontology import (
     slot_ids_covered_by_context,
     work_obligation_peer_shape,
 )
-from .situation_carryover import carryover_shape_key
+from .situation_carryover import carryover_shape_key, diagnose_ask_carryover_candidates
 
 # Phase 31 API alias (same as ontology.MONEY)
 MONEY = SPENDING
@@ -1472,11 +1472,146 @@ def build_routed_decision_guidance(
     return "\n\n".join(merged)
 
 
+def _debug_ask_memory_merge_snapshot(
+    tend_cands: Sequence[Tuple[str, float, str]],
+    prof_cands: Sequence[Tuple[str, float, str]],
+    interview_cands: Sequence[Tuple[str, float, str]],
+    *,
+    seed: str,
+    min_tend: float,
+    min_prof: float,
+    min_interview: float,
+) -> Dict[str, Any]:
+    """Deterministic pool view for Phase 51 debug (same floors as ``_pick_merged_memory_lines``)."""
+    pool: List[Dict[str, Any]] = []
+    for k, s, t in tend_cands:
+        pool.append(
+            {
+                "key": k,
+                "score": round(float(s), 4),
+                "source": "tendency",
+                "passes_floor": bool(s >= min_tend),
+            }
+        )
+    for k, s, t in prof_cands:
+        pool.append(
+            {
+                "key": k,
+                "score": round(float(s), 4),
+                "source": "profile",
+                "passes_floor": bool(s >= min_prof),
+            }
+        )
+    for k, s, t in interview_cands:
+        pool.append(
+            {
+                "key": k,
+                "score": round(float(s), 4),
+                "source": "interview_memory",
+                "passes_floor": bool(s >= min_interview),
+            }
+        )
+    pool.sort(key=lambda x: (-float(x["score"]), str(x["key"])))
+    picked = _pick_merged_memory_lines(
+        tend_cands,
+        prof_cands,
+        seed=seed,
+        min_tend=min_tend,
+        min_prof=min_prof,
+        interview_cands=interview_cands,
+        min_interview=min_interview,
+    )
+    sel_key = picked[0][0] if picked else ""
+    return {
+        "merged_pool_top": pool[:12],
+        "selected_memory_line_key": sel_key,
+        "floors": {
+            "min_tendency": min_tend,
+            "min_profile": min_prof,
+            "min_interview": min_interview,
+        },
+    }
+
+
+def format_ask_decision_debug_trace(report: Mapping[str, Any]) -> List[str]:
+    """Plain lines for ``mirrorcore ask --debug-trace`` (Phase 51)."""
+    lines: List[str] = []
+    if not report:
+        return lines
+    lines.append("--- Debug trace (ask → decision guidance) ---")
+    lines.append("")
+    rtr = report.get("router") or {}
+    if rtr:
+        lines.append("Route scores (intent classification)")
+        lines.append("-" * 36)
+        for name, sc in rtr.get("ordered", [])[:10]:
+            lines.append(f"  {name}: {sc}")
+        lines.append(
+            f"  weak_input: {rtr.get('weak_input')}  "
+            f"resolved_category: {rtr.get('resolved_category')}"
+        )
+        lines.append("")
+    fam = report.get("family_scoring") or {}
+    if fam:
+        lines.append("Family scoring (decision guidance)")
+        lines.append("-" * 34)
+        for name, sc in fam.get("ranked_initial", [])[:12]:
+            lines.append(f"  {name}: {sc}")
+        lines.append(f"  primary_initial: {fam.get('primary_initial')}")
+        lines.append(f"  domain_order: {fam.get('domain_order')}")
+        lines.append("")
+    co = report.get("carryover") or {}
+    if co:
+        lines.append("Carryover (ask pick)")
+        lines.append("-" * 20)
+        lines.append(f"  match_row_id: {co.get('match_row_id')}")
+        lines.append(f"  strength: {co.get('strength')}")
+        cd = co.get("candidate_diag") or {}
+        if cd.get("candidate_count"):
+            lines.append(
+                f"  candidates: {cd.get('candidate_count')}  "
+                f"best: {cd.get('best_row_id')}  ok: {cd.get('any_candidate_meets_threshold')}"
+            )
+        lines.append("")
+    clar = report.get("clarification") or {}
+    if clar:
+        lines.append("Clarification rounds")
+        lines.append("-" * 22)
+        lines.append(f"  slots_asked: {clar.get('asked_slot_ids')}")
+        lines.append(f"  rounds_completed: {clar.get('rounds_completed')}")
+        lines.append("")
+    mem = report.get("memory_lines") or {}
+    if mem:
+        lines.append("Situation memory merge (tail lines)")
+        lines.append("-" * 38)
+        lines.append(f"  selected_key: {mem.get('selected_memory_line_key')}")
+        for item in mem.get("merged_pool_top", [])[:8]:
+            lines.append(
+                f"  {item.get('source')}: {item.get('key')}  score={item.get('score')}  "
+                f"passes_floor={item.get('passes_floor')}"
+            )
+        lines.append("")
+    iv = report.get("interview_memory_candidates") or []
+    if iv:
+        lines.append("Interview-style memory candidates")
+        lines.append("-" * 34)
+        for item in iv[:8]:
+            lines.append(
+                f"  {item.get('key')}  score={item.get('score')}  "
+                f"passes_interview_floor={item.get('passes_floor')}"
+            )
+        lines.append("")
+    lines.append("--- End debug trace ---")
+    return lines
+
+
 def run_routed_decision_guidance(
     *,
     initial_text: str,
     read_line: Callable[[str], str],
     db_store,
+    debug_trace: bool = False,
+    trace_out: Optional[Dict[str, Any]] = None,
 ) -> str:
     norm = normalize_input(initial_text)
     ranked, dimensions = rank_families(norm)
@@ -1602,6 +1737,37 @@ def run_routed_decision_guidance(
     except Exception:
         interview_cands = []
 
+    merge_trace: Optional[Dict[str, Any]] = None
+    if debug_trace and trace_out is not None:
+        dims_m = score_dimensions(merged_norm)
+        order_list_m = sanitize_domain_order_for_obligation(
+            merged_norm, dims_m, list(order)
+        )
+        primary_m = order_list_m[0] if order_list_m else GENERAL
+        tend_m = _tendency_line_candidates(
+            tendency_map,
+            primary_family=primary_m,
+            initial_norm=norm,
+            seed=phrase_seed,
+        )
+        prof_m: List[Tuple[str, float, str]] = []
+        if profile:
+            prof_m = _profile_line_candidates(
+                profile,
+                primary_family=primary_m,
+                initial_norm=norm,
+                seed=phrase_seed,
+            )
+        merge_trace = _debug_ask_memory_merge_snapshot(
+            tend_m,
+            prof_m,
+            interview_cands,
+            seed=phrase_seed,
+            min_tend=0.28,
+            min_prof=0.55,
+            min_interview=0.52,
+        )
+
     guidance_text = build_routed_decision_guidance(
         original_question=initial_text,
         qa_pairs=qa_pairs,
@@ -1612,6 +1778,69 @@ def run_routed_decision_guidance(
         surface_store=db_store,
         interview_memory_candidates=interview_cands,
     )
+
+    if debug_trace and trace_out is not None:
+        rows_dbg: List[Dict[str, Any]] = []
+        try:
+            if hasattr(db_store, "list_recent_short_term_situations"):
+                rows_dbg = db_store.list_recent_short_term_situations(limit=40)
+        except Exception:
+            rows_dbg = []
+        ph_carry = hashlib.sha256(norm.encode("utf-8")).hexdigest()
+        cand_diag = diagnose_ask_carryover_candidates(norm, ph_carry, rows_dbg)
+        mid = ""
+        st = 0.0
+        if carry_payload and carry_payload.get("match"):
+            mid = str(carry_payload["match"].get("id") or "")
+            try:
+                st = float(carry_payload.get("strength") or 0.0)
+            except (TypeError, ValueError):
+                st = 0.0
+        iv_items: List[Dict[str, Any]] = []
+        for k, s, t in interview_cands[:12]:
+            iv_items.append(
+                {
+                    "key": k,
+                    "score": round(float(s), 4),
+                    "passes_floor": bool(float(s) >= 0.52),
+                    "line_prefix": (t or "")[:80],
+                }
+            )
+        ranked_snapshot = [
+            (a, round(float(b), 4)) for a, b in (ranked or [])[:14]
+        ]
+        dims_snapshot = {
+            str(k): round(float(v), 4)
+            for k, v in list(dimensions.items())[:20]
+        }
+        trace_out["phase"] = "mirrorcore_ask_debug_trace_v1"
+        trace_out["family_scoring"] = {
+            "ranked_initial": ranked_snapshot,
+            "primary_initial": primary,
+            "domain_order": list(order),
+            "dimensions_initial": dims_snapshot,
+        }
+        trace_out["carryover"] = {
+            "match_row_id": mid,
+            "strength": round(float(st), 4),
+            "candidate_diag": {
+                "pick_threshold": cand_diag.get("pick_threshold"),
+                "candidate_count": cand_diag.get("candidate_count"),
+                "best_row_id": cand_diag.get("best_row_id"),
+                "best_score": cand_diag.get("best_score"),
+                "any_candidate_meets_threshold": cand_diag.get(
+                    "any_candidate_meets_threshold"
+                ),
+                "candidates": list(cand_diag.get("candidates") or [])[:8],
+            },
+        }
+        trace_out["clarification"] = {
+            "asked_slot_ids": list(asked_ids),
+            "rounds_completed": len(qa_pairs),
+            "deprioritized_slots": list(dep_slots),
+        }
+        trace_out["memory_lines"] = merge_trace or {}
+        trace_out["interview_memory_candidates"] = iv_items
 
     rec_shape = carryover_shape_key(merged_norm, order[0] if order else GENERAL)
     try:

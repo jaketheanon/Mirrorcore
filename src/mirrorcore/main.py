@@ -230,6 +230,11 @@ Examples:
         action="store_true",
         help="Print Phase 44 short-term carryover diagnostics (temporary; JSON)",
     )
+    respond_like_me_parser.add_argument(
+        "--debug-trace",
+        action="store_true",
+        help="Print structured debug trace (routing memory, confidence steps) after the answer",
+    )
 
     respond_feedback_parser = subparsers.add_parser(
         "respond-feedback",
@@ -251,6 +256,11 @@ Examples:
         "query",
         nargs="*",
         help="What you want help with (omit to type when prompted)",
+    )
+    ask_parser.add_argument(
+        "--debug-trace",
+        action="store_true",
+        help="Print structured debug trace after the routed flow (no effect on routing)",
     )
 
     # Status command
@@ -288,6 +298,9 @@ def handle_ask(args):
         routing_feedback,
     )
 
+    debug_trace = bool(getattr(args, "debug_trace", False))
+    ask_trace: Optional[Dict[str, Any]] = {} if debug_trace else None
+
     parts = getattr(args, "query", None) or []
     text = " ".join(parts).strip()
 
@@ -320,6 +333,15 @@ def handle_ask(args):
 
     classification, route = resolve_full_route(text, read_choice)
 
+    if ask_trace is not None:
+        ask_trace["router"] = {
+            "ordered": list(classification.ordered),
+            "scores": dict(classification.scores),
+            "weak_input": classification.weak_input,
+            "resolved_category": route.category,
+            "resolved_profile_target": route.profile_target,
+        }
+
     if classification.weak_input:
         print(
             "That's a bit vague — I'm not sure which track fits. "
@@ -332,30 +354,62 @@ def handle_ask(args):
     print()
 
     if route.category == "onboarding_or_help":
+        if debug_trace and ask_trace is not None:
+            from .decision.routed_clarification import format_ask_decision_debug_trace
+
+            for ln in format_ask_decision_debug_trace(ask_trace):
+                print(ln)
         handle_start(args)
         return
 
     if route.category == "decision_help":
-        from .decision.routed_clarification import run_routed_decision_guidance
+        from .decision.routed_clarification import (
+            format_ask_decision_debug_trace,
+            run_routed_decision_guidance,
+        )
 
         guidance = run_routed_decision_guidance(
             initial_text=text,
             read_line=read_choice,
             db_store=db_store,
+            debug_trace=debug_trace,
+            trace_out=ask_trace,
         )
         print()
         print(guidance)
+        if debug_trace and ask_trace is not None:
+            print()
+            for ln in format_ask_decision_debug_trace(ask_trace):
+                print(ln)
         return
 
     if route.category == "personal_response":
-        handle_respond_like_me(SimpleNamespace(scenario=text))
+        if debug_trace and ask_trace is not None:
+            from .decision.routed_clarification import format_ask_decision_debug_trace
+
+            print()
+            for ln in format_ask_decision_debug_trace(ask_trace):
+                print(ln)
+        handle_respond_like_me(
+            SimpleNamespace(scenario=text, debug_trace=debug_trace)
+        )
         return
 
     if route.category == "debug_help":
+        if debug_trace and ask_trace is not None:
+            from .decision.routed_clarification import format_ask_decision_debug_trace
+
+            for ln in format_ask_decision_debug_trace(ask_trace):
+                print(ln)
         handle_analyze_log(args)
         return
 
     if route.category == "profile_building":
+        if debug_trace and ask_trace is not None:
+            from .decision.routed_clarification import format_ask_decision_debug_trace
+
+            for ln in format_ask_decision_debug_trace(ask_trace):
+                print(ln)
         if route.profile_target == PROFILE_STYLE:
             handle_calibrate_style(args)
         else:
@@ -1998,7 +2052,10 @@ def handle_respond_like_me(args):
         os.environ.get("MIRRORCORE_DEBUG_PHASE44_CARRYOVER", "").strip() == "1"
     )
     pr = generate_personal_response(
-        scenario, db_store, debug_phase44_carryover=debug_carry
+        scenario,
+        db_store,
+        debug_phase44_carryover=debug_carry,
+        debug_trace=bool(getattr(args, "debug_trace", False)),
     )
     print()
     print("Likely response")
@@ -2024,6 +2081,13 @@ def handle_respond_like_me(args):
     if debug_carry and getattr(pr, "phase44_carryover_debug", None):
         print("--- Phase 44 carryover (debug) ---")
         print(json.dumps(pr.phase44_carryover_debug, indent=2, sort_keys=True))
+        print()
+
+    if getattr(args, "debug_trace", False) and getattr(pr, "debug_trace_report", None):
+        from .persona.respond import format_personal_response_debug_trace
+
+        for line in format_personal_response_debug_trace(pr.debug_trace_report):
+            print(line)
         print()
 
     from .persona.respond_feedback import maybe_prompt_respond_feedback, stdin_is_interactive

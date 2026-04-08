@@ -280,6 +280,16 @@ class TestAskCommand(unittest.TestCase):
         mock_guidance.assert_called_once()
         mock_start.assert_not_called()
 
+    def test_ask_parser_accepts_debug_trace(self):
+        parser = create_parser()
+        args = parser.parse_args(["ask", "--debug-trace", "hello"])
+        self.assertTrue(args.debug_trace)
+
+    def test_respond_like_me_parser_accepts_debug_trace(self):
+        parser = create_parser()
+        args = parser.parse_args(["respond-like-me", "--debug-trace", "hello"])
+        self.assertTrue(args.debug_trace)
+
 
 if __name__ == "__main__":
     unittest.main()

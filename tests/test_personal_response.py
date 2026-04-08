@@ -45,6 +45,7 @@ from mirrorcore.persona.respond import (
     _respond_repeated_passive_aggressive_escalation_active,
     build_respond_feedback_influence,
     classify_answer_focus,
+    format_personal_response_debug_trace,
     generate_personal_response,
     retrieve_relevant_decision_memories,
     retrieve_relevant_style_memories,
@@ -3534,6 +3535,77 @@ class TestPhase49RespondIntegration(unittest.TestCase):
         self.assertGreater(pr.confidence, 0.4)
         low = pr.likely_answer.lower()
         self.assertNotRegex(low, r"\bi(?:'d| would) likely\b")
+
+
+class TestPhase51DebugTrace(unittest.TestCase):
+    def test_debug_trace_matches_non_debug_output(self):
+        def _seed_store(store: DatabaseStore) -> None:
+            store.initialize_database()
+            store.record_decision_memory(
+                scenario_id="x",
+                scenario_text="Coworker keeps asking me to cover shifts and I'm wiped.",
+                choice_label="Say I can't",
+                choice_value="n",
+                reasoning_label="Protect my energy",
+                reasoning_value="e",
+                value_tags=["boundaries"],
+                trait_signals={"boundary_strain": 0.7},
+                confidence_score=0.88,
+                correction_status="accurate",
+            )
+
+        scenario = (
+            "Colleague asked me to pick up a shift tomorrow and I'm drained, "
+            "what would I probably say"
+        )
+
+        tmp_off = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp_off.close()
+        tmp_on = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp_on.close()
+        db_off = DatabaseStore(Path(tmp_off.name))
+        db_on = DatabaseStore(Path(tmp_on.name))
+        try:
+            _seed_store(db_off)
+            _seed_store(db_on)
+            p_off = generate_personal_response(scenario, db_off, debug_trace=False)
+            p_on = generate_personal_response(scenario, db_on, debug_trace=True)
+            self.assertEqual(p_off.likely_answer, p_on.likely_answer)
+            self.assertEqual(p_off.confidence, p_on.confidence)
+            self.assertEqual(p_off.reasoning_brief, p_on.reasoning_brief)
+            self.assertIsNone(p_off.debug_trace_report)
+            self.assertIsNotNone(p_on.debug_trace_report)
+            rep = p_on.debug_trace_report or {}
+            self.assertEqual(rep.get("phase"), "mirrorcore_debug_trace_v1")
+            self.assertIn("confidence_trace", rep)
+            self.assertIn("pre_cap_steps", rep["confidence_trace"])
+            self.assertIn("memory_decision_candidates", rep)
+        finally:
+            db_off.close()
+            db_on.close()
+            Path(tmp_off.name).unlink(missing_ok=True)
+            Path(tmp_on.name).unlink(missing_ok=True)
+
+    def test_format_debug_trace_is_deterministic(self):
+        rep = {
+            "route_family": {
+                "ordered": [("general", 1.0)],
+                "primary_pf": "general",
+                "eff_pf": "general",
+                "strict_shape": False,
+            },
+            "confidence_trace": {
+                "pre_cap_steps": [
+                    {"step": "base", "delta": 0.32, "running": 0.32}
+                ],
+                "caps_applied": [],
+                "post_cap_boost": None,
+                "final": 0.5,
+            },
+        }
+        a = "\n".join(format_personal_response_debug_trace(rep))
+        b = "\n".join(format_personal_response_debug_trace(rep))
+        self.assertEqual(a, b)
 
 
 if __name__ == "__main__":
