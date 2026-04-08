@@ -38,6 +38,7 @@ from mirrorcore.persona.respond import (
     _phase49_hedge_level,
     _phase49_skip_wording_tightening,
     _phase49_wording_strength_polish,
+    _phase50_refine_surface_hedge_level,
     _respond_carryover_reasoning_line_audit,
     _evaluate_phase45_conflict_escalation,
     _respond_carryover_suppress_avoidance,
@@ -3192,6 +3193,17 @@ class TestPhase49SurfaceWording(unittest.TestCase):
         self.assertIn("if i said it out loud", low)
         self.assertNotIn("maybe:", low)
 
+    def test_polish_medium_strips_cautious_preface_and_id_maybe(self):
+        s = (
+            "If I'm reading your saves right, I'd maybe hold off for now.\n"
+            'If I said it out loud, maybe: "Not this week."'
+        )
+        out = _phase49_wording_strength_polish(s, hedge_level="medium")
+        low = out.lower()
+        self.assertNotIn("if i'm reading your saves right", low)
+        self.assertNotIn("i'd maybe", low)
+        self.assertNotIn("maybe:", low)
+
     def test_polish_soft_is_noop(self):
         s = (
             "If I'm reading your saves right, I'd draw the line.\n"
@@ -3224,6 +3236,135 @@ class TestPhase49SurfaceWording(unittest.TestCase):
                 feedback_influence=fb,
             )
         )
+
+
+class TestPhase50SurfaceToneCalibration(unittest.TestCase):
+    """Phase 50: confidence-to-tone refinement without changing Phase 49 base tiers."""
+
+    def test_refine_keeps_soft_and_inference_routes(self):
+        self.assertEqual(
+            _phase50_refine_surface_hedge_level(
+                "soft",
+                conf=0.55,
+                route_keys=("strong_decision",),
+                carry_strength=0.5,
+                used_example_overlay=False,
+                decision_row_anchor=True,
+                feedback_direction_mixed=0.0,
+                example_contradiction=0.0,
+            ),
+            "soft",
+        )
+        self.assertEqual(
+            _phase50_refine_surface_hedge_level(
+                "medium",
+                conf=0.55,
+                route_keys=("medium_decision", "strict_spending_fallback"),
+                carry_strength=0.5,
+                used_example_overlay=False,
+                decision_row_anchor=True,
+                feedback_direction_mixed=0.0,
+                example_contradiction=0.0,
+            ),
+            "medium",
+        )
+
+    def test_refine_upgrades_medium_with_decision_anchor(self):
+        self.assertEqual(
+            _phase50_refine_surface_hedge_level(
+                "medium",
+                conf=0.44,
+                route_keys=("medium_decision",),
+                carry_strength=0.0,
+                used_example_overlay=False,
+                decision_row_anchor=True,
+                feedback_direction_mixed=0.0,
+                example_contradiction=0.0,
+            ),
+            "firm",
+        )
+
+    def test_refine_upgrades_medium_with_carryover_not_anchor(self):
+        self.assertEqual(
+            _phase50_refine_surface_hedge_level(
+                "medium",
+                conf=0.44,
+                route_keys=("medium_decision",),
+                carry_strength=RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN,
+                used_example_overlay=False,
+                decision_row_anchor=False,
+                feedback_direction_mixed=0.0,
+                example_contradiction=0.0,
+            ),
+            "firm",
+        )
+
+    def test_refine_no_upgrade_medium_without_anchor_or_carry(self):
+        self.assertEqual(
+            _phase50_refine_surface_hedge_level(
+                "medium",
+                conf=0.44,
+                route_keys=("medium_decision",),
+                carry_strength=0.12,
+                used_example_overlay=False,
+                decision_row_anchor=False,
+                feedback_direction_mixed=0.0,
+                example_contradiction=0.0,
+            ),
+            "medium",
+        )
+
+    def test_refine_demotes_firm_when_example_overlay(self):
+        self.assertEqual(
+            _phase50_refine_surface_hedge_level(
+                "firm",
+                conf=0.72,
+                route_keys=("strong_decision", "example_memory_overlay"),
+                carry_strength=0.0,
+                used_example_overlay=True,
+                decision_row_anchor=True,
+                feedback_direction_mixed=0.0,
+                example_contradiction=0.0,
+            ),
+            "medium",
+        )
+
+    def test_moderate_memory_match_answer_firmer_surface(self):
+        """Related-but-not-top save → medium_decision; Phase 50 polish trims template hedges."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        db = DatabaseStore(Path(tmp.name))
+        db.initialize_database()
+        try:
+            # Overlapping money pressure, different want-shape so match stays medium band.
+            db.record_decision_memory(
+                scenario_id="mod_spend_v1",
+                scenario_text=(
+                    "I am juggling a laptop upgrade while rent is already late and cash is thin."
+                ),
+                choice_label="Cover bills first, pause the big purchase",
+                choice_value="b",
+                reasoning_label="Keep the squeeze from getting worse",
+                reasoning_value="r",
+                value_tags=["caution"],
+                trait_signals={"financial_caution": 0.72},
+                confidence_score=0.78,
+                correction_status="accurate",
+            )
+            pr = generate_personal_response(
+                "i want to buy something fun but rent is due tomorrow and i am short on money",
+                db,
+            )
+            self.assertIn("medium_decision", pr.evidence_path.route_keys)
+            self.assertGreater(pr.confidence, 0.4)
+            self.assertLess(pr.confidence, 0.62)
+            la = pr.likely_answer.lower()
+            self.assertNotIn("if i'm reading your saves right", la)
+            self.assertNotIn("from what's on file", la)
+            self.assertNotRegex(la, r"\bi(?:'d| would) maybe\b")
+        finally:
+            db.close()
+            Path(tmp.name).unlink(missing_ok=True)
 
 
 class TestPhase49RespondIntegration(unittest.TestCase):

@@ -2162,6 +2162,67 @@ def _phase49_hedge_level(
     return "soft"
 
 
+# Routes where the surfaced line is mostly inference/pattern-fill, not a quoted save.
+_PHASE50_INFERENCE_HEAVY_ROUTES = frozenset(
+    {
+        "strict_conflict_fallback",
+        "strict_spending_fallback",
+        "strict_shape_miss",
+        "profile_pattern_fallback",
+        "profile_pattern_fallback_suppressed",
+        "weak_profile_signal",
+        "insufficient_evidence",
+        "family_misalign",
+        "family_misalign_ungated",
+    }
+)
+
+
+def _phase50_refine_surface_hedge_level(
+    base: str,
+    *,
+    conf: float,
+    route_keys: Sequence[str],
+    carry_strength: float,
+    used_example_overlay: bool,
+    decision_row_anchor: bool,
+    feedback_direction_mixed: float,
+    example_contradiction: float,
+) -> str:
+    """
+    Phase 50: surface-only hedge tier refinement from grounding signals.
+
+    Does not change stored confidence or retrieval; only adjusts final wording polish.
+    """
+    b = (base or "soft").strip().lower()
+    if b not in ("soft", "medium", "firm"):
+        b = "soft"
+    rks = {str(x).strip().lower() for x in (route_keys or ()) if str(x).strip()}
+    if b == "soft":
+        return b
+    if float(feedback_direction_mixed or 0.0) >= 0.34:
+        return b
+    if float(example_contradiction or 0.0) >= 0.42:
+        return b
+    if rks & _PHASE50_INFERENCE_HEAVY_ROUTES:
+        return b
+
+    if b == "firm" and used_example_overlay and "example_memory_overlay" in rks:
+        return "medium"
+
+    cf = float(conf or 0.0)
+    cs = float(carry_strength or 0.0)
+    carry_ok = cs >= float(RESPOND_CARRYOVER_INFLUENCE_SOFT_MIN)
+
+    if b == "medium" and not used_example_overlay:
+        if "medium_decision" in rks and cf >= 0.41 and (carry_ok or decision_row_anchor):
+            return "firm"
+        if "strong_decision" in rks and cf >= 0.43 and (carry_ok or decision_row_anchor):
+            return "firm"
+
+    return b
+
+
 def _phase49_skip_wording_tightening(
     answer: str,
     *,
@@ -2206,8 +2267,8 @@ def _phase49_wording_strength_polish(
 
     def _strip_cautious_line_prefixes(segment: str) -> str:
         s = segment
-        if level != "firm":
-            return s
+        # Phase 50: medium + firm both drop save-reading openers when polish runs;
+        # soft level never reaches this block.
         for p in cautious_prefs:
             if s.startswith(p):
                 s = s[len(p) :]
@@ -2243,6 +2304,12 @@ def _phase49_wording_strength_polish(
             )
         out_lines.append(ln)
     t = "\n".join(out_lines)
+
+    # Phase 50: trim weak "maybe" hedges on action lines when polish tier is medium+.
+    if level in ("medium", "firm"):
+        t = re.sub(r"(?i)\bI'd maybe\b", "I'd", t)
+        t = re.sub(r"(?i)\bI would maybe\b", "I would", t)
+        t = re.sub(r"(?i)\bmaybe I'd\b", "I'd", t)
 
     # Light "likely" trim when not in soft-lock territory.
     if level in ("medium", "firm"):
@@ -4212,9 +4279,21 @@ def generate_personal_response(
         if example_influence
         else 0.0
     )
-    p49_level = _phase49_hedge_level(
+    p49_base = _phase49_hedge_level(
         conf=conf,
         route_keys=evidence_path.route_keys,
+        feedback_direction_mixed=float(
+            feedback_influence.replacement_direction_mixed or 0.0
+        ),
+        example_contradiction=ex_contra,
+    )
+    p50_level = _phase50_refine_surface_hedge_level(
+        p49_base,
+        conf=conf,
+        route_keys=evidence_path.route_keys,
+        carry_strength=carry_strength,
+        used_example_overlay=used_example_overlay,
+        decision_row_anchor=bool(evidence_path.decision_ids),
         feedback_direction_mixed=float(
             feedback_influence.replacement_direction_mixed or 0.0
         ),
@@ -4225,7 +4304,7 @@ def generate_personal_response(
         carry_used_replacement_stance=_carry_used_replacement_stance,
         feedback_influence=feedback_influence,
     ):
-        answer = _phase49_wording_strength_polish(answer, hedge_level=p49_level)
+        answer = _phase49_wording_strength_polish(answer, hedge_level=p50_level)
 
     continuity_note = ""
     reasoning_line_audit = _respond_carryover_reasoning_line_audit(
