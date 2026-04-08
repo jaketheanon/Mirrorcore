@@ -2744,6 +2744,134 @@ class TestPhase44RespondContinuation(unittest.TestCase):
             msg=repr(dbg),
         )
 
+    def test_phase50_action_prompt_does_not_surface_wording_only_correction(self):
+        """
+        Same-thread action_ok_word_bad rows must sharpen wording-mode output, not replace
+        action-focused answers with the stored spoken line (Phase 50).
+        """
+        prev = normalize_input(
+            "what would i say coworker keeps asking me to cover shifts after i said no"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        replacement = "I already told you no. I can't take that on right now."
+        awkward = (
+            "I was already overloaded. I'd hold the line on what I already said."
+        )
+        self.db.record_decision_memory(
+            scenario_id="p50_ob_direct",
+            scenario_text=(
+                "coworker keeps asking to cover shifts after you said no hold boundary"
+            ),
+            choice_label="Say no and keep it short",
+            choice_value="d",
+            reasoning_label="You already declined",
+            reasoning_value="s",
+            value_tags=["directness"],
+            trait_signals={},
+            confidence_score=0.88,
+            correction_status="accurate",
+        )
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet=awkward,
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        self.db.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text=replacement,
+            confidence_shown=0.55,
+            effective_family=OBLIGATION_OVERLOAD,
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet=awkward[:200],
+            feedback_target="wording",
+        )
+        q_action = (
+            "what would i do if my coworker is still pushing after i already said no"
+        )
+        self.assertEqual(classify_answer_focus(normalize_input(q_action)), "action")
+        pr = generate_personal_response(q_action, self.db, debug_phase44_carryover=True)
+        self.assertEqual(pr.effective_family, OBLIGATION_OVERLOAD)
+        la = (pr.likely_answer or "").strip()
+        low = la.lower()
+        self.assertNotIn("already told you no", low, msg=la)
+        self.assertNotIn("can't take that on right now", low, msg=la)
+        self.assertNotIn(
+            "same-thread wording correction applied",
+            (pr.reasoning_brief or "").lower(),
+            msg=pr.reasoning_brief,
+        )
+        dbg = pr.phase44_carryover_debug
+        self.assertIsNotNone(dbg)
+        self.assertFalse(dbg["surfaced_answer_used_carryover_replacement_stance"])
+        self.assertTrue(dbg["phase46_feedback_merge"]["merge_applied"])
+        self.assertTrue(
+            dbg["phase46_feedback_merge"].get("merge_wording_line_suppressed_for_action_focus"),
+            msg=repr(dbg["phase46_feedback_merge"]),
+        )
+        self.assertTrue(
+            any(
+                x in low
+                for x in (
+                    "you'd probably",
+                    "you would probably",
+                    "probably",
+                    "boundary",
+                    "hold",
+                    "say no",
+                    "declin",
+                    "direct",
+                )
+            ),
+            msg=la,
+        )
+
+    def test_phase50_wording_prompt_still_reuses_wording_correction(self):
+        """Wording-shaped continuation must still surface the approved line."""
+        prev = normalize_input(
+            "what would i say coworker keeps asking me to cover shifts after i said no"
+        )
+        ph = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+        replacement = "I already told you no. I can't take that on right now."
+        awkward = (
+            "I was already overloaded. I'd hold the line on what I already said."
+        )
+        self.db.record_short_term_situation(
+            prompt_norm=prev,
+            prompt_norm_hash=ph,
+            effective_family=OBLIGATION_OVERLOAD,
+            shape_key=carryover_shape_key(prev, OBLIGATION_OVERLOAD),
+            stance_snippet=awkward,
+            source="respond_like_me",
+            asked_slots_json=json.dumps([]),
+        )
+        self.db.record_personal_response_feedback(
+            scenario_snippet=prev[:220],
+            prompt_norm_hash=ph,
+            rating="partly",
+            partial_aspect="action_ok_word_bad",
+            replacement_text=replacement,
+            confidence_shown=0.55,
+            effective_family=OBLIGATION_OVERLOAD,
+            evidence_path={"route_keys": ["strong_decision"]},
+            likely_answer_snippet=awkward[:200],
+            feedback_target="wording",
+        )
+        q_word = (
+            "what would i say if my coworker is still pushing after i already said no"
+        )
+        self.assertEqual(classify_answer_focus(normalize_input(q_word)), "wording")
+        pr = generate_personal_response(q_word, self.db, debug_phase44_carryover=True)
+        low = (pr.likely_answer or "").lower()
+        self.assertIn("already told you no", low, msg=pr.likely_answer)
+        self.assertNotIn("already overloaded", low, msg=pr.likely_answer)
+
     def test_phase46_close_same_thread_variant_prefers_replacement(self):
         """Near same-thread wording (not identical hash) still surfaces approved line."""
         prev = normalize_input(

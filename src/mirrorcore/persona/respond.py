@@ -442,6 +442,25 @@ def _feedback_family_compatible(stored: str, current: str) -> bool:
     return False
 
 
+def _feedback_row_targets_wording_correction_path(row: Mapping[str, Any]) -> bool:
+    """
+    action_ok_word_bad rows apply to wording / surface phrasing, not action-first asks.
+
+    Rows tagged as action-target or saved with answer_focus=action are excluded from
+    action-ok wording replacement aggregation (Phase 50).
+    """
+    ft = (row.get("feedback_target") or "").strip().lower()
+    if ft == "action":
+        return False
+    ep = row.get("evidence_path") or {}
+    if not isinstance(ep, dict):
+        ep = {}
+    af_ep = (ep.get("answer_focus") or "").strip().lower()
+    if af_ep == "action":
+        return False
+    return True
+
+
 def _tokenize_feedback_phrase(text: str) -> List[str]:
     out: List[str] = []
     for m in _TOKEN_RE.findall((text or "").lower()):
@@ -881,6 +900,8 @@ def build_respond_feedback_influence(
     store: DatabaseStore,
     prompt_norm_hash: str,
     effective_family: str,
+    *,
+    answer_focus: str = "",
 ) -> RespondFeedbackInfluence:
     """Derive lexical preference + avoidance demotion from recent same-prompt feedback."""
     if not (prompt_norm_hash or "").strip():
@@ -893,6 +914,7 @@ def build_respond_feedback_influence(
     action_ok_wording_off = any(
         _feedback_family_compatible(str(r.get("effective_family") or ""), effective_family)
         and (r.get("partial_aspect") or "").strip() == "action_ok_word_bad"
+        and _feedback_row_targets_wording_correction_path(r)
         for r in rows
     )
     action_ok_wording_replacement_line = ""
@@ -902,6 +924,8 @@ def build_respond_feedback_influence(
         ):
             continue
         if (row.get("partial_aspect") or "").strip() != "action_ok_word_bad":
+            continue
+        if not _feedback_row_targets_wording_correction_path(row):
             continue
         rep_w = (row.get("replacement_text") or "").strip()
         if len(rep_w) >= 8:
@@ -1036,6 +1060,11 @@ def build_respond_feedback_influence(
         demote = min(1.0, max(demote, 0.62))
     if wrong_rep_count >= 2 and direct_hits >= 0.22:
         demote = min(1.0, max(demote, 0.55 + 0.06 * min(3, wrong_rep_count - 2)))
+    ao_off = action_ok_wording_off
+    ao_line = action_ok_wording_replacement_line.strip()
+    if (answer_focus or "").strip().lower() == "action":
+        ao_off = False
+        ao_line = ""
     return RespondFeedbackInfluence(
         pref_token_weight=pref,
         avoidance_demote=demote,
@@ -1043,8 +1072,8 @@ def build_respond_feedback_influence(
         wrong_replacement_count=wrong_rep_count,
         replacement_inject_line=inject_line.strip(),
         replacement_direction_mixed=replacement_direction_mixed,
-        action_ok_wording_off=action_ok_wording_off,
-        action_ok_wording_replacement_line=action_ok_wording_replacement_line.strip(),
+        action_ok_wording_off=ao_off,
+        action_ok_wording_replacement_line=ao_line,
     )
 
 
@@ -1165,6 +1194,7 @@ def phase46_merge_carryover_feedback_influence(
     eff_pf: str,
     situation_carryover: Optional[Dict[str, Any]],
     carry_strength: float,
+    answer_focus: str = "both",
 ) -> Tuple[RespondFeedbackInfluence, Dict[str, Any]]:
     """
     When the current prompt hash has no usable action-ok replacement line, pull
@@ -1181,6 +1211,7 @@ def phase46_merge_carryover_feedback_influence(
         "replacement_thread_gate_reason": "",
         "stance_snippet_carryover_merge": False,
         "corrected_stance_inheritance_reason": "",
+        "merge_wording_line_suppressed_for_action_focus": False,
     }
     if _phase46_has_action_ok_replacement_line(base):
         info["merge_block_reason"] = "current_prompt_has_action_ok_replacement"
@@ -1267,6 +1298,19 @@ def phase46_merge_carryover_feedback_influence(
         action_ok_wording_replacement_line=rep[:400],
         phase46_merged_carryover_feedback=True,
     )
+    if (answer_focus or "both").strip().lower() == "action":
+        merged = RespondFeedbackInfluence(
+            pref_token_weight=merged.pref_token_weight,
+            avoidance_demote=merged.avoidance_demote,
+            direct_calm_signal=merged.direct_calm_signal,
+            wrong_replacement_count=merged.wrong_replacement_count,
+            replacement_inject_line=merged.replacement_inject_line,
+            replacement_direction_mixed=merged.replacement_direction_mixed,
+            action_ok_wording_off=False,
+            action_ok_wording_replacement_line="",
+            phase46_merged_carryover_feedback=True,
+        )
+        info["merge_wording_line_suppressed_for_action_focus"] = True
     return merged, info
 
 
@@ -1482,6 +1526,7 @@ def _apply_feedback_replacement_overlay(
     Phase 46: action-ok / wording-off replacement applies in one shot for any
     routed family (not only conflict), using the user-approved line directly.
     """
+    af = (answer_focus or "both").strip().lower()
     inj_ao = ""
     if feedback_influence.action_ok_wording_off:
         inj_ao = _sanitize_replacement_for_overlay(
@@ -1492,6 +1537,8 @@ def _apply_feedback_replacement_overlay(
         feedback_influence.replacement_inject_line or ""
     )
     action_ok_inj = len(inj_ao) >= 8
+    if action_ok_inj and af == "action":
+        return answer, reasoning
     if action_ok_inj:
         inj = inj_ao
     else:
@@ -1504,7 +1551,6 @@ def _apply_feedback_replacement_overlay(
     low = a.lower()
     covered = _answer_covers_injection_tokens(a, inj)
     avoidance_ans = _memory_blob_avoidance_hit(low) or "let it go" in low
-    af = (answer_focus or "both").strip().lower()
     fb_mix = max(0.0, min(1.0, float(feedback_influence.replacement_direction_mixed or 0.0)))
     cautious_fb = fb_mix >= 0.36
     if action_ok_inj and not covered and af == "wording":
@@ -3435,7 +3481,10 @@ def generate_personal_response(
         mmap = {}
 
     feedback_influence = build_respond_feedback_influence(
-        store, prompt_norm_hash, str(eff_pf or "general")
+        store,
+        prompt_norm_hash,
+        str(eff_pf or "general"),
+        answer_focus=answer_focus,
     )
     feedback_influence, phase46_feedback_merge_info = (
         phase46_merge_carryover_feedback_influence(
@@ -3446,6 +3495,7 @@ def generate_personal_response(
             eff_pf=str(eff_pf or "general"),
             situation_carryover=situation_carryover,
             carry_strength=carry_strength,
+            answer_focus=answer_focus,
         )
     )
     ex_route_hints: List[str] = ["strong_decision", "medium_decision"]
@@ -4256,7 +4306,7 @@ def generate_personal_response(
                     row_shape,
                     _cm,
                 )
-                if _gate_ok:
+                if _gate_ok and (answer_focus or "").strip().lower() != "action":
                     # Prefer explicit DB replacement text; else Phase 47 eligible
                     # stance_snippet (same-thread STM may hold approved wording without
                     # feedback rows for that variant hash).
